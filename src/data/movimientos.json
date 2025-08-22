@@ -4,25 +4,25 @@
     "fecha": "2025-08-01",
     "hora": "14:30",
     "descripcion": "Compra en Mercado Libre",
-    "monto": -12000.50,
+    "monto": "12000.50",
     "tipo": "Gasto",
-    "medio": "MP/Efectivo"
+    "medio": "Tarjeta"
   },
   {
     "id": 2,
     "fecha": "2025-08-02",
     "hora": "11:00",
     "descripcion": "Transferencia de Franco",
-    "monto": 20000.00,
+    "monto": "20000",
     "tipo": "Transferencia in",
-    "medio": "MP/Efectivo"
+    "medio": "Banco"
   },
   {
     "id": 3,
     "fecha": "2025-08-03",
     "hora": "18:15",
     "descripcion": "Carga SUBE",
-    "monto": -5000.00,
+    "monto": "5000",
     "tipo": "Gasto",
     "medio": "SUBE"
   }

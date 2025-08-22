@@ -1,15 +1,13 @@
-function MovimientoCard({ fecha, comercio, monto, tipo }) {
+import React from 'react'
+export default function MovimientoCard({ fecha, comercio, monto, tipo }) {
+  const esGasto = tipo === 'Gasto'
   return (
-    <div className="border rounded-xl p-4 shadow-md mb-4 bg-white">
-      <div className="flex justify-between items-center">
-        <h3 className="font-semibold">{comercio}</h3>
-        <span className={`font-bold ${tipo === 'Gasto' ? 'text-red-500' : 'text-green-500'}`}>
-          ${monto}
-        </span>
+    <div className="border rounded-lg p-4 mb-3 bg-gray-800 border-gray-700 shadow flex justify-between items-center">
+      <div>
+        <p className="font-medium truncate max-w-xs" title={comercio}>{comercio}</p>
+        <p className="text-sm text-gray-400">{fecha}</p>
       </div>
-      <p className="text-sm text-gray-500">{fecha}</p>
+      <div className={`font-bold ${esGasto ? 'text-red-400' : 'text-green-400'}`}>${monto}</div>
     </div>
-  );
+  )
 }
-
-export default MovimientoCard;
