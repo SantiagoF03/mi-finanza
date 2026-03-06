@@ -3,6 +3,9 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
     negative_hits = [n for n in news if n.get("impact") == "negativo"]
     positive_hits = [n for n in news if n.get("impact") == "positivo"]
 
+    held_symbols = [p.get("symbol") for p in snapshot.get("positions", []) if p.get("symbol")]
+    held_set = set(held_symbols)
+
     action = "mantener"
     pct = 0.0
     actions = []

@@ -68,7 +68,7 @@ def portfolio_analysis(db: Session = Depends(get_db)):
 
 @router.get("/news/recent")
 def recent_news(db: Session = Depends(get_db)):
-    return db.query(NewsEvent).order_by(desc(NewsEvent.created_at)).limit(20).all()
+    return db.query(NewsEvent).order_by(desc(NewsEvent.created_at)).limit(10).all()
 
 
 @router.get("/recommendations/current")

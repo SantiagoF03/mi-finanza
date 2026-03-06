@@ -132,3 +132,19 @@ def test_positive_news_outside_snapshot_falls_back_to_maintain():
     rec = generate_recommendation(snapshot, analysis, news, max_move=0.1)
     assert rec["action"] == "mantener"
     assert rec["actions"] == []
+
+
+def test_mock_news_not_duplicated_between_cycles():
+    db = make_db()
+    s = get_settings()
+    s.trigger_cooldown_seconds = 0
+
+    run_cycle(db)
+    from app.models.models import NewsEvent
+
+    first_count = db.query(NewsEvent).count()
+    run_cycle(db)
+    second_count = db.query(NewsEvent).count()
+
+    assert first_count == 3
+    assert second_count == 3

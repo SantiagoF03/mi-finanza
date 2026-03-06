@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.broker.clients import IolBrokerClient, map_iol_portfolio_to_snapshot
+from app.broker.clients import IolBrokerClient, map_iol_estadocuenta_cash, map_iol_portfolio_to_snapshot
 from app.core.config import get_settings
 from app.db.session import Base
 from app.services import orchestrator
@@ -37,7 +37,16 @@ class FakeHttpClient:
         self.get_calls += 1
         if self.get_calls == 1:
             return FakeResponse(401, {})
-        return FakeResponse(200, {"moneda": "ARS", "disponible": 1000, "titulos": []})
+        if "/portafolio/" in url:
+            return FakeResponse(200, {"moneda": "ARS", "disponible": 0, "titulos": []})
+        if "/estadocuenta" in url:
+            return FakeResponse(200, {"disponible": 4321.5})
+        return FakeResponse(404, {})
+
+
+class BrokenRealClient:
+    def get_portfolio_snapshot(self):
+        raise RuntimeError("Auth failed")
 
 
 def make_db():
@@ -63,7 +72,14 @@ def test_map_iol_portfolio_to_snapshot():
     assert out["positions"][0]["instrument_type"] == "ACCION"
 
 
-def test_refresh_token_flow():
+def test_map_iol_estadocuenta_cash_with_fallbacks():
+    assert map_iol_estadocuenta_cash({"disponible": 1500}) == 1500
+    assert map_iol_estadocuenta_cash({"saldoDisponible": "2400.5"}) == 2400.5
+    assert map_iol_estadocuenta_cash({"cuentas": {"disponible": 300}}) == 300
+    assert map_iol_estadocuenta_cash({}) == 0.0
+
+
+def test_refresh_token_flow_and_real_cash_from_estadocuenta():
     settings = get_settings()
     settings.iol_username = "u"
     settings.iol_password = "p"
@@ -75,6 +91,7 @@ def test_refresh_token_flow():
     snapshot = client.get_portfolio_snapshot()
 
     assert snapshot["currency"] == "ARS"
+    assert snapshot["cash"] == 4321.5
     assert len(fake.post_calls) >= 2
     assert fake.post_calls[0]["grant_type"] == "password"
     assert fake.post_calls[1]["grant_type"] == "refresh_token"
@@ -87,11 +104,6 @@ def test_fallback_to_mock_if_auth_fails(monkeypatch):
     settings.trigger_cooldown_seconds = 0
 
     orchestrator._broker_singletons.clear()
-
-    class BrokenRealClient:
-        def get_portfolio_snapshot(self):
-            raise RuntimeError("Auth failed")
-
     monkeypatch.setattr(orchestrator, "IolBrokerClient", lambda: BrokenRealClient())
 
     out = orchestrator.run_cycle(db, source="manual")

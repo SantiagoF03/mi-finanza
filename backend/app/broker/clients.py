@@ -17,16 +17,38 @@ class BrokerClient(ABC):
         return {"status": "ok", "mode": "mock"}
 
 
-def map_iol_portfolio_to_snapshot(payload: dict[str, Any], default_currency: str = "ARS") -> dict:
+def map_iol_estadocuenta_cash(payload: dict[str, Any]) -> float:
+    """Extrae cash disponible desde /estadocuenta con fallbacks robustos."""
+    candidates = [
+        payload.get("disponible"),
+        payload.get("saldoDisponible"),
+        payload.get("cuentas", {}).get("disponible"),
+        payload.get("cuenta", {}).get("disponible"),
+        payload.get("cash"),
+    ]
+    for value in candidates:
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def map_iol_portfolio_to_snapshot(
+    payload: dict[str, Any],
+    default_currency: str = "ARS",
+    cash_override: float | None = None,
+) -> dict:
     """Mapea respuesta variada de IOL al formato interno del MVP."""
 
     titulos = payload.get("titulos") or payload.get("activos") or payload.get("positions") or []
-    cash = payload.get("disponible")
-    if cash is None:
-        cash = payload.get("cuentas", {}).get("disponible")
-    if cash is None:
-        cash = payload.get("cash")
-    cash = float(cash or 0)
+    portfolio_cash = payload.get("disponible")
+    if portfolio_cash is None:
+        portfolio_cash = payload.get("cuentas", {}).get("disponible")
+    if portfolio_cash is None:
+        portfolio_cash = payload.get("cash")
+    cash = float(cash_override if cash_override is not None else (portfolio_cash or 0))
 
     currency = payload.get("moneda") or payload.get("currency") or default_currency
 
@@ -144,12 +166,14 @@ class IolBrokerClient(BrokerClient):
         try:
             resp = self._authorized_get("/api/v2/estadocuenta")
             return {"status": "ok", "mode": "real", "http_status": resp.status_code}
-        except Exception as exc:  # pragma: no cover - surfaced through API
+        except Exception as exc:  # pragma: no cover
             return {"status": "error", "mode": "real", "message": str(exc)}
 
     def get_portfolio_snapshot(self) -> dict:
-        resp = self._authorized_get(f"/api/v2/portafolio/{self.country}")
-        return map_iol_portfolio_to_snapshot(resp.json())
+        portfolio_resp = self._authorized_get(f"/api/v2/portafolio/{self.country}")
+        estado_resp = self._authorized_get("/api/v2/estadocuenta")
+        real_cash = map_iol_estadocuenta_cash(estado_resp.json())
+        return map_iol_portfolio_to_snapshot(portfolio_resp.json(), cash_override=real_cash)
 
 
 class MockBrokerClient(BrokerClient):

@@ -78,3 +78,9 @@ No hay endpoints de compra/venta implementados. Solo lectura.
 - El motor ya no sugiere símbolos hardcodeados.
 - Los símbolos recomendados salen únicamente de la cartera actual (`snapshot.positions`) y métricas derivadas del snapshot (`weights_by_asset`, `rebalance_deviation`).
 - Si por cualquier motivo una acción apunta a un símbolo fuera del snapshot, la recomendación hace fallback a `mantener` con explicación.
+
+
+## Mejoras MVP recientes
+- **Cash real desde IOL**: el snapshot toma `cash` de `GET /api/v2/estadocuenta` (prioriza `disponible`, con fallbacks `saldoDisponible`, `cuentas.disponible`, `cuenta.disponible`, `cash`).
+- **Noticias mock sin duplicados**: cada ciclo refresca noticias mock para evitar acumulación de duplicados en DB.
+- **UI/API más limpia**: `GET /api/news/recent` devuelve solo las últimas 10 noticias.

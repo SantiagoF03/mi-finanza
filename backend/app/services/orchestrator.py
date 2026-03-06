@@ -75,6 +75,8 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         db.add(PortfolioPosition(snapshot_id=snapshot.id, **p))
 
     news_items = get_mock_news() if source != "test_no_news" else []
+    # MVP simple anti-duplicación: refrescar noticias mock por ciclo
+    db.query(NewsEvent).delete()
     for n in news_items:
         db.add(NewsEvent(**n))
 
