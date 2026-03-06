@@ -95,3 +95,40 @@ def test_contradictory_news_lowers_confidence():
     ]
     rec = generate_recommendation(snapshot, analysis, news, max_move=0.1)
     assert rec["confidence"] <= 0.45
+
+
+def test_recommendation_actions_symbols_always_in_snapshot():
+    snapshot = {
+        "total_value": 100,
+        "cash": 20,
+        "currency": "USD",
+        "positions": [
+            {"symbol": "GGAL", "market_value": 40, "pnl_pct": 0.01},
+            {"symbol": "YPFD", "market_value": 40, "pnl_pct": 0.02},
+        ],
+    }
+    analysis = {
+        "alerts": ["Sobreconcentración en un activo > 40%."],
+        "weights_by_asset": {"GGAL": 0.41, "AAPL": 0.49},
+        "rebalance_deviation": {"GGAL": 0.1, "AAPL": 0.2},
+    }
+    news = [{"impact": "positivo", "related_assets": ["AAPL"]}]
+
+    rec = generate_recommendation(snapshot, analysis, news, max_move=0.1)
+    symbols = {p["symbol"] for p in snapshot["positions"]}
+    assert all(a["symbol"] in symbols for a in rec["actions"])
+
+
+def test_positive_news_outside_snapshot_falls_back_to_maintain():
+    snapshot = {
+        "total_value": 100,
+        "cash": 20,
+        "currency": "USD",
+        "positions": [{"symbol": "GGAL", "market_value": 80, "pnl_pct": 0.01}],
+    }
+    analysis = {"alerts": [], "weights_by_asset": {"GGAL": 0.8}, "rebalance_deviation": {"GGAL": 0.0}}
+    news = [{"impact": "positivo", "related_assets": ["AAPL"]}]
+
+    rec = generate_recommendation(snapshot, analysis, news, max_move=0.1)
+    assert rec["action"] == "mantener"
+    assert rec["actions"] == []

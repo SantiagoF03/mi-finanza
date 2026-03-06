@@ -72,3 +72,9 @@ npm --prefix frontend run dev
 
 ## Restricción
 No hay endpoints de compra/venta implementados. Solo lectura.
+
+
+## Corrección de recomendación (símbolos reales)
+- El motor ya no sugiere símbolos hardcodeados.
+- Los símbolos recomendados salen únicamente de la cartera actual (`snapshot.positions`) y métricas derivadas del snapshot (`weights_by_asset`, `rebalance_deviation`).
+- Si por cualquier motivo una acción apunta a un símbolo fuera del snapshot, la recomendación hace fallback a `mantener` con explicación.
