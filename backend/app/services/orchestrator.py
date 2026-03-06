@@ -12,10 +12,19 @@ from app.recommendations.engine import generate_recommendation
 from app.rules.engine import enforce_rules
 from app.services.logs import app_log
 
+_broker_singletons: dict[str, object] = {}
+
 
 def _get_broker():
     settings = get_settings()
-    return MockBrokerClient() if settings.broker_mode == "mock" else IolBrokerClient()
+    if settings.broker_mode == "mock":
+        if "mock" not in _broker_singletons:
+            _broker_singletons["mock"] = MockBrokerClient()
+        return _broker_singletons["mock"]
+
+    if "real" not in _broker_singletons:
+        _broker_singletons["real"] = IolBrokerClient()
+    return _broker_singletons["real"]
 
 
 def get_current_recommendation(db: Session) -> Recommendation | None:
@@ -45,7 +54,16 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         return {"skipped": True, "reason": "cooldown", "recommendation_id": latest.id}
 
     broker = _get_broker()
-    raw = broker.get_portfolio_snapshot()
+    broker_mode = settings.broker_mode
+    try:
+        raw = broker.get_portfolio_snapshot()
+    except Exception as exc:
+        if settings.broker_mode == "real":
+            app_log(db, "Fallo broker real, fallback a mock", level="WARNING", context={"source": source, "error": str(exc)})
+            broker_mode = "mock_fallback"
+            raw = MockBrokerClient().get_portfolio_snapshot()
+        else:
+            raise
 
     raw_cash = raw.get("cash", 0)
     total = raw_cash + sum(p.get("market_value", 0) for p in raw.get("positions", []))
@@ -79,7 +97,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         risks=rec["risks"],
         executive_summary=rec["executive_summary"],
         blocked_reason=rec.get("blocked_reason", ""),
-        metadata_json={"analysis": analysis, "rules": rec.get("blocked_reasons", []), "source": source},
+        metadata_json={"analysis": analysis, "rules": rec.get("blocked_reasons", []), "source": source, "broker_mode": broker_mode},
     )
     db.add(rec_model)
     db.flush()
@@ -88,7 +106,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
 
     _supersede_open_recommendations(db, rec_model.id)
     db.commit()
-    app_log(db, "Ciclo de análisis ejecutado", context={"recommendation_id": rec_model.id, "source": source})
+    app_log(db, "Ciclo de análisis ejecutado", context={"recommendation_id": rec_model.id, "source": source, "broker_mode": broker_mode})
 
     return {
         "snapshot_id": snapshot.id,
@@ -96,4 +114,5 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         "analysis": analysis,
         "status": rec_model.status,
         "blocked_reason": rec_model.blocked_reason,
+        "broker_mode": broker_mode,
     }

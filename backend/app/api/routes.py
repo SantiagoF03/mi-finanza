@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import desc
 from sqlalchemy.orm import Session, joinedload
 
+from app.broker.clients import IolBrokerClient, MockBrokerClient
+from app.core.config import get_settings
 from app.db.session import get_db
 from app.models.models import NewsEvent, PortfolioSnapshot, Recommendation, UserDecision
 from app.schemas.schemas import DecisionIn
@@ -13,6 +15,13 @@ router = APIRouter()
 @router.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@router.get("/broker/ping")
+def broker_ping():
+    settings = get_settings()
+    client = MockBrokerClient() if settings.broker_mode == "mock" else IolBrokerClient()
+    return client.ping()
 
 
 @router.post("/analysis/run")
@@ -35,9 +44,11 @@ def portfolio_summary(db: Session = Depends(get_db)):
             {
                 "symbol": p.symbol,
                 "asset_type": p.asset_type,
+                "instrument_type": p.instrument_type,
                 "currency": p.currency,
                 "quantity": p.quantity,
                 "market_value": p.market_value,
+                "avg_price": p.avg_price,
                 "pnl_pct": p.pnl_pct,
             }
             for p in snapshot.positions
@@ -78,6 +89,7 @@ def current_recommendation(db: Session = Depends(get_db)):
         "executive_summary": rec.executive_summary,
         "created_at": rec.created_at,
         "rules_applied": rec.metadata_json.get("rules", []),
+        "broker_mode": rec.metadata_json.get("broker_mode", "unknown"),
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 

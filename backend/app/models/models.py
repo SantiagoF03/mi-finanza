@@ -24,9 +24,11 @@ class PortfolioPosition(Base):
     snapshot_id: Mapped[int] = mapped_column(ForeignKey("portfolio_snapshots.id"))
     symbol: Mapped[str] = mapped_column(String(20), index=True)
     asset_type: Mapped[str] = mapped_column(String(30))
+    instrument_type: Mapped[str] = mapped_column(String(30), default="UNKNOWN")
     currency: Mapped[str] = mapped_column(String(10))
     quantity: Mapped[float] = mapped_column(Float)
     market_value: Mapped[float] = mapped_column(Float)
+    avg_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     pnl_pct: Mapped[float] = mapped_column(Float)
     snapshot: Mapped[PortfolioSnapshot] = relationship(back_populates="positions")
 

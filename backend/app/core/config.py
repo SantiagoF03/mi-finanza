@@ -10,6 +10,14 @@ class Settings(BaseSettings):
     environment: str = "dev"
     database_url: str = "sqlite:///./mi_finanza.db"
     broker_mode: str = "mock"
+
+    iol_api_base: str = "https://api.invertironline.com"
+    iol_username: str = ""
+    iol_password: str = ""
+    iol_portfolio_country: str = "argentina"
+    iol_timeout_seconds: int = 15
+    iol_use_sandbox: bool = False
+
     scheduler_enabled: bool = True
     analysis_frequency_days: int = 4
     trigger_cooldown_seconds: int = 60
