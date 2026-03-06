@@ -11,58 +11,92 @@ from app.core.config import get_settings
 
 class BrokerClient(ABC):
     @abstractmethod
-    def get_portfolio_snapshot(self) -> dict: ...
+    def get_portfolio_snapshot(self) -> dict:
+        ...
 
     def ping(self) -> dict:
         return {"status": "ok", "mode": "mock"}
 
 
-def map_iol_portfolio_to_snapshot(payload: dict[str, Any], default_currency: str = "ARS") -> dict:
-    """Mapea respuesta variada de IOL al formato interno del MVP."""
+def map_iol_portfolio_to_snapshot(payload: dict) -> dict:
+    """
+    Normaliza el JSON de IOL /api/v2/portafolio/{pais} al formato interno del MVP.
 
-    titulos = payload.get("titulos") or payload.get("activos") or payload.get("positions") or []
-    cash = payload.get("disponible")
-    if cash is None:
-        cash = payload.get("cuentas", {}).get("disponible")
-    if cash is None:
-        cash = payload.get("cash")
-    cash = float(cash or 0)
+    Estructura esperada (según tu Postman):
+      {
+        "pais": "argentina",
+        "activos": [
+          {
+            "cantidad": ...,
+            "valorizado": ...,
+            "ppc": ...,
+            "gananciaPorcentaje": ...,
+            "titulo": {
+                "simbolo": "...",
+                "tipo": "...",
+                "moneda": "peso_Argentino|dolar_Estadounidense"
+            }
+          }
+        ]
+      }
+    """
+    activos = payload.get("activos") or []
+    positions: list[dict] = []
 
-    currency = payload.get("moneda") or payload.get("currency") or default_currency
+    # En tu JSON no aparece cash, así que lo dejamos 0 por ahora
+    cash = 0.0
 
-    positions: list[dict[str, Any]] = []
-    for item in titulos:
-        symbol = item.get("simbolo") or item.get("ticker") or item.get("symbol")
+    # Snapshot currency general (para Argentina: ARS).
+    # La moneda real por activo va en cada position.
+    snapshot_currency = "ARS"
+
+    def map_currency(iol_moneda: str) -> str:
+        m = (iol_moneda or "").strip().lower()
+        if m in {"peso_argentino", "peso argentino", "ars"}:
+            return "ARS"
+        if m in {"dolar_estadounidense", "dólar estadounidense", "usd", "u$s"}:
+            return "USD"
+        return "ARS"
+
+    for a in activos:
+        titulo = a.get("titulo") or {}
+
+        symbol = titulo.get("simbolo") or ""
         if not symbol:
             continue
 
-        quantity = float(item.get("cantidad") or item.get("quantity") or 0)
-        market_value = (
-            item.get("valorizado")
-            or item.get("valuado")
-            or item.get("marketValue")
-            or item.get("market_value")
-            or (quantity * float(item.get("ultimoPrecio") or item.get("lastPrice") or 0))
-        )
-        avg_price = item.get("precioPromedio") or item.get("averagePrice") or item.get("avg_price")
-        instrument_type = item.get("tipo") or item.get("tipoInstrumento") or item.get("instrumentType") or "UNKNOWN"
+        iol_tipo = (titulo.get("tipo") or "").strip()
+        iol_moneda = (titulo.get("moneda") or "").strip()
+
+        quantity = float(a.get("cantidad") or 0.0)
+        market_value = float(a.get("valorizado") or 0.0)
+        avg_price = float(a.get("ppc") or 0.0)
+
+        asset_type = iol_tipo or "DESCONOCIDO"
+        currency = map_currency(iol_moneda)
+
+        pnl_pct_raw = a.get("gananciaPorcentaje")
+        try:
+            pnl_pct = float(pnl_pct_raw) / 100.0 if pnl_pct_raw is not None else 0.0
+        except (TypeError, ValueError):
+            pnl_pct = 0.0
 
         positions.append(
             {
                 "symbol": symbol,
+                "asset_type": asset_type,
+                "instrument_type": iol_tipo,
+                "currency": currency,
                 "quantity": quantity,
-                "market_value": float(market_value or 0),
-                "avg_price": float(avg_price) if avg_price is not None else None,
-                "instrument_type": instrument_type,
-                "asset_type": instrument_type,
-                "currency": item.get("moneda") or item.get("currency") or currency,
-                "pnl_pct": float(item.get("rentabilidad") or item.get("pnlPct") or 0),
+                "market_value": market_value,
+                "avg_price": avg_price,
+                "pnl_pct": pnl_pct,
             }
         )
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "currency": currency,
+        "currency": snapshot_currency,
         "cash": cash,
         "positions": positions,
     }
@@ -90,7 +124,9 @@ class IolBrokerClient(BrokerClient):
         self._access_token = payload.get("access_token")
         self._refresh_token = payload.get("refresh_token")
         expires_in = int(payload.get("expires_in") or 0)
-        self._expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(expires_in - 30, 0))
+        self._expires_at = datetime.now(timezone.utc) + timedelta(
+            seconds=max(expires_in - 30, 0)
+        )
 
     def _authenticate_password(self) -> None:
         if not self.username or not self.password:
@@ -111,6 +147,7 @@ class IolBrokerClient(BrokerClient):
     def _refresh_access_token(self) -> bool:
         if not self._refresh_token:
             return False
+
         resp = self._client.post(
             f"{self.api_base}/token",
             data={
@@ -119,8 +156,10 @@ class IolBrokerClient(BrokerClient):
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
+
         if resp.status_code >= 400:
             return False
+
         self._set_tokens(resp.json())
         return True
 
@@ -132,11 +171,20 @@ class IolBrokerClient(BrokerClient):
     def _authorized_get(self, path: str) -> httpx.Response:
         self._ensure_auth()
         assert self._access_token
-        resp = self._client.get(f"{self.api_base}{path}", headers={"Authorization": f"Bearer {self._access_token}"})
+
+        resp = self._client.get(
+            f"{self.api_base}{path}",
+            headers={"Authorization": f"Bearer {self._access_token}"},
+        )
+
         if resp.status_code in {401, 403}:
             if self._refresh_access_token():
                 assert self._access_token
-                resp = self._client.get(f"{self.api_base}{path}", headers={"Authorization": f"Bearer {self._access_token}"})
+                resp = self._client.get(
+                    f"{self.api_base}{path}",
+                    headers={"Authorization": f"Bearer {self._access_token}"},
+                )
+
         resp.raise_for_status()
         return resp
 
@@ -144,7 +192,7 @@ class IolBrokerClient(BrokerClient):
         try:
             resp = self._authorized_get("/api/v2/estadocuenta")
             return {"status": "ok", "mode": "real", "http_status": resp.status_code}
-        except Exception as exc:  # pragma: no cover - surfaced through API
+        except Exception as exc:
             return {"status": "error", "mode": "real", "message": str(exc)}
 
     def get_portfolio_snapshot(self) -> dict:
@@ -155,7 +203,7 @@ class IolBrokerClient(BrokerClient):
 class MockBrokerClient(BrokerClient):
     def get_portfolio_snapshot(self) -> dict:
         return {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "currency": "USD",
             "cash": 12000,
             "positions": [
