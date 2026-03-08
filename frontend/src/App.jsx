@@ -2,6 +2,13 @@ import { useEffect, useState } from 'react'
 
 const API = 'http://localhost:8000/api'
 
+function formatRemaining(totalSeconds) {
+  const seconds = Math.max(0, Number(totalSeconds || 0))
+  const mins = Math.floor(seconds / 60)
+  const secs = seconds % 60
+  return `${mins} min ${secs} s`
+}
+
 export default function App() {
   const [summary, setSummary] = useState(null)
   const [analysis, setAnalysis] = useState(null)
@@ -9,11 +16,30 @@ export default function App() {
   const [current, setCurrent] = useState(null)
   const [history, setHistory] = useState([])
   const [error, setError] = useState('')
+  const [currentInfo, setCurrentInfo] = useState('')
+  const [cooldownMessage, setCooldownMessage] = useState('')
+  const [cooldownRemaining, setCooldownRemaining] = useState(0)
 
-  const load = async (trigger = false) => {
+  useEffect(() => {
+    if (cooldownRemaining <= 0) return undefined
+    const timer = setInterval(() => {
+      setCooldownRemaining((prev) => {
+        const next = prev - 1
+        if (next <= 0) {
+          setCooldownMessage('')
+          return 0
+        }
+        setCooldownMessage(`Todavía no podés generar una nueva recomendación. Esperá ${formatRemaining(next)}.`)
+        return next
+      })
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [cooldownRemaining])
+
+  const load = async () => {
     setError('')
+    setCurrentInfo('')
     try {
-      if (trigger) await fetch(`${API}/analysis/run`, { method: 'POST' })
       const [sRes, aRes, nRes, cRes, hRes] = await Promise.all([
         fetch(`${API}/portfolio/summary`),
         fetch(`${API}/portfolio/analysis`),
@@ -28,7 +54,15 @@ export default function App() {
       setAnalysis(await aRes.json())
       setNews(await nRes.json())
       setHistory(await hRes.json())
-      setCurrent(cRes.ok ? await cRes.json() : null)
+
+      if (cRes.status === 404) {
+        setCurrent(null)
+        setCurrentInfo('No hay recomendación abierta actualmente.')
+      } else if (cRes.ok) {
+        setCurrent(await cRes.json())
+      } else {
+        throw new Error('backend_unavailable')
+      }
     } catch {
       setError('Backend no disponible. Levantá FastAPI para usar la app (sin mock frontend local).')
       setSummary(null)
@@ -36,12 +70,38 @@ export default function App() {
       setNews([])
       setCurrent(null)
       setHistory([])
+      setCurrentInfo('')
     }
   }
 
   useEffect(() => {
-    load(false)
+    load()
   }, [])
+
+  const triggerAnalysis = async () => {
+    setError('')
+    try {
+      const resp = await fetch(`${API}/analysis/run`, { method: 'POST' })
+      if (!resp.ok) throw new Error('trigger_failed')
+      const payload = await resp.json()
+
+      if (payload?.status === 'cooldown' && payload?.skipped) {
+        const remainingSeconds = Number(payload.cooldown_remaining_seconds || 0)
+        setCooldownRemaining(remainingSeconds)
+        setCooldownMessage(
+          `Todavía no podés generar una nueva recomendación. Esperá ${formatRemaining(remainingSeconds)}.`,
+        )
+        await load()
+        return
+      }
+
+      setCooldownRemaining(0)
+      setCooldownMessage('')
+      await load()
+    } catch {
+      setError('No se pudo ejecutar el análisis manual en este momento.')
+    }
+  }
 
   const decide = async (decision) => {
     if (!current?.id) return
@@ -50,13 +110,16 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ decision, note: '' }),
     })
-    load(false)
+    load()
   }
 
   return (
     <main className="container">
       <h1>Mi Finanza MVP</h1>
-      <button onClick={() => load(true)}>Disparar análisis manual</button>
+      <button onClick={triggerAnalysis} disabled={cooldownRemaining > 0}>
+        Disparar análisis manual
+      </button>
+      {cooldownMessage && <p style={{ color: '#7a2e0a', fontWeight: 600 }}>{cooldownMessage}</p>}
       {error && <p style={{ color: '#b42318' }}>{error}</p>}
 
       {summary && (
@@ -79,6 +142,8 @@ export default function App() {
           <p>Alertas: {analysis.alerts?.join(' | ') || 'Sin alertas'}</p>
         </section>
       )}
+
+      {currentInfo && <p>{currentInfo}</p>}
 
       {current && (
         <section>

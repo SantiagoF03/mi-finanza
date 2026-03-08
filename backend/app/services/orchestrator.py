@@ -49,9 +49,26 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     settings = get_settings()
 
     latest = db.query(Recommendation).order_by(desc(Recommendation.created_at)).first()
-    if latest and latest.created_at >= datetime.utcnow() - timedelta(seconds=settings.trigger_cooldown_seconds):
-        app_log(db, "Análisis omitido por cooldown (idempotencia)", context={"recommendation_id": latest.id, "source": source})
-        return {"skipped": True, "reason": "cooldown", "recommendation_id": latest.id}
+    if latest:
+        cooldown_until = latest.created_at + timedelta(seconds=settings.trigger_cooldown_seconds)
+        now = datetime.utcnow()
+        if now < cooldown_until:
+            remaining_seconds = int((cooldown_until - now).total_seconds())
+            remaining_minutes = round(remaining_seconds / 60, 2)
+            app_log(
+                db,
+                "Análisis omitido por cooldown (idempotencia)",
+                context={"recommendation_id": latest.id, "source": source, "remaining_seconds": remaining_seconds},
+            )
+            return {
+                "status": "cooldown",
+                "skipped": True,
+                "message": "Todavía no podés generar una nueva recomendación.",
+                "cooldown_remaining_seconds": remaining_seconds,
+                "cooldown_remaining_minutes": remaining_minutes,
+                "reason": "cooldown",
+                "recommendation_id": latest.id,
+            }
 
     broker = _get_broker()
     broker_mode = settings.broker_mode
@@ -75,7 +92,6 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         db.add(PortfolioPosition(snapshot_id=snapshot.id, **p))
 
     news_items = get_mock_news() if source != "test_no_news" else []
-    # MVP simple anti-duplicación: refrescar noticias mock por ciclo
     db.query(NewsEvent).delete()
     for n in news_items:
         db.add(NewsEvent(**n))

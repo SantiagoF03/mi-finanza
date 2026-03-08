@@ -75,6 +75,9 @@ def test_idempotency_cooldown_skips_duplicate():
     second = run_cycle(db)
 
     assert second["skipped"] is True
+    assert second["status"] == "cooldown"
+    assert second["cooldown_remaining_seconds"] > 0
+    assert second["cooldown_remaining_minutes"] > 0
     assert second["recommendation_id"] == first["recommendation_id"]
 
 

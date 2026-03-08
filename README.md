@@ -84,3 +84,15 @@ No hay endpoints de compra/venta implementados. Solo lectura.
 - **Cash real desde IOL**: el snapshot toma `cash` de `GET /api/v2/estadocuenta` (prioriza `disponible`, con fallbacks `saldoDisponible`, `cuentas.disponible`, `cuenta.disponible`, `cash`).
 - **Noticias mock sin duplicados**: cada ciclo refresca noticias mock para evitar acumulación de duplicados en DB.
 - **UI/API más limpia**: `GET /api/news/recent` devuelve solo las últimas 10 noticias.
+
+
+## UX cooldown del trigger manual
+- Si se dispara análisis durante cooldown, `POST /api/analysis/run` devuelve:
+  - `status: "cooldown"`
+  - `skipped: true`
+  - `message`
+  - `cooldown_remaining_seconds`
+  - `cooldown_remaining_minutes`
+- La UI muestra: “Todavía no podés generar una nueva recomendación. Esperá X min Y s.”
+- El botón de trigger queda deshabilitado temporalmente con countdown local.
+- Si `GET /api/recommendations/current` responde 404, la UI lo interpreta como estado válido: “No hay recomendación abierta actualmente”.
