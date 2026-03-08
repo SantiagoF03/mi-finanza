@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
-from app.news.pipeline import get_mock_news
+from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
 from app.rules.engine import enforce_rules
@@ -43,6 +43,45 @@ def _supersede_open_recommendations(db: Session, new_id: int) -> None:
             rec.status = "superseded"
             rec.replaced_by_id = new_id
             rec.superseded_at = datetime.utcnow()
+
+
+def _load_news_items(snapshot_positions: list[dict]) -> tuple[list[dict], str]:
+    provider = get_news_provider()
+    symbols = [p.get("symbol") for p in snapshot_positions if p.get("symbol")]
+
+    items = []
+    source = provider.__class__.__name__
+    try:
+        items = deduplicate_news_items(provider.get_recent_news(symbols))
+    except Exception:
+        items = []
+
+    if not items and not isinstance(provider, MockNewsProvider):
+        mock_provider = MockNewsProvider()
+        source = f"{provider.__class__.__name__}->MockNewsProvider"
+        items = deduplicate_news_items(mock_provider.get_recent_news(symbols))
+
+    return items, source
+
+
+def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int:
+    inserted = 0
+    for n in news_items:
+        title = (n.get("title") or "").strip()
+        summary = (n.get("summary") or "").strip()
+        if not title:
+            continue
+        exists = (
+            db.query(NewsEvent)
+            .filter(NewsEvent.title == title)
+            .filter(NewsEvent.summary == summary)
+            .first()
+        )
+        if exists:
+            continue
+        db.add(NewsEvent(**n))
+        inserted += 1
+    return inserted
 
 
 def run_cycle(db: Session, source: str = "manual") -> dict:
@@ -83,24 +122,23 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             raise
 
     raw_cash = raw.get("cash", 0)
-    total = raw_cash + sum(p.get("market_value", 0) for p in raw.get("positions", []))
+    positions = raw.get("positions", [])
+    total = raw_cash + sum(p.get("market_value", 0) for p in positions)
 
     snapshot = PortfolioSnapshot(total_value=total, cash=raw_cash, currency=raw.get("currency", "USD"))
     db.add(snapshot)
     db.flush()
-    for p in raw.get("positions", []):
+    for p in positions:
         db.add(PortfolioPosition(snapshot_id=snapshot.id, **p))
 
-    news_items = get_mock_news() if source != "test_no_news" else []
-    db.query(NewsEvent).delete()
-    for n in news_items:
-        db.add(NewsEvent(**n))
+    news_items, news_source = _load_news_items(positions)
+    inserted_news = _persist_news_without_duplicates(db, news_items)
 
     snapshot_dict = {
         "total_value": total,
         "cash": raw_cash,
         "currency": raw.get("currency", "USD"),
-        "positions": raw.get("positions", []),
+        "positions": positions,
     }
     analysis = analyze_portfolio(snapshot_dict)
     rec = generate_recommendation(snapshot_dict, analysis, news_items, settings.max_movement_per_cycle)
@@ -115,7 +153,15 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         risks=rec["risks"],
         executive_summary=rec["executive_summary"],
         blocked_reason=rec.get("blocked_reason", ""),
-        metadata_json={"analysis": analysis, "rules": rec.get("blocked_reasons", []), "source": source, "broker_mode": broker_mode},
+        metadata_json={
+            "analysis": analysis,
+            "rules": rec.get("blocked_reasons", []),
+            "source": source,
+            "broker_mode": broker_mode,
+            "news_source": news_source,
+            "news_inserted": inserted_news,
+            "news_used": len(news_items),
+        },
     )
     db.add(rec_model)
     db.flush()
@@ -124,7 +170,17 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
 
     _supersede_open_recommendations(db, rec_model.id)
     db.commit()
-    app_log(db, "Ciclo de análisis ejecutado", context={"recommendation_id": rec_model.id, "source": source, "broker_mode": broker_mode})
+    app_log(
+        db,
+        "Ciclo de análisis ejecutado",
+        context={
+            "recommendation_id": rec_model.id,
+            "source": source,
+            "broker_mode": broker_mode,
+            "news_source": news_source,
+            "news_inserted": inserted_news,
+        },
+    )
 
     return {
         "snapshot_id": snapshot.id,
@@ -133,4 +189,5 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         "status": rec_model.status,
         "blocked_reason": rec_model.blocked_reason,
         "broker_mode": broker_mode,
+        "news_source": news_source,
     }

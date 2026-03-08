@@ -82,7 +82,7 @@ No hay endpoints de compra/venta implementados. Solo lectura.
 
 ## Mejoras MVP recientes
 - **Cash real desde IOL**: el snapshot toma `cash` de `GET /api/v2/estadocuenta` (prioriza `disponible`, con fallbacks `saldoDisponible`, `cuentas.disponible`, `cuenta.disponible`, `cash`).
-- **Noticias mock sin duplicados**: cada ciclo refresca noticias mock para evitar acumulación de duplicados en DB.
+- **Noticias sin duplicados**: se evita insertar duplicados por `title + summary` (mock o provider real).
 - **UI/API más limpia**: `GET /api/news/recent` devuelve solo las últimas 10 noticias.
 
 
@@ -96,3 +96,16 @@ No hay endpoints de compra/venta implementados. Solo lectura.
 - La UI muestra: “Todavía no podés generar una nueva recomendación. Esperá X min Y s.”
 - El botón de trigger queda deshabilitado temporalmente con countdown local.
 - Si `GET /api/recommendations/current` responde 404, la UI lo interpreta como estado válido: “No hay recomendación abierta actualmente”.
+
+
+## Noticias reales (sin LLM)
+- El pipeline usa provider configurable por `.env` con interfaz `get_recent_news()`.
+- `NEWS_PROVIDER=mock` usa noticias simuladas (fallback seguro).
+- `NEWS_PROVIDER=rss` usa feeds RSS reales (`NEWS_RSS_URLS`) y clasificación rule-based mínima:
+  - `impact`: positivo / negativo / neutro
+  - `event_type`: earnings / guidance / inflación / tasas / regulatorio / geopolítico / sectorial / ia / otro
+  - `related_assets`: símbolos detectados en titular/resumen sobre la cartera
+  - `confidence`: score simple rule-based
+- Si el provider real no devuelve noticias, el sistema hace fallback a mock para no romper el ciclo.
+- Persistencia anti-duplicados: no inserta dos veces la misma noticia (`title + summary`).
+- `GET /api/news/recent` muestra solo las últimas 10 noticias.

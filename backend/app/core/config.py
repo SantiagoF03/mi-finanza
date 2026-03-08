@@ -18,6 +18,16 @@ class Settings(BaseSettings):
     iol_timeout_seconds: int = 15
     iol_use_sandbox: bool = False
 
+    news_provider: str = "mock"  # mock | rss
+    news_rss_urls: List[str] = Field(
+        default_factory=lambda: [
+            "https://www.investing.com/rss/news_25.rss",
+            "https://feeds.reuters.com/reuters/businessNews",
+        ]
+    )
+    news_timeout_seconds: int = 10
+    news_max_items: int = 20
+
     scheduler_enabled: bool = True
     analysis_frequency_days: int = 4
     trigger_cooldown_seconds: int = 60
@@ -29,9 +39,9 @@ class Settings(BaseSettings):
         default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "AL30", "BND", "CASH"]
     )
 
-    @field_validator("whitelist_assets", mode="before")
+    @field_validator("whitelist_assets", "news_rss_urls", mode="before")
     @classmethod
-    def parse_whitelist(cls, v):
+    def parse_csv_fields(cls, v):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
