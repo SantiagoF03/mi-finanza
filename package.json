@@ -1,21 +1,10 @@
 {
-  "name": "mi-finanzas",
-  "version": "0.2.1",
+  "name": "mi-finanza",
   "private": true,
-  "type": "module",
+  "version": "1.0.0",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "react": "18.3.1",
-    "react-dom": "18.3.1"
-  },
-  "devDependencies": {
-    "@tailwindcss/vite": "^4.1.12",
-    "@vitejs/plugin-react": "4.3.4",
-    "tailwindcss": "^4.1.12",
-    "vite": "5.4.3"
+    "frontend:install": "npm --prefix frontend install",
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build"
   }
 }
