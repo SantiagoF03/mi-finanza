@@ -9,9 +9,33 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
     action = "mantener"
     pct = 0.0
     actions = []
+    external_opportunities = []
     rationale = "Cartera estable sin señales fuertes."
     risks = "Riesgo moderado de mercado."
     confidence = 0.55
+
+    for item in news:
+        for symbol in item.get("related_assets", []):
+            if symbol not in held_set:
+                external_opportunities.append(
+                    {
+                        "symbol": symbol,
+                        "reason": item.get("title") or "Oportunidad detectada por noticia externa",
+                        "confidence": item.get("confidence", 0.5),
+                        "event_type": item.get("event_type", "otro"),
+                        "impact": item.get("impact", "neutro"),
+                    }
+                )
+
+    dedup_ops = []
+    seen = set()
+    for op in external_opportunities:
+        key = (op["symbol"], op["event_type"], op["impact"])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup_ops.append(op)
+    external_opportunities = dedup_ops
 
     if "Portfolio vacío o sin valor." in alerts:
         confidence = 0.3
@@ -86,4 +110,5 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         "risks": risks,
         "executive_summary": f"Sugerencia: {action}. Movimiento sugerido: {round(pct*100,2)}% del portfolio.",
         "actions": actions,
+        "external_opportunities": external_opportunities,
     }

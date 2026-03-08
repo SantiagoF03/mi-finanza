@@ -161,6 +161,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_source": news_source,
             "news_inserted": inserted_news,
             "news_used": len(news_items),
+            "external_opportunities": rec.get("external_opportunities", []),
         },
     )
     db.add(rec_model)

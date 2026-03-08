@@ -151,3 +151,47 @@ def test_mock_news_not_duplicated_between_cycles():
 
     assert first_count == 3
     assert second_count == 3
+
+
+def test_external_opportunity_for_non_held_asset():
+    snapshot = {
+        "total_value": 100,
+        "cash": 20,
+        "currency": "USD",
+        "positions": [{"symbol": "GGAL", "market_value": 80, "pnl_pct": 0.01}],
+    }
+    analysis = {"alerts": [], "weights_by_asset": {"GGAL": 0.8}, "rebalance_deviation": {"GGAL": 0.0}}
+    news = [{"impact": "positivo", "related_assets": ["AAPL"], "event_type": "earnings", "confidence": 0.7, "title": "AAPL supera expectativas"}]
+
+    rec = generate_recommendation(snapshot, analysis, news, max_move=0.1)
+    assert any(op["symbol"] == "AAPL" for op in rec["external_opportunities"])
+
+
+def test_non_held_asset_news_not_in_main_actions():
+    snapshot = {
+        "total_value": 100,
+        "cash": 20,
+        "currency": "USD",
+        "positions": [{"symbol": "GGAL", "market_value": 80, "pnl_pct": 0.01}],
+    }
+    analysis = {"alerts": [], "weights_by_asset": {"GGAL": 0.8}, "rebalance_deviation": {"GGAL": 0.0}}
+    news = [{"impact": "positivo", "related_assets": ["AAPL"], "event_type": "earnings", "confidence": 0.7, "title": "AAPL sube"}]
+
+    rec = generate_recommendation(snapshot, analysis, news, max_move=0.1)
+    assert rec["actions"] == []
+    assert rec["action"] == "mantener"
+
+
+def test_held_asset_news_can_influence_main_recommendation():
+    snapshot = {
+        "total_value": 100,
+        "cash": 20,
+        "currency": "USD",
+        "positions": [{"symbol": "GGAL", "market_value": 80, "pnl_pct": 0.01}],
+    }
+    analysis = {"alerts": [], "weights_by_asset": {"GGAL": 0.8}, "rebalance_deviation": {"GGAL": 0.0}}
+    news = [{"impact": "positivo", "related_assets": ["GGAL"], "event_type": "earnings", "confidence": 0.7, "title": "GGAL mejora"}]
+
+    rec = generate_recommendation(snapshot, analysis, news, max_move=0.1)
+    assert rec["action"] in {"aumentar posición", "mantener"}
+    assert all(a["symbol"] == "GGAL" for a in rec["actions"])

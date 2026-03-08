@@ -17,6 +17,74 @@ class BrokerClient(ABC):
         return {"status": "ok", "mode": "mock"}
 
 
+def map_iol_estadocuenta_cash(payload: dict[str, Any]) -> float:
+    """Extrae cash disponible desde /estadocuenta con fallbacks robustos."""
+    candidates = [
+        payload.get("disponible"),
+        payload.get("saldoDisponible"),
+        payload.get("cuentas", {}).get("disponible"),
+        payload.get("cuenta", {}).get("disponible"),
+        payload.get("cash"),
+    ]
+    for value in candidates:
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def map_iol_portfolio_to_snapshot(
+    payload: dict[str, Any],
+    default_currency: str = "ARS",
+    cash_override: float | None = None,
+) -> dict:
+    """Mapea respuesta variada de IOL al formato interno del MVP."""
+
+    titulos = payload.get("titulos") or payload.get("activos") or payload.get("positions") or []
+    portfolio_cash = payload.get("disponible")
+    if portfolio_cash is None:
+        portfolio_cash = payload.get("cuentas", {}).get("disponible")
+    if portfolio_cash is None:
+        portfolio_cash = payload.get("cash")
+    cash = float(cash_override if cash_override is not None else (portfolio_cash or 0))
+
+    currency = payload.get("moneda") or payload.get("currency") or default_currency
+
+    positions: list[dict[str, Any]] = []
+    for item in titulos:
+        symbol = item.get("simbolo") or item.get("ticker") or item.get("symbol")
+        if not symbol:
+            continue
+
+        quantity = float(item.get("cantidad") or item.get("quantity") or 0)
+        market_value = (
+            item.get("valorizado")
+            or item.get("valuado")
+            or item.get("marketValue")
+            or item.get("market_value")
+            or (quantity * float(item.get("ultimoPrecio") or item.get("lastPrice") or 0))
+        )
+        avg_price = item.get("precioPromedio") or item.get("averagePrice") or item.get("avg_price")
+        instrument_type = item.get("tipo") or item.get("tipoInstrumento") or item.get("instrumentType") or "UNKNOWN"
+
+        positions.append(
+            {
+                "symbol": symbol,
+                "quantity": quantity,
+                "market_value": float(market_value or 0),
+                "avg_price": float(avg_price) if avg_price is not None else None,
+                "instrument_type": instrument_type,
+                "asset_type": instrument_type,
+                "currency": item.get("moneda") or item.get("currency") or currency,
+                "pnl_pct": float(item.get("rentabilidad") or item.get("pnlPct") or 0),
+            }
+        )
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "currency": currency,
 def map_iol_estadocuenta_cash(payload: dict) -> float:
     """
     Extrae cash/disponible desde /api/v2/estadocuenta con varios fallbacks.
@@ -250,6 +318,12 @@ class IolBrokerClient(BrokerClient):
 
     def _authorized_get(self, path: str) -> httpx.Response:
         self._ensure_auth()
+        assert self._access_token
+        resp = self._client.get(f"{self.api_base}{path}", headers={"Authorization": f"Bearer {self._access_token}"})
+        if resp.status_code in {401, 403}:
+            if self._refresh_access_token():
+                assert self._access_token
+                resp = self._client.get(f"{self.api_base}{path}", headers={"Authorization": f"Bearer {self._access_token}"})
         assert self._access_token is not None
 
         resp = self._client.get(
@@ -272,11 +346,16 @@ class IolBrokerClient(BrokerClient):
         try:
             resp = self._authorized_get("/api/v2/estadocuenta")
             return {"status": "ok", "mode": "real", "http_status": resp.status_code}
+        except Exception as exc:  # pragma: no cover
         except Exception as exc:
             return {"status": "error", "mode": "real", "message": str(exc)}
 
     def get_portfolio_snapshot(self) -> dict:
         portfolio_resp = self._authorized_get(f"/api/v2/portafolio/{self.country}")
+        estado_resp = self._authorized_get("/api/v2/estadocuenta")
+        real_cash = map_iol_estadocuenta_cash(estado_resp.json())
+        return map_iol_portfolio_to_snapshot(portfolio_resp.json(), cash_override=real_cash)
+
         portfolio_payload = portfolio_resp.json()
 
         real_cash = 0.0

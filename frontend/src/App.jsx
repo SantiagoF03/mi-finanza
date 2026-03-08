@@ -169,6 +169,21 @@ export default function App() {
         </section>
       )}
 
+
+      {current && (current.external_opportunities || []).length > 0 && (
+        <section>
+          <h2>Oportunidades detectadas (activos para vigilar)</h2>
+          <p>Estas oportunidades son externas a tu cartera actual. No generan órdenes ni approve/reject.</p>
+          <ul>
+            {current.external_opportunities.map((op, idx) => (
+              <li key={`${op.symbol}-${idx}`}>
+                <strong>{op.symbol}</strong> | impacto: {op.impact} | tipo: {op.event_type} | confianza: {(Number(op.confidence || 0) * 100).toFixed(0)}% | motivo: {op.reason}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section>
         <h2>Noticias relevantes</h2>
         <ul>

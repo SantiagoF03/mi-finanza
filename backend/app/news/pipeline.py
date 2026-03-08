@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+import re
 from typing import Iterable
 from xml.etree import ElementTree
 
@@ -38,7 +39,7 @@ class MockNewsProvider(NewsProvider):
         symbol_b = universe[min(1, len(universe) - 1)]
         return [
             {
-                "title": "La FED mantiene tasas y sugiere prudencia",
+                "title": f"La FED mantiene tasas y sugiere prudencia para {symbol_a}",
                 "event_type": "tasas",
                 "impact": "neutro",
                 "confidence": 0.74,
@@ -47,7 +48,7 @@ class MockNewsProvider(NewsProvider):
                 "created_at": now,
             },
             {
-                "title": "Resultados sólidos en sectores relevantes de cartera",
+                "title": f"Resultados sólidos en sectores relevantes de cartera y {symbol_b}",
                 "event_type": "earnings",
                 "impact": "positivo",
                 "confidence": 0.68,
@@ -56,7 +57,7 @@ class MockNewsProvider(NewsProvider):
                 "created_at": now - timedelta(hours=8),
             },
             {
-                "title": "Nueva tensión geopolítica impacta activos emergentes",
+                "title": f"Nueva tensión geopolítica impacta activos emergentes como {symbol_b}",
                 "event_type": "geopolítico",
                 "impact": "negativo",
                 "confidence": 0.61,
@@ -87,6 +88,18 @@ class RssNewsProvider(NewsProvider):
         return deduplicate_news_items(items)[: self.max_items]
 
 
+def extract_market_symbols(text: str) -> list[str]:
+    candidates = re.findall(r"\b[A-Z]{2,6}\b", text)
+    blacklist = {"USD", "ARS", "FED", "CPI", "IPC", "AI", "ETF"}
+    out = []
+    for c in candidates:
+        if c in blacklist:
+            continue
+        if c not in out:
+            out.append(c)
+    return out
+
+
 def classify_news_event(title: str, summary: str, portfolio_symbols: list[str]) -> dict:
     text = f"{title} {summary}".lower()
 
@@ -112,7 +125,13 @@ def classify_news_event(title: str, summary: str, portfolio_symbols: list[str]) 
         confidence += 0.1
     confidence = round(min(0.95, confidence), 2)
 
-    related_assets = [s for s in portfolio_symbols if s.lower() in text]
+    raw_text = f"{title} {summary}"
+    detected = extract_market_symbols(raw_text)
+    held_mentions = [s for s in portfolio_symbols if s.lower() in text]
+    related_assets = []
+    for s in held_mentions + detected:
+        if s not in related_assets:
+            related_assets.append(s)
 
     return {
         "event_type": event_type,

@@ -109,3 +109,9 @@ No hay endpoints de compra/venta implementados. Solo lectura.
 - Si el provider real no devuelve noticias, el sistema hace fallback a mock para no romper el ciclo.
 - Persistencia anti-duplicados: no inserta dos veces la misma noticia (`title + summary`).
 - `GET /api/news/recent` muestra solo las últimas 10 noticias.
+
+
+## Recomendación principal vs oportunidades externas
+- **Recomendación principal de cartera**: usa holdings reales (`snapshot.positions`), análisis de cartera y señales de mercado que afecten la cartera; sus `actions` solo pueden apuntar a activos en cartera.
+- **Oportunidades externas de mercado**: noticias sobre activos no tenidos se guardan como `external_opportunities` (watchlist), con `symbol`, `reason`, `confidence`, `event_type`, `impact`.
+- Las oportunidades externas **no** se mezclan con `actions` y **no** disparan approve/reject.
