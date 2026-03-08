@@ -17,74 +17,169 @@ class BrokerClient(ABC):
         return {"status": "ok", "mode": "mock"}
 
 
-def map_iol_estadocuenta_cash(payload: dict[str, Any]) -> float:
-    """Extrae cash disponible desde /estadocuenta con fallbacks robustos."""
-    candidates = [
+def map_iol_estadocuenta_cash(payload: dict) -> float:
+    """
+    Extrae cash/disponible desde /api/v2/estadocuenta con varios fallbacks.
+    Soporta estructuras tipo dict y listas en 'cuentas'.
+    """
+    def to_float(value) -> float | None:
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    # Fallbacks directos en raíz
+    direct_candidates = [
         payload.get("disponible"),
         payload.get("saldoDisponible"),
-        payload.get("cuentas", {}).get("disponible"),
-        payload.get("cuenta", {}).get("disponible"),
         payload.get("cash"),
     ]
-    for value in candidates:
-        if value is not None:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
+
+    for candidate in direct_candidates:
+        parsed = to_float(candidate)
+        if parsed is not None:
+            return parsed
+
+    # Caso cuenta simple como dict
+    cuenta = payload.get("cuenta")
+    if isinstance(cuenta, dict):
+        for key in ["disponible", "saldoDisponible", "cash"]:
+            parsed = to_float(cuenta.get(key))
+            if parsed is not None:
+                return parsed
+
+    # Caso cuentas como dict
+    cuentas = payload.get("cuentas")
+    if isinstance(cuentas, dict):
+        for key in ["disponible", "saldoDisponible", "cash"]:
+            parsed = to_float(cuentas.get(key))
+            if parsed is not None:
+                return parsed
+
+    # Caso cuentas como lista
+    if isinstance(cuentas, list):
+        total = 0.0
+        found_any = False
+
+        for item in cuentas:
+            if not isinstance(item, dict):
                 continue
+
+            for key in ["disponible", "saldoDisponible", "cash"]:
+                parsed = to_float(item.get(key))
+                if parsed is not None:
+                    total += parsed
+                    found_any = True
+                    break
+
+        if found_any:
+            return total
+
     return 0.0
 
+def map_iol_portfolio_to_snapshot(payload: dict, cash_override: float | None = None) -> dict:
+    """
+    Normaliza el JSON real de IOL /api/v2/portafolio/{pais} al formato interno del MVP.
 
-def map_iol_portfolio_to_snapshot(
-    payload: dict[str, Any],
-    default_currency: str = "ARS",
-    cash_override: float | None = None,
-) -> dict:
-    """Mapea respuesta variada de IOL al formato interno del MVP."""
+    Soporta:
+    - estructura real V2 con "activos"
+    - estructura vieja/mock con "titulos" o "positions"
+    """
+    positions: list[dict] = []
 
-    titulos = payload.get("titulos") or payload.get("activos") or payload.get("positions") or []
-    portfolio_cash = payload.get("disponible")
-    if portfolio_cash is None:
-        portfolio_cash = payload.get("cuentas", {}).get("disponible")
-    if portfolio_cash is None:
-        portfolio_cash = payload.get("cash")
-    cash = float(cash_override if cash_override is not None else (portfolio_cash or 0))
+    def map_currency(iol_moneda: str | None) -> str:
+        m = (iol_moneda or "").strip().lower()
+        if m in {"peso_argentino", "peso argentino", "ars"}:
+            return "ARS"
+        if m in {"dolar_estadounidense", "dólar estadounidense", "usd", "u$s"}:
+            return "USD"
+        return "ARS"
 
-    currency = payload.get("moneda") or payload.get("currency") or default_currency
+    # ===== Caso real IOL V2: activos =====
+    activos = payload.get("activos") or []
+    if isinstance(activos, list) and activos:
+        for a in activos:
+            if not isinstance(a, dict):
+                continue
 
-    positions: list[dict[str, Any]] = []
-    for item in titulos:
-        symbol = item.get("simbolo") or item.get("ticker") or item.get("symbol")
-        if not symbol:
-            continue
+            titulo = a.get("titulo") or {}
+            if not isinstance(titulo, dict):
+                titulo = {}
 
-        quantity = float(item.get("cantidad") or item.get("quantity") or 0)
-        market_value = (
-            item.get("valorizado")
-            or item.get("valuado")
-            or item.get("marketValue")
-            or item.get("market_value")
-            or (quantity * float(item.get("ultimoPrecio") or item.get("lastPrice") or 0))
-        )
-        avg_price = item.get("precioPromedio") or item.get("averagePrice") or item.get("avg_price")
-        instrument_type = item.get("tipo") or item.get("tipoInstrumento") or item.get("instrumentType") or "UNKNOWN"
+            symbol = titulo.get("simbolo") or ""
+            if not symbol:
+                continue
 
-        positions.append(
-            {
-                "symbol": symbol,
-                "quantity": quantity,
-                "market_value": float(market_value or 0),
-                "avg_price": float(avg_price) if avg_price is not None else None,
-                "instrument_type": instrument_type,
-                "asset_type": instrument_type,
-                "currency": item.get("moneda") or item.get("currency") or currency,
-                "pnl_pct": float(item.get("rentabilidad") or item.get("pnlPct") or 0),
-            }
-        )
+            iol_tipo = (titulo.get("tipo") or "").strip()
+            iol_moneda = titulo.get("moneda")
+
+            try:
+                quantity = float(a.get("cantidad") or 0.0)
+            except (TypeError, ValueError):
+                quantity = 0.0
+
+            try:
+                market_value = float(a.get("valorizado") or 0.0)
+            except (TypeError, ValueError):
+                market_value = 0.0
+
+            try:
+                avg_price = float(a.get("ppc") or 0.0)
+            except (TypeError, ValueError):
+                avg_price = 0.0
+
+            try:
+                pnl_pct = float(a.get("gananciaPorcentaje") or 0.0) / 100.0
+            except (TypeError, ValueError):
+                pnl_pct = 0.0
+
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "asset_type": iol_tipo or "DESCONOCIDO",
+                    "instrument_type": iol_tipo or "DESCONOCIDO",
+                    "currency": map_currency(iol_moneda),
+                    "quantity": quantity,
+                    "market_value": market_value,
+                    "avg_price": avg_price,
+                    "pnl_pct": pnl_pct,
+                }
+            )
+
+    # ===== Fallback legacy: titulos =====
+    elif isinstance(payload.get("titulos"), list):
+        for t in payload.get("titulos", []):
+            if not isinstance(t, dict):
+                continue
+            symbol = t.get("simbolo") or ""
+            if not symbol:
+                continue
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "asset_type": t.get("tipo") or "DESCONOCIDO",
+                    "instrument_type": t.get("tipo") or "DESCONOCIDO",
+                    "currency": payload.get("moneda", "ARS"),
+                    "quantity": float(t.get("cantidad") or 0.0),
+                    "market_value": float(t.get("valorizado") or 0.0),
+                    "avg_price": float(t.get("precioPromedio") or 0.0),
+                    "pnl_pct": 0.0,
+                }
+            )
+
+    # ===== Fallback extra: positions ya normalizadas =====
+    elif isinstance(payload.get("positions"), list):
+        for p in payload.get("positions", []):
+            if isinstance(p, dict):
+                positions.append(p)
+
+    cash = cash_override if cash_override is not None else float(payload.get("disponible") or 0.0)
 
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "currency": currency,
+        "timestamp": datetime.utcnow().isoformat() + "+00:00",
+        "currency": "ARS",
         "cash": cash,
         "positions": positions,
     }
@@ -133,6 +228,7 @@ class IolBrokerClient(BrokerClient):
     def _refresh_access_token(self) -> bool:
         if not self._refresh_token:
             return False
+
         resp = self._client.post(
             f"{self.api_base}/token",
             data={
@@ -143,6 +239,7 @@ class IolBrokerClient(BrokerClient):
         )
         if resp.status_code >= 400:
             return False
+
         self._set_tokens(resp.json())
         return True
 
@@ -153,12 +250,21 @@ class IolBrokerClient(BrokerClient):
 
     def _authorized_get(self, path: str) -> httpx.Response:
         self._ensure_auth()
-        assert self._access_token
-        resp = self._client.get(f"{self.api_base}{path}", headers={"Authorization": f"Bearer {self._access_token}"})
+        assert self._access_token is not None
+
+        resp = self._client.get(
+            f"{self.api_base}{path}",
+            headers={"Authorization": f"Bearer {self._access_token}"},
+        )
+
         if resp.status_code in {401, 403}:
             if self._refresh_access_token():
-                assert self._access_token
-                resp = self._client.get(f"{self.api_base}{path}", headers={"Authorization": f"Bearer {self._access_token}"})
+                assert self._access_token is not None
+                resp = self._client.get(
+                    f"{self.api_base}{path}",
+                    headers={"Authorization": f"Bearer {self._access_token}"},
+                )
+
         resp.raise_for_status()
         return resp
 
@@ -166,15 +272,21 @@ class IolBrokerClient(BrokerClient):
         try:
             resp = self._authorized_get("/api/v2/estadocuenta")
             return {"status": "ok", "mode": "real", "http_status": resp.status_code}
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:
             return {"status": "error", "mode": "real", "message": str(exc)}
 
     def get_portfolio_snapshot(self) -> dict:
         portfolio_resp = self._authorized_get(f"/api/v2/portafolio/{self.country}")
-        estado_resp = self._authorized_get("/api/v2/estadocuenta")
-        real_cash = map_iol_estadocuenta_cash(estado_resp.json())
-        return map_iol_portfolio_to_snapshot(portfolio_resp.json(), cash_override=real_cash)
+        portfolio_payload = portfolio_resp.json()
 
+        real_cash = 0.0
+        try:
+            estado_resp = self._authorized_get("/api/v2/estadocuenta")
+            real_cash = map_iol_estadocuenta_cash(estado_resp.json())
+        except Exception:
+            real_cash = 0.0
+
+        return map_iol_portfolio_to_snapshot(portfolio_payload, cash_override=real_cash)
 
 class MockBrokerClient(BrokerClient):
     def get_portfolio_snapshot(self) -> dict:
