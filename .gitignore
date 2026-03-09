@@ -24,3 +24,7 @@ dist-ssr
 *.sw?
 backend/data/
 backend/target/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
