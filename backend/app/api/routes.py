@@ -91,10 +91,6 @@ def current_recommendation(db: Session = Depends(get_db)):
         "rules_applied": rec.metadata_json.get("rules", []),
         "broker_mode": rec.metadata_json.get("broker_mode", "unknown"),
         "external_opportunities": rec.metadata_json.get("external_opportunities", []),
-        "unchanged": rec.metadata_json.get("unchanged", False),
-        "unchanged_reason": rec.metadata_json.get("unchanged_reason", ""),
-        "news_summary": rec.metadata_json.get("news_summary"),
-        "recommendation_explanation_llm": rec.metadata_json.get("recommendation_explanation_llm"),
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 

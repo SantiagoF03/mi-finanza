@@ -1,13 +1,12 @@
-from types import SimpleNamespace
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.session import Base
-from app.models.models import Recommendation, RecommendationAction
+from app.models.models import Recommendation
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
 from app.rules.engine import enforce_rules
-from app.services.orchestrator import detect_material_change, get_current_recommendation, run_cycle
+from app.services.orchestrator import get_current_recommendation, run_cycle
 from app.core.config import get_settings
 
 
@@ -196,94 +195,3 @@ def test_held_asset_news_can_influence_main_recommendation():
     rec = generate_recommendation(snapshot, analysis, news, max_move=0.1)
     assert rec["action"] in {"aumentar posición", "mantener"}
     assert all(a["symbol"] == "GGAL" for a in rec["actions"])
-
-
-def test_detect_material_change_equal_or_minimal_diff_is_unchanged():
-    settings = get_settings()
-    settings.recommendation_unchanged_pct_threshold = 0.01
-    settings.recommendation_unchanged_risk_threshold = 0.03
-
-    previous = SimpleNamespace(
-        action="mantener",
-        blocked_reason="",
-        suggested_pct=0.05,
-        metadata_json={
-            "analysis": {"risk_score": 0.4, "concentration_score": 0.5, "alerts": ["A"]},
-            "news_fingerprint": "n1",
-        },
-    )
-    prev_actions = [SimpleNamespace(symbol="GGAL")]
-    new_rec = {"action": "mantener", "blocked_reason": "", "suggested_pct": 0.055, "actions": [{"symbol": "GGAL"}]}
-    analysis = {"risk_score": 0.42, "concentration_score": 0.51, "alerts": ["A"]}
-
-    unchanged, _ = detect_material_change(previous, prev_actions, new_rec, analysis, "n1", settings)
-    assert unchanged is True
-
-
-def test_detect_material_change_when_distinct_is_false():
-    settings = get_settings()
-    previous = SimpleNamespace(
-        action="mantener",
-        blocked_reason="",
-        suggested_pct=0.01,
-        metadata_json={"analysis": {"risk_score": 0.2, "concentration_score": 0.3, "alerts": []}, "news_fingerprint": "old"},
-    )
-    prev_actions = [SimpleNamespace(symbol="GGAL")]
-    new_rec = {"action": "rebalancear", "blocked_reason": "", "suggested_pct": 0.1, "actions": [{"symbol": "YPFD"}]}
-    analysis = {"risk_score": 0.8, "concentration_score": 0.7, "alerts": ["X"]}
-
-    unchanged, _ = detect_material_change(previous, prev_actions, new_rec, analysis, "new", settings)
-    assert unchanged is False
-
-
-def test_llm_disabled_fallback_metadata_fields_present(monkeypatch):
-    db = make_db()
-    s = get_settings()
-    s.trigger_cooldown_seconds = 0
-    s.llm_enabled = False
-
-    out = run_cycle(db)
-    rec = db.query(Recommendation).filter(Recommendation.id == out["recommendation_id"]).first()
-    assert rec.metadata_json.get("news_summary") is None
-    assert rec.metadata_json.get("recommendation_explanation_llm") is None
-
-
-def test_llm_error_fallback_does_not_break_cycle(monkeypatch):
-    db = make_db()
-    s = get_settings()
-    s.trigger_cooldown_seconds = 0
-    s.llm_enabled = True
-
-    import app.services.orchestrator as orch
-
-    monkeypatch.setattr(orch, "summarize_news", lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("llm timeout")))
-    monkeypatch.setattr(orch, "explain_recommendation", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("llm down")))
-
-    out = run_cycle(db)
-    rec = db.query(Recommendation).filter(Recommendation.id == out["recommendation_id"]).first()
-    assert rec.metadata_json.get("news_summary") is None
-    assert rec.metadata_json.get("recommendation_explanation_llm") is None
-
-
-def test_llm_never_alters_structured_recommendation(monkeypatch):
-    db = make_db()
-    s = get_settings()
-    s.trigger_cooldown_seconds = 0
-    s.llm_enabled = True
-
-    import app.services.orchestrator as orch
-
-    def mutating_explainer(recommendation, *args, **kwargs):
-        recommendation["action"] = "MALICIOUS"
-        recommendation["actions"] = [{"symbol": "FAKE", "target_change_pct": 1.0, "reason": "bad"}]
-        return "texto"
-
-    monkeypatch.setattr(orch, "summarize_news", lambda *args, **kwargs: "resumen")
-    monkeypatch.setattr(orch, "explain_recommendation", mutating_explainer)
-
-    out = run_cycle(db)
-    rec = db.query(Recommendation).filter(Recommendation.id == out["recommendation_id"]).first()
-    actions = db.query(RecommendationAction).filter(RecommendationAction.recommendation_id == rec.id).all()
-
-    assert rec.action != "MALICIOUS"
-    assert all(a.symbol != "FAKE" for a in actions)

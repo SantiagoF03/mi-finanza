@@ -4,8 +4,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session
 
 from app.broker.clients import IolBrokerClient, MockBrokerClient
-from app.core.config import Settings, get_settings
-from app.llm.explainer import explain_recommendation, summarize_news
+from app.core.config import get_settings
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
 from app.portfolio.analyzer import analyze_portfolio
@@ -85,65 +84,6 @@ def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int
     return inserted
 
 
-def _news_fingerprint(news_items: list[dict]) -> str:
-    keys = []
-    for n in news_items:
-        keys.append(
-            f"{(n.get('title') or '').strip().lower()}|{n.get('impact','neutro')}|{','.join(sorted(n.get('related_assets', [])))}"
-        )
-    return "||".join(sorted(keys))
-
-
-def detect_material_change(
-    previous_rec: Recommendation | None,
-    previous_actions: list[RecommendationAction],
-    new_rec: dict,
-    analysis: dict,
-    news_fingerprint: str,
-    settings: Settings,
-) -> tuple[bool, str]:
-    if not previous_rec:
-        return False, "Primer ciclo con recomendación nueva."
-
-    prev_symbols = sorted(a.symbol for a in previous_actions)
-    new_symbols = sorted(a.get("symbol") for a in new_rec.get("actions", []) if a.get("symbol"))
-
-    prev_analysis = previous_rec.metadata_json.get("analysis", {}) if previous_rec.metadata_json else {}
-    prev_alerts = set(prev_analysis.get("alerts", []))
-    new_alerts = set(analysis.get("alerts", []))
-
-    prev_pct = float(previous_rec.suggested_pct or 0)
-    new_pct = float(new_rec.get("suggested_pct", 0) or 0)
-    pct_diff = abs(prev_pct - new_pct)
-
-    prev_risk = float(prev_analysis.get("risk_score", 0) or 0)
-    new_risk = float(analysis.get("risk_score", 0) or 0)
-    risk_diff = abs(prev_risk - new_risk)
-
-    prev_conc = float(prev_analysis.get("concentration_score", 0) or 0)
-    new_conc = float(analysis.get("concentration_score", 0) or 0)
-    conc_diff = abs(prev_conc - new_conc)
-
-    prev_news_fp = (previous_rec.metadata_json or {}).get("news_fingerprint", "")
-
-    unchanged = all(
-        [
-            previous_rec.action == new_rec.get("action"),
-            previous_rec.blocked_reason == new_rec.get("blocked_reason", ""),
-            prev_symbols == new_symbols,
-            pct_diff <= settings.recommendation_unchanged_pct_threshold,
-            risk_diff <= settings.recommendation_unchanged_risk_threshold,
-            conc_diff <= settings.recommendation_unchanged_risk_threshold,
-            prev_alerts == new_alerts,
-            prev_news_fp == news_fingerprint,
-        ]
-    )
-
-    if unchanged:
-        return True, "No hubo cambios materiales desde el último análisis."
-    return False, "Se detectaron cambios materiales vs el ciclo anterior."
-
-
 def run_cycle(db: Session, source: str = "manual") -> dict:
     settings = get_settings()
 
@@ -193,7 +133,6 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
 
     news_items, news_source = _load_news_items(positions)
     inserted_news = _persist_news_without_duplicates(db, news_items)
-    news_fp = _news_fingerprint(news_items)
 
     snapshot_dict = {
         "total_value": total,
@@ -204,23 +143,6 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     analysis = analyze_portfolio(snapshot_dict)
     rec = generate_recommendation(snapshot_dict, analysis, news_items, settings.max_movement_per_cycle)
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle)
-
-    previous_actions = []
-    if latest:
-        previous_actions = db.query(RecommendationAction).filter(RecommendationAction.recommendation_id == latest.id).all()
-    unchanged, unchanged_reason = detect_material_change(latest, previous_actions, rec, analysis, news_fp, settings)
-
-    news_summary = None
-    recommendation_explanation_llm = None
-    try:
-        news_summary = summarize_news(news_items, snapshot_dict, analysis)
-    except Exception as exc:
-        app_log(db, "LLM summarize fallback", level="WARNING", context={"error": str(exc)})
-
-    try:
-        recommendation_explanation_llm = explain_recommendation(dict(rec), snapshot_dict, analysis, list(news_items), unchanged)
-    except Exception as exc:
-        app_log(db, "LLM explanation fallback", level="WARNING", context={"error": str(exc)})
 
     rec_model = Recommendation(
         action=rec["action"],
@@ -239,12 +161,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_source": news_source,
             "news_inserted": inserted_news,
             "news_used": len(news_items),
-            "news_fingerprint": news_fp,
             "external_opportunities": rec.get("external_opportunities", []),
-            "unchanged": unchanged,
-            "unchanged_reason": unchanged_reason,
-            "news_summary": news_summary,
-            "recommendation_explanation_llm": recommendation_explanation_llm,
         },
     )
     db.add(rec_model)
@@ -263,7 +180,6 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "broker_mode": broker_mode,
             "news_source": news_source,
             "news_inserted": inserted_news,
-            "unchanged": unchanged,
         },
     )
 
@@ -275,6 +191,4 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         "blocked_reason": rec_model.blocked_reason,
         "broker_mode": broker_mode,
         "news_source": news_source,
-        "unchanged": unchanged,
-        "unchanged_reason": unchanged_reason,
     }

@@ -34,16 +34,7 @@ class Settings(BaseSettings):
     investor_profile: str = "moderado"
     max_movement_per_cycle: float = 0.10
     min_liquidity_pct: float = 0.05
-
-    recommendation_unchanged_pct_threshold: float = 0.01
-    recommendation_unchanged_risk_threshold: float = 0.03
-
     llm_enabled: bool = False
-    llm_provider: str = "openai"
-    llm_api_key: str = ""
-    llm_model: str = "gpt-4o-mini"
-    llm_timeout_seconds: int = 15
-
     whitelist_assets: List[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "AL30", "BND", "CASH"]
     )

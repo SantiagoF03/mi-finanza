@@ -145,16 +145,6 @@ export default function App() {
 
       {currentInfo && <p>{currentInfo}</p>}
 
-      {current?.unchanged && (
-        <section>
-          <h2>Sin cambios materiales</h2>
-          <p style={{ color: '#7a2e0a', fontWeight: 600 }}>
-            No hubo cambios materiales desde el último análisis.
-          </p>
-          <p>{current.unchanged_reason}</p>
-        </section>
-      )}
-
       {current && (
         <section>
           <h2>Recomendación actual</h2>
@@ -179,19 +169,6 @@ export default function App() {
         </section>
       )}
 
-      {current && current.news_summary && (
-        <section>
-          <h2>Resumen de noticias</h2>
-          <p>{current.news_summary}</p>
-        </section>
-      )}
-
-      {current && (
-        <section>
-          <h2>Explicación ampliada</h2>
-          <p>{current.recommendation_explanation_llm || current.executive_summary}</p>
-        </section>
-      )}
 
       {current && (current.external_opportunities || []).length > 0 && (
         <section>
