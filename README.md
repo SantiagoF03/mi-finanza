@@ -115,3 +115,37 @@ No hay endpoints de compra/venta implementados. Solo lectura.
 - **Recomendación principal de cartera**: usa holdings reales (`snapshot.positions`), análisis de cartera y señales de mercado que afecten la cartera; sus `actions` solo pueden apuntar a activos en cartera.
 - **Oportunidades externas de mercado**: noticias sobre activos no tenidos se guardan como `external_opportunities` (watchlist), con `symbol`, `reason`, `confidence`, `event_type`, `impact`.
 - Las oportunidades externas **no** se mezclan con `actions` y **no** disparan approve/reject.
+
+
+## Detección de “sin cambios materiales”
+- El ciclo compara la nueva recomendación contra la última relevante usando criterios MVP explícitos:
+  - `action`
+  - símbolos principales en `actions`
+  - diferencia de `suggested_pct` (umbral `RECOMMENDATION_UNCHANGED_PCT_THRESHOLD`)
+  - `blocked_reason`
+  - señales de análisis (`risk_score`, `concentration_score`, `alerts`)
+  - fingerprint de noticias
+- Si no hay cambios materiales, se guarda en metadata:
+  - `unchanged=true`
+  - `unchanged_reason`
+- La UI muestra el mensaje: “No hubo cambios materiales desde el último análisis.”
+
+## Capa LLM (solo explicación)
+- Módulo: `backend/app/llm/explainer.py`.
+- Usa LLM **solo** para:
+  - `news_summary`
+  - `recommendation_explanation_llm`
+- El LLM **no** decide:
+  - símbolos
+  - porcentajes
+  - reglas hard
+  - estados (`pending/blocked/approved/rejected/superseded`)
+- Si está deshabilitado o falla, el ciclo sigue con fallback rule-based y no se rompe.
+- Variables nuevas:
+- `LLM_ENABLED`, `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS`.
+
+### Nota de resiliencia (MVP)
+
+- Si el proveedor LLM está deshabilitado o falla por timeout/error, el flujo **no** corta el ciclo.
+- En ese caso, la recomendación estructurada sigue saliendo por reglas (rule-based) y los campos
+  `news_summary` / `recommendation_explanation_llm` pueden venir en `null`.
