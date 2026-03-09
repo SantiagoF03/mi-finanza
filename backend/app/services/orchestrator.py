@@ -5,10 +5,12 @@ from sqlalchemy.orm import Session
 
 from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
+from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
+from app.recommendations.unchanged import detect_unchanged
 from app.rules.engine import enforce_rules
 from app.services.logs import app_log
 
@@ -144,6 +146,36 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     rec = generate_recommendation(snapshot_dict, analysis, news_items, settings.max_movement_per_cycle)
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle)
 
+    # --- Unchanged detection ---
+    prev_rec = (
+        db.query(Recommendation)
+        .filter(Recommendation.status.in_(["pending", "blocked", "superseded", "approved", "rejected"]))
+        .order_by(desc(Recommendation.created_at))
+        .first()
+    )
+    # Attach news count temporarily for unchanged detection
+    rec["_news_items"] = news_items
+    unchanged, unchanged_reason = detect_unchanged(
+        rec,
+        prev_rec,
+        analysis,
+        pct_threshold=settings.recommendation_unchanged_pct_threshold,
+        risk_threshold=settings.recommendation_unchanged_risk_threshold,
+    )
+    rec.pop("_news_items", None)
+
+    # --- LLM explanation layer (best-effort, never breaks cycle) ---
+    news_summary = None
+    recommendation_explanation_llm = None
+    try:
+        news_summary = llm_summarize(news_items, snapshot_dict, analysis)
+    except Exception:
+        pass
+    try:
+        recommendation_explanation_llm = llm_explain(rec, snapshot_dict, analysis, news_items, unchanged=unchanged)
+    except Exception:
+        pass
+
     rec_model = Recommendation(
         action=rec["action"],
         status=rec["status"],
@@ -162,6 +194,10 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_inserted": inserted_news,
             "news_used": len(news_items),
             "external_opportunities": rec.get("external_opportunities", []),
+            "unchanged": unchanged,
+            "unchanged_reason": unchanged_reason,
+            "news_summary": news_summary,
+            "recommendation_explanation_llm": recommendation_explanation_llm,
         },
     )
     db.add(rec_model)
@@ -180,6 +216,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "broker_mode": broker_mode,
             "news_source": news_source,
             "news_inserted": inserted_news,
+            "unchanged": unchanged,
         },
     )
 
@@ -191,4 +228,6 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         "blocked_reason": rec_model.blocked_reason,
         "broker_mode": broker_mode,
         "news_source": news_source,
+        "unchanged": unchanged,
+        "unchanged_reason": unchanged_reason,
     }

@@ -85,6 +85,10 @@ def map_iol_portfolio_to_snapshot(
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "currency": currency,
+        "positions": positions,
+    }
+
+
 def map_iol_estadocuenta_cash(payload: dict) -> float:
     """
     Extrae cash/disponible desde /api/v2/estadocuenta con varios fallbacks.
@@ -318,12 +322,6 @@ class IolBrokerClient(BrokerClient):
 
     def _authorized_get(self, path: str) -> httpx.Response:
         self._ensure_auth()
-        assert self._access_token
-        resp = self._client.get(f"{self.api_base}{path}", headers={"Authorization": f"Bearer {self._access_token}"})
-        if resp.status_code in {401, 403}:
-            if self._refresh_access_token():
-                assert self._access_token
-                resp = self._client.get(f"{self.api_base}{path}", headers={"Authorization": f"Bearer {self._access_token}"})
         assert self._access_token is not None
 
         resp = self._client.get(
@@ -346,17 +344,11 @@ class IolBrokerClient(BrokerClient):
         try:
             resp = self._authorized_get("/api/v2/estadocuenta")
             return {"status": "ok", "mode": "real", "http_status": resp.status_code}
-        except Exception as exc:  # pragma: no cover
         except Exception as exc:
             return {"status": "error", "mode": "real", "message": str(exc)}
 
     def get_portfolio_snapshot(self) -> dict:
         portfolio_resp = self._authorized_get(f"/api/v2/portafolio/{self.country}")
-        estado_resp = self._authorized_get("/api/v2/estadocuenta")
-        real_cash = map_iol_estadocuenta_cash(estado_resp.json())
-        return map_iol_portfolio_to_snapshot(portfolio_resp.json(), cash_override=real_cash)
-
-        portfolio_payload = portfolio_resp.json()
 
         real_cash = 0.0
         try:
@@ -365,7 +357,8 @@ class IolBrokerClient(BrokerClient):
         except Exception:
             real_cash = 0.0
 
-        return map_iol_portfolio_to_snapshot(portfolio_payload, cash_override=real_cash)
+        return map_iol_portfolio_to_snapshot(portfolio_resp.json(), cash_override=real_cash)
+
 
 class MockBrokerClient(BrokerClient):
     def get_portfolio_snapshot(self) -> dict:

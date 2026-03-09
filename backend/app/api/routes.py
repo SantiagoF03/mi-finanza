@@ -77,6 +77,7 @@ def current_recommendation(db: Session = Depends(get_db)):
     if not rec:
         raise HTTPException(404, "No active recommendation")
     rec = db.query(Recommendation).options(joinedload(Recommendation.actions)).filter(Recommendation.id == rec.id).first()
+    meta = rec.metadata_json or {}
     return {
         "id": rec.id,
         "action": rec.action,
@@ -88,9 +89,13 @@ def current_recommendation(db: Session = Depends(get_db)):
         "risks": rec.risks,
         "executive_summary": rec.executive_summary,
         "created_at": rec.created_at,
-        "rules_applied": rec.metadata_json.get("rules", []),
-        "broker_mode": rec.metadata_json.get("broker_mode", "unknown"),
-        "external_opportunities": rec.metadata_json.get("external_opportunities", []),
+        "rules_applied": meta.get("rules", []),
+        "broker_mode": meta.get("broker_mode", "unknown"),
+        "external_opportunities": meta.get("external_opportunities", []),
+        "unchanged": meta.get("unchanged", False),
+        "unchanged_reason": meta.get("unchanged_reason", ""),
+        "news_summary": meta.get("news_summary"),
+        "recommendation_explanation_llm": meta.get("recommendation_explanation_llm"),
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 

@@ -148,12 +148,17 @@ export default function App() {
       {current && (
         <section>
           <h2>Recomendación actual</h2>
+          {current.unchanged && (
+            <p style={{ background: '#e8f5e9', padding: '8px 12px', borderRadius: 6, fontWeight: 600 }}>
+              No hubo cambios materiales desde el último análisis. Se mantiene la recomendación anterior.
+            </p>
+          )}
           <p>Estado: <strong>{current.status}</strong></p>
           {current.status === 'blocked' && <p style={{ color: '#b42318' }}>Bloqueada por reglas: {current.blocked_reason}</p>}
           <p>Acción: <strong>{current.action}</strong></p>
           <p>Porcentaje sugerido: {(current.suggested_pct * 100).toFixed(2)}%</p>
           <p>Confianza: {(current.confidence * 100).toFixed(0)}%</p>
-          <p>Motivo: {current.rationale}</p>
+          <p>Motivo: {current.recommendation_explanation_llm || current.rationale}</p>
           <p>Riesgos: {current.risks}</p>
           <p>Resumen ejecutivo: {current.executive_summary}</p>
           <p>Reglas aplicadas: {(current.rules_applied || []).join(' | ') || 'Sin bloqueos'}</p>
@@ -186,6 +191,12 @@ export default function App() {
 
       <section>
         <h2>Noticias relevantes</h2>
+        {current?.news_summary && (
+          <div style={{ background: '#f3f4f6', padding: '8px 12px', borderRadius: 6, marginBottom: 12, whiteSpace: 'pre-wrap' }}>
+            <strong>Resumen de noticias (LLM):</strong>
+            <p>{current.news_summary}</p>
+          </div>
+        )}
         <ul>
           {news.map((item) => (
             <li key={item.id}>

@@ -118,34 +118,74 @@ No hay endpoints de compra/venta implementados. Solo lectura.
 
 
 ## Detección de “sin cambios materiales”
-- El ciclo compara la nueva recomendación contra la última relevante usando criterios MVP explícitos:
-  - `action`
-  - símbolos principales en `actions`
-  - diferencia de `suggested_pct` (umbral `RECOMMENDATION_UNCHANGED_PCT_THRESHOLD`)
-  - `blocked_reason`
-  - señales de análisis (`risk_score`, `concentration_score`, `alerts`)
-  - fingerprint de noticias
-- Si no hay cambios materiales, se guarda en metadata:
-  - `unchanged=true`
-  - `unchanged_reason`
-- La UI muestra el mensaje: “No hubo cambios materiales desde el último análisis.”
+
+Implementado en `backend/app/recommendations/unchanged.py`.
+
+El ciclo compara la nueva recomendación contra la última relevante (cualquier estado) usando estos criterios MVP:
+
+| Criterio | Detalle |
+|---|---|
+| `action` | Si cambió la acción (mantener, reducir riesgo, etc.) |
+| símbolos en `actions` | Si los activos afectados cambiaron |
+| `suggested_pct` | Diferencia > `RECOMMENDATION_UNCHANGED_PCT_THRESHOLD` (default 0.01) |
+| `blocked_reason` | Si la razón de bloqueo cambió |
+| `risk_score` | Diferencia > `RECOMMENDATION_UNCHANGED_RISK_THRESHOLD` (default 0.03) |
+| `concentration_score` | Diferencia > umbral de riesgo |
+| `alerts` | Si las alertas de análisis cambiaron |
+| noticias | Si la cantidad de noticias cambió en >= 2 |
+| oportunidades externas | Si los símbolos de oportunidades cambiaron |
+
+Si **ningún** criterio cambia materialmente → `unchanged=true`.
+
+Campos persistidos en `metadata_json`:
+- `unchanged`: bool
+- `unchanged_reason`: string explicativo
+
+Campos expuestos en `GET /api/recommendations/current`:
+- `unchanged`: bool
+- `unchanged_reason`: string
+
+En frontend: si `unchanged=true`, se muestra un banner verde: *”No hubo cambios materiales desde el último análisis.”*
+
+Variables de configuración:
+- `RECOMMENDATION_UNCHANGED_PCT_THRESHOLD` (default: 0.01)
+- `RECOMMENDATION_UNCHANGED_RISK_THRESHOLD` (default: 0.03)
 
 ## Capa LLM (solo explicación)
-- Módulo: `backend/app/llm/explainer.py`.
-- Usa LLM **solo** para:
-  - `news_summary`
-  - `recommendation_explanation_llm`
-- El LLM **no** decide:
-  - símbolos
-  - porcentajes
-  - reglas hard
-  - estados (`pending/blocked/approved/rejected/superseded`)
-- Si está deshabilitado o falla, el ciclo sigue con fallback rule-based y no se rompe.
-- Variables nuevas:
-- `LLM_ENABLED`, `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS`.
 
-### Nota de resiliencia (MVP)
+Módulo: `backend/app/llm/explainer.py`.
 
-- Si el proveedor LLM está deshabilitado o falla por timeout/error, el flujo **no** corta el ciclo.
-- En ese caso, la recomendación estructurada sigue saliendo por reglas (rule-based) y los campos
-  `news_summary` / `recommendation_explanation_llm` pueden venir en `null`.
+El LLM se usa **solo** para generar texto explicativo:
+- `news_summary`: resumen legible de noticias recientes
+- `recommendation_explanation_llm`: explicación en lenguaje simple de la recomendación
+
+El LLM **NO** decide ni modifica:
+- símbolos, porcentajes, reglas hard, estados (`pending/blocked/approved/rejected/superseded`)
+- La recomendación estructurada siempre sale del motor rule-based
+
+Campos persistidos en `metadata_json` y expuestos en API:
+- `news_summary`: string | null
+- `recommendation_explanation_llm`: string | null
+
+En frontend:
+- Si `recommendation_explanation_llm` existe, se usa como motivo principal (en vez de `rationale`)
+- Si `news_summary` existe, se muestra en la sección de noticias
+- Si no existen, se usan `rationale`/`executive_summary` normales
+
+### Configuración LLM (.env)
+```
+LLM_ENABLED=false          # true para activar
+LLM_PROVIDER=openai        # solo openai soportado
+LLM_API_KEY=               # API key del proveedor
+LLM_MODEL=gpt-4o-mini      # modelo a usar
+LLM_TIMEOUT_SECONDS=15     # timeout de la llamada
+```
+
+Para activar: setear `LLM_ENABLED=true` y `LLM_API_KEY=sk-...` en `.env`.
+Para desactivar: `LLM_ENABLED=false` (default).
+
+### Resiliencia
+
+- Si el LLM está deshabilitado o falla por timeout/error, el ciclo **no** se rompe.
+- La recomendación estructurada sigue saliendo por reglas (rule-based).
+- Los campos `news_summary` / `recommendation_explanation_llm` quedan en `null`.
