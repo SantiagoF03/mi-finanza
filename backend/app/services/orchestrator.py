@@ -169,12 +169,19 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     recommendation_explanation_llm = None
     try:
         news_summary = llm_summarize(news_items, snapshot_dict, analysis)
-    except Exception:
-        pass
+        print("LLM news_summary OK:", news_summary)
+    except Exception as exc:
+        print("LLM summarize failed:", repr(exc))
+        news_summary = None
+
     try:
-        recommendation_explanation_llm = llm_explain(rec, snapshot_dict, analysis, news_items, unchanged=unchanged)
-    except Exception:
-        pass
+        recommendation_explanation_llm = llm_explain(
+        rec, snapshot_dict, analysis, news_items, unchanged=unchanged
+        )
+        print("LLM recommendation_explanation_llm OK:", recommendation_explanation_llm)
+    except Exception as exc:
+        print("LLM explain failed:", repr(exc))
+        recommendation_explanation_llm = None
 
     rec_model = Recommendation(
         action=rec["action"],

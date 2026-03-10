@@ -11,89 +11,19 @@ from app.core.config import get_settings
 
 class BrokerClient(ABC):
     @abstractmethod
-    def get_portfolio_snapshot(self) -> dict: ...
+    def get_portfolio_snapshot(self) -> dict:
+        ...
 
     def ping(self) -> dict:
         return {"status": "ok", "mode": "mock"}
 
 
 def map_iol_estadocuenta_cash(payload: dict[str, Any]) -> float:
-    """Extrae cash disponible desde /estadocuenta con fallbacks robustos."""
-    candidates = [
-        payload.get("disponible"),
-        payload.get("saldoDisponible"),
-        payload.get("cuentas", {}).get("disponible"),
-        payload.get("cuenta", {}).get("disponible"),
-        payload.get("cash"),
-    ]
-    for value in candidates:
-        if value is not None:
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-    return 0.0
-
-
-def map_iol_portfolio_to_snapshot(
-    payload: dict[str, Any],
-    default_currency: str = "ARS",
-    cash_override: float | None = None,
-) -> dict:
-    """Mapea respuesta variada de IOL al formato interno del MVP."""
-
-    titulos = payload.get("titulos") or payload.get("activos") or payload.get("positions") or []
-    portfolio_cash = payload.get("disponible")
-    if portfolio_cash is None:
-        portfolio_cash = payload.get("cuentas", {}).get("disponible")
-    if portfolio_cash is None:
-        portfolio_cash = payload.get("cash")
-    cash = float(cash_override if cash_override is not None else (portfolio_cash or 0))
-
-    currency = payload.get("moneda") or payload.get("currency") or default_currency
-
-    positions: list[dict[str, Any]] = []
-    for item in titulos:
-        symbol = item.get("simbolo") or item.get("ticker") or item.get("symbol")
-        if not symbol:
-            continue
-
-        quantity = float(item.get("cantidad") or item.get("quantity") or 0)
-        market_value = (
-            item.get("valorizado")
-            or item.get("valuado")
-            or item.get("marketValue")
-            or item.get("market_value")
-            or (quantity * float(item.get("ultimoPrecio") or item.get("lastPrice") or 0))
-        )
-        avg_price = item.get("precioPromedio") or item.get("averagePrice") or item.get("avg_price")
-        instrument_type = item.get("tipo") or item.get("tipoInstrumento") or item.get("instrumentType") or "UNKNOWN"
-
-        positions.append(
-            {
-                "symbol": symbol,
-                "quantity": quantity,
-                "market_value": float(market_value or 0),
-                "avg_price": float(avg_price) if avg_price is not None else None,
-                "instrument_type": instrument_type,
-                "asset_type": instrument_type,
-                "currency": item.get("moneda") or item.get("currency") or currency,
-                "pnl_pct": float(item.get("rentabilidad") or item.get("pnlPct") or 0),
-            }
-        )
-
-    return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "currency": currency,
-        "positions": positions,
-    }
-
-
-def map_iol_estadocuenta_cash(payload: dict) -> float:
     """
     Extrae cash/disponible desde /api/v2/estadocuenta con varios fallbacks.
     Soporta estructuras tipo dict y listas en 'cuentas'.
     """
+
     def to_float(value) -> float | None:
         try:
             if value is None or value == "":
@@ -102,19 +32,15 @@ def map_iol_estadocuenta_cash(payload: dict) -> float:
         except (TypeError, ValueError):
             return None
 
-    # Fallbacks directos en raíz
-    direct_candidates = [
+    for candidate in [
         payload.get("disponible"),
         payload.get("saldoDisponible"),
         payload.get("cash"),
-    ]
-
-    for candidate in direct_candidates:
+    ]:
         parsed = to_float(candidate)
         if parsed is not None:
             return parsed
 
-    # Caso cuenta simple como dict
     cuenta = payload.get("cuenta")
     if isinstance(cuenta, dict):
         for key in ["disponible", "saldoDisponible", "cash"]:
@@ -122,7 +48,6 @@ def map_iol_estadocuenta_cash(payload: dict) -> float:
             if parsed is not None:
                 return parsed
 
-    # Caso cuentas como dict
     cuentas = payload.get("cuentas")
     if isinstance(cuentas, dict):
         for key in ["disponible", "saldoDisponible", "cash"]:
@@ -130,7 +55,6 @@ def map_iol_estadocuenta_cash(payload: dict) -> float:
             if parsed is not None:
                 return parsed
 
-    # Caso cuentas como lista
     if isinstance(cuentas, list):
         total = 0.0
         found_any = False
@@ -151,15 +75,20 @@ def map_iol_estadocuenta_cash(payload: dict) -> float:
 
     return 0.0
 
-def map_iol_portfolio_to_snapshot(payload: dict, cash_override: float | None = None) -> dict:
+
+def map_iol_portfolio_to_snapshot(
+    payload: dict[str, Any],
+    cash_override: float | None = None,
+) -> dict:
     """
     Normaliza el JSON real de IOL /api/v2/portafolio/{pais} al formato interno del MVP.
 
     Soporta:
     - estructura real V2 con "activos"
-    - estructura vieja/mock con "titulos" o "positions"
+    - estructura vieja con "titulos"
+    - estructura ya normalizada con "positions"
     """
-    positions: list[dict] = []
+    positions: list[dict[str, Any]] = []
 
     def map_currency(iol_moneda: str | None) -> str:
         m = (iol_moneda or "").strip().lower()
@@ -169,7 +98,6 @@ def map_iol_portfolio_to_snapshot(payload: dict, cash_override: float | None = N
             return "USD"
         return "ARS"
 
-    # ===== Caso real IOL V2: activos =====
     activos = payload.get("activos") or []
     if isinstance(activos, list) and activos:
         for a in activos:
@@ -220,14 +148,15 @@ def map_iol_portfolio_to_snapshot(payload: dict, cash_override: float | None = N
                 }
             )
 
-    # ===== Fallback legacy: titulos =====
     elif isinstance(payload.get("titulos"), list):
         for t in payload.get("titulos", []):
             if not isinstance(t, dict):
                 continue
+
             symbol = t.get("simbolo") or ""
             if not symbol:
                 continue
+
             positions.append(
                 {
                     "symbol": symbol,
@@ -241,7 +170,6 @@ def map_iol_portfolio_to_snapshot(payload: dict, cash_override: float | None = N
                 }
             )
 
-    # ===== Fallback extra: positions ya normalizadas =====
     elif isinstance(payload.get("positions"), list):
         for p in payload.get("positions", []):
             if isinstance(p, dict):
@@ -250,7 +178,7 @@ def map_iol_portfolio_to_snapshot(payload: dict, cash_override: float | None = N
     cash = cash_override if cash_override is not None else float(payload.get("disponible") or 0.0)
 
     return {
-        "timestamp": datetime.utcnow().isoformat() + "+00:00",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "currency": "ARS",
         "cash": cash,
         "positions": positions,
@@ -357,13 +285,16 @@ class IolBrokerClient(BrokerClient):
         except Exception:
             real_cash = 0.0
 
-        return map_iol_portfolio_to_snapshot(portfolio_resp.json(), cash_override=real_cash)
+        return map_iol_portfolio_to_snapshot(
+            portfolio_resp.json(),
+            cash_override=real_cash,
+        )
 
 
 class MockBrokerClient(BrokerClient):
     def get_portfolio_snapshot(self) -> dict:
         return {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "currency": "USD",
             "cash": 12000,
             "positions": [
