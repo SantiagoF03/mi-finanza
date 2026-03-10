@@ -6,6 +6,21 @@ import httpx
 
 from app.core.config import get_settings
 
+from datetime import datetime, date
+
+
+def _json_safe(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
 
 def _call_llm(prompt: str) -> str:
     settings = get_settings()
@@ -41,13 +56,18 @@ def summarize_news(news_items: list[dict], snapshot: dict, analysis: dict) -> st
     if not settings.llm_enabled or not news_items:
         return None
 
+    safe_news = _json_safe(news_items)
+    safe_snapshot = _json_safe(snapshot)
+    safe_analysis = _json_safe(analysis)
+
     prompt = (
         "Resumí en 4 bullets claros las noticias recientes relevantes para una cartera moderada.\n"
-        f"Holdings: {[p.get('symbol') for p in snapshot.get('positions', [])]}\n"
-        f"Alerts análisis: {analysis.get('alerts', [])}\n"
-        f"Noticias: {json.dumps(news_items[:10], ensure_ascii=False)}"
+        f"Holdings: {[p.get('symbol') for p in safe_snapshot.get('positions', [])]}\n"
+        f"Alerts análisis: {safe_analysis.get('alerts', [])}\n"
+        f"Noticias: {json.dumps(safe_news[:10], ensure_ascii=False)}"
     )
     return _call_llm(prompt)
+
 
 
 def explain_recommendation(
@@ -61,13 +81,18 @@ def explain_recommendation(
     if not settings.llm_enabled:
         return None
 
+    safe_recommendation = _json_safe(recommendation)
+    safe_snapshot = _json_safe(snapshot)
+    safe_analysis = _json_safe(analysis)
+    safe_news = _json_safe(news_items)
+
     prompt = (
         "Explicá en lenguaje simple la recomendación rule-based para un inversor moderado.\n"
         "No cambies acción, activos, porcentajes ni reglas. Solo explicá.\n"
         f"Unchanged: {unchanged}\n"
-        f"Recomendación: {json.dumps(recommendation, ensure_ascii=False)}\n"
-        f"Holdings: {[p.get('symbol') for p in snapshot.get('positions', [])]}\n"
-        f"Análisis: {json.dumps(analysis, ensure_ascii=False)}\n"
-        f"Noticias: {json.dumps(news_items[:8], ensure_ascii=False)}"
+        f"Recomendación: {json.dumps(safe_recommendation, ensure_ascii=False)}\n"
+        f"Holdings: {[p.get('symbol') for p in safe_snapshot.get('positions', [])]}\n"
+        f"Análisis: {json.dumps(safe_analysis, ensure_ascii=False)}\n"
+        f"Noticias: {json.dumps(safe_news[:8], ensure_ascii=False)}"
     )
     return _call_llm(prompt)
