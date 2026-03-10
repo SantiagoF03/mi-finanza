@@ -150,15 +150,67 @@ MARKET_UNIVERSE_ASSETS=MELI,GLOB,BBAR,GGAL,YPFD
 - `allowed_assets.main_allowed`: unión de holdings + whitelist
 - Cada `external_opportunity` tiene `tracking_status`
 
-### Fase futura (preparado)
-El módulo `universe.py` y las config `WATCHLIST_ASSETS` / `MARKET_UNIVERSE_ASSETS` dejan preparada la base para:
-- agregar fuentes de oportunidades más allá de RSS (screeners, rankings)
-- reglas simples de mercado por tipo de activo
-- expandir el universo operable sin cambios de arquitectura
+## Candidate sourcing para oportunidades externas
+
+Implementado en `backend/app/market/candidates.py`.
+
+Las oportunidades externas ahora se generan desde tres fuentes, no solo noticias:
+
+| Fuente | Descripción |
+|---|---|
+| **news** | Noticias sobre activos no tenidos (como antes) |
+| **watchlist** | Símbolos en `WATCHLIST_ASSETS` aparecen como candidatos aunque no haya noticias |
+| **universe** | Símbolos en `MARKET_UNIVERSE_ASSETS` aparecen como candidatos observados |
+
+Cada oportunidad externa incluye:
+- `source_types`: lista de fuentes (`["news", "watchlist"]`, etc.)
+- `tracking_status`: clasificación (`watchlist`, `in_universe`, `untracked`)
+- `actionable_external`: true si está en watchlist o universe (habilitado para seguimiento)
+- `actionable_reason`: explicación de por qué es o no es actionable
+- `priority_score`: score simple (news + watchlist > watchlist sola > universe sola)
+- `asset_type` / `asset_type_valid`: tipo de activo y si es soportado
+
+**Candidato observado vs actionable**: un candidato `untracked` (no en watchlist ni universe) aparece pero con menor prioridad y `actionable_external=false`. Un candidato en watchlist es `actionable_external=true`.
+
+## Validación de tipos de activo (runtime)
+
+Los tipos de activo se validan en runtime contra `VALID_ASSET_TYPES`:
+`CEDEAR`, `ACCIONES`, `TitulosPublicos`, `FondoComundeInversion`, `ETF`, `BONO`, `ON`
+
+- Si un activo externo tiene tipo no soportado: se marca `asset_type_valid=false`, no se rompe el ciclo
+- `DESCONOCIDO` es un fallback para tipos desconocidos, no es un tipo válido
+- El frontend muestra "tipo no soportado" cuando corresponde
+
+## Target weights dinámicos (perfiles de inversor)
+
+Implementado en `backend/app/portfolio/profiles.py`.
+
+El análisis de cartera ya **no** usa target weights hardcodeados (AAPL/MSFT/SPY). En cambio:
+
+1. Se lee `INVESTOR_PROFILE` del `.env` (default: `moderado`)
+2. El profile define targets por **bucket** (no por símbolo)
+3. Los buckets se distribuyen entre los holdings reales
+
+### Perfiles disponibles
+
+| Perfil | cash | renta_fija | equity_ext | equity_local | fci | otros |
+|---|---|---|---|---|---|---|
+| conservador | 25% | 40% | 15% | 10% | 5% | 5% |
+| moderado | 15% | 25% | 30% | 15% | 10% | 5% |
+| agresivo | 5% | 10% | 45% | 25% | 10% | 5% |
+
+### Mapeo asset_type -> bucket
+- `BONO`, `ON`, `TitulosPublicos` -> renta_fija
+- `CEDEAR`, `ETF` -> equity_exterior
+- `ACCIONES` -> equity_local
+- `FondoComundeInversion` -> fci
+- Desconocido -> otros
+
+Si un bucket no tiene holdings, su peso queda "no asignado" sin romper el análisis.
 
 ## Recomendación principal vs oportunidades externas
 - **Recomendación principal de cartera**: usa holdings reales (`snapshot.positions`), análisis de cartera y señales de mercado que afecten la cartera; sus `actions` solo pueden apuntar a activos en cartera o whitelist.
-- **Oportunidades externas de mercado**: noticias sobre activos no tenidos se guardan como `external_opportunities`, con `symbol`, `reason`, `confidence`, `event_type`, `impact`, `tracking_status`.
+- **Oportunidades externas de mercado**: candidatos generados desde noticias + watchlist + universe, con campos enriched (`source_types`, `actionable_external`, `priority_score`, etc.).
 - Las oportunidades externas **no** se mezclan con `actions` y **no** disparan approve/reject.
 
 

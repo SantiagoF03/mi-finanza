@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from app.core.config import get_settings
 
-# Supported IOL asset types (for validation / future filtering)
+# Supported IOL asset types (for runtime validation)
 VALID_ASSET_TYPES = {
     "CEDEAR",
     "ACCIONES",
@@ -24,8 +24,8 @@ VALID_ASSET_TYPES = {
     "ETF",
     "BONO",
     "ON",  # obligaciones negociables
-    "DESCONOCIDO",
 }
+# "DESCONOCIDO" is NOT valid — it's a fallback marker for unknown types
 
 
 def build_allowed_assets(snapshot_positions: list[dict]) -> dict:

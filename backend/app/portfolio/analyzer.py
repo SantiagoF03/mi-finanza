@@ -1,6 +1,12 @@
+from app.core.config import get_settings
+from app.portfolio.profiles import build_target_weights
+
+
 def analyze_portfolio(snapshot: dict, target_weights: dict | None = None) -> dict:
-    target_weights = target_weights or {"AAPL": 0.25, "MSFT": 0.20, "SPY": 0.25, "AL30": 0.15, "CASH": 0.15}
     positions = snapshot.get("positions", [])
+    if target_weights is None:
+        settings = get_settings()
+        target_weights = build_target_weights(positions, profile=settings.investor_profile)
     cash = snapshot.get("cash", 0)
 
     alerts = []
