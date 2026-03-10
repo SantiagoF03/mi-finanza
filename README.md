@@ -163,14 +163,24 @@ Las oportunidades externas ahora se generan desde tres fuentes, no solo noticias
 | **universe** | Símbolos en `MARKET_UNIVERSE_ASSETS` aparecen como candidatos observados |
 
 Cada oportunidad externa incluye:
-- `source_types`: lista de fuentes (`["news", "watchlist"]`, etc.)
+- `source_types`: lista de fuentes (`["news", "watchlist"]`, etc.) — refleja TODAS las fuentes combinadas
 - `tracking_status`: clasificación (`watchlist`, `in_universe`, `untracked`)
-- `actionable_external`: true si está en watchlist o universe (habilitado para seguimiento)
-- `actionable_reason`: explicación de por qué es o no es actionable
-- `priority_score`: score simple (news + watchlist > watchlist sola > universe sola)
-- `asset_type` / `asset_type_valid`: tipo de activo y si es soportado
+- `asset_type` / `asset_type_status`: tipo resuelto y su estado (`known_valid`, `unknown`, `unsupported`)
+- `in_main_allowed`: bool — si el símbolo está en whitelist/main_allowed (podría estar en acciones principales)
+- `actionable_external`: bool — habilitado para seguimiento (en watchlist/universe + tipo no unsupported)
+- `investable`: bool — listo para inversión manual (en main_allowed + tipo known_valid)
+- `actionable_reason`: explicación semántica sin contradicciones
+- `priority_score`: score dinámico — sube al combinar fuentes, al tener tipo válido, al ser investable
 
-**Candidato observado vs actionable**: un candidato `untracked` (no en watchlist ni universe) aparece pero con menor prioridad y `actionable_external=false`. Un candidato en watchlist es `actionable_external=true`.
+### Semántica de tres niveles
+
+| Nivel | Flag | Significado |
+|---|---|---|
+| **Observado** | aparece en lista | Solo se ve, sin acción sugerida |
+| **Seguimiento** | `actionable_external=true` | En watchlist/universe, habilitado para tracking activo |
+| **Invertible** | `investable=true` | En whitelist + tipo válido, listo para inversión manual |
+
+**Ejemplo real**: AAPL en `MARKET_UNIVERSE_ASSETS` + `WHITELIST_ASSETS` → `actionable_external=true`, `investable=true`, `asset_type=CEDEAR`, `asset_type_status=known_valid`.
 
 ## Resolución de tipos de activo
 

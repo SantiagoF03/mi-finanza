@@ -91,16 +91,18 @@ def test_build_asset_type_map():
 # ---------------------------------------------------------------------------
 
 
-def _make_allowed(watchlist=None, universe=None, holdings=None):
+def _make_allowed(watchlist=None, universe=None, holdings=None, whitelist=None):
     holdings = holdings or set()
+    whitelist = whitelist or set()
     watchlist = watchlist or set()
     universe = universe or set()
+    main_allowed = holdings | whitelist
     return {
         "holdings": holdings,
-        "whitelist": set(),
+        "whitelist": whitelist,
         "watchlist": watchlist,
         "universe": universe,
-        "main_allowed": holdings,
+        "main_allowed": main_allowed,
         "external_allowed": watchlist | universe,
     }
 
@@ -146,6 +148,93 @@ def test_candidate_has_asset_type_status_field():
     for c in candidates:
         assert "asset_type_status" in c
         assert c["asset_type_status"] in ("known_valid", "unknown", "unsupported")
+
+
+def test_candidate_in_universe_and_whitelist_is_investable():
+    """A symbol in universe + whitelist should be investable with known_valid type."""
+    # This mirrors the real runtime scenario: AAPL in MARKET_UNIVERSE + WHITELIST
+    allowed = _make_allowed(universe={"AAPL", "NVDA"}, whitelist={"AAPL", "NVDA", "MSFT"})
+    positions = []  # Not held
+    candidates = generate_external_candidates([], allowed, positions)
+    syms = {c["symbol"]: c for c in candidates}
+
+    assert "AAPL" in syms
+    aapl = syms["AAPL"]
+    assert aapl["asset_type"] == "CEDEAR"
+    assert aapl["asset_type_status"] == "known_valid"
+    assert aapl["in_main_allowed"] is True
+    assert aapl["investable"] is True
+    assert aapl["actionable_external"] is True
+    assert "inversión" in aapl["actionable_reason"].lower() or "whitelist" in aapl["actionable_reason"].lower()
+
+
+def test_candidate_in_watchlist_not_in_whitelist_not_investable():
+    """A watchlist symbol NOT in whitelist should be actionable but NOT investable."""
+    allowed = _make_allowed(watchlist={"TSLA"})
+    candidates = generate_external_candidates([], allowed, [])
+    c = candidates[0]
+    assert c["actionable_external"] is True
+    assert c["investable"] is False
+    assert c["in_main_allowed"] is False
+
+
+def test_priority_score_increases_with_multiple_sources():
+    """A symbol in news + watchlist should have higher priority than watchlist-only."""
+    allowed = _make_allowed(watchlist={"TSLA", "NVDA"})
+    news_ops = [
+        {"symbol": "TSLA", "reason": "Tesla news", "confidence": 0.7, "event_type": "earnings", "impact": "positivo"},
+    ]
+    candidates = generate_external_candidates(news_ops, allowed, [])
+    tsla = next(c for c in candidates if c["symbol"] == "TSLA")
+    nvda = next(c for c in candidates if c["symbol"] == "NVDA")
+    # TSLA has news + watchlist, NVDA has only watchlist
+    assert tsla["priority_score"] > nvda["priority_score"]
+    assert len(tsla["source_types"]) == 2
+
+
+def test_priority_score_boosts_for_investable():
+    """Investable candidates (in whitelist + known_valid) get a score boost."""
+    # TSLA in watchlist only vs TSLA in watchlist + whitelist
+    allowed_no_wl = _make_allowed(watchlist={"TSLA"})
+    allowed_with_wl = _make_allowed(watchlist={"TSLA"}, whitelist={"TSLA"})
+    c_no = generate_external_candidates([], allowed_no_wl, [])[0]
+    c_wl = generate_external_candidates([], allowed_with_wl, [])[0]
+    assert c_wl["priority_score"] > c_no["priority_score"]
+
+
+def test_real_runtime_scenario_aapl_nvda_in_universe():
+    """Reproduce the exact runtime scenario from the user's API response.
+
+    Config: MARKET_UNIVERSE_ASSETS=NVDA,AAPL, both also in WHITELIST_ASSETS.
+    Holdings include SPY, QQQ, BABA etc. but NOT AAPL/NVDA.
+    Expected: AAPL/NVDA show as external with CEDEAR/known_valid, investable=True.
+    """
+    holdings = {"ACWI", "BABA", "BIDU", "BRKB", "BYMA", "GD35", "GLD", "PAMP", "QQQ", "SPY"}
+    whitelist = holdings | {"AAPL", "MSFT", "AMZN", "GOOGL", "TSLA", "NVDA", "JPM", "V"}
+    universe = {"NVDA", "AAPL"}
+    allowed = _make_allowed(universe=universe, holdings=holdings, whitelist=whitelist)
+
+    positions = [{"symbol": s, "asset_type": "CEDEAR"} for s in holdings]
+    candidates = generate_external_candidates([], allowed, positions)
+    syms = {c["symbol"]: c for c in candidates}
+
+    # Both should appear (not in holdings)
+    assert "AAPL" in syms
+    assert "NVDA" in syms
+
+    for sym in ["AAPL", "NVDA"]:
+        c = syms[sym]
+        # Type resolved correctly (NOT DESCONOCIDO)
+        assert c["asset_type"] == "CEDEAR", f"{sym} should be CEDEAR, got {c['asset_type']}"
+        assert c["asset_type_status"] == "known_valid"
+        assert c["asset_type_valid"] is True
+        # In whitelist → investable
+        assert c["in_main_allowed"] is True
+        assert c["investable"] is True
+        # In universe → actionable
+        assert c["actionable_external"] is True
+        # No contradictory flags
+        assert c["priority_score"] > 0.1  # More than base universe score
 
 
 def test_unsupported_blocks_actionable():

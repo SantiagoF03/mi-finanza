@@ -109,7 +109,8 @@ def test_candidate_has_all_required_fields():
     required_fields = {
         "symbol", "source_types", "tracking_status", "actionable_external",
         "actionable_reason", "priority_score", "asset_type", "asset_type_valid",
-        "asset_type_status", "reason", "confidence", "event_type", "impact",
+        "asset_type_status", "in_main_allowed", "investable",
+        "reason", "confidence", "event_type", "impact",
     }
     assert required_fields.issubset(set(c.keys()))
 
