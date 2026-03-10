@@ -6,12 +6,13 @@ from sqlalchemy.orm import Session
 from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
+from app.market.candidates import generate_external_candidates
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
 from app.recommendations.unchanged import detect_unchanged
-from app.recommendations.universe import build_allowed_assets, classify_opportunity_status
+from app.recommendations.universe import build_allowed_assets
 from app.rules.engine import enforce_rules
 from app.services.logs import app_log
 
@@ -147,9 +148,12 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     allowed_assets = build_allowed_assets(positions)
     rec = generate_recommendation(snapshot_dict, analysis, news_items, settings.max_movement_per_cycle)
 
-    # Enrich external opportunities with tracking status
-    for op in rec.get("external_opportunities", []):
-        op["tracking_status"] = classify_opportunity_status(op.get("symbol", ""), allowed_assets)
+    # Replace news-only external_opportunities with full candidate sourcing
+    rec["external_opportunities"] = generate_external_candidates(
+        news_opportunities=rec.get("external_opportunities", []),
+        allowed_assets=allowed_assets,
+        positions=positions,
+    )
 
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
 
