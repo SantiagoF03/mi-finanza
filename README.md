@@ -111,9 +111,54 @@ No hay endpoints de compra/venta implementados. Solo lectura.
 - `GET /api/news/recent` muestra solo las últimas 10 noticias.
 
 
+## Universo operable y whitelist dinámica
+
+Implementado en `backend/app/recommendations/universe.py`.
+
+### Jerarquía de activos permitidos
+
+| Capa | Fuente | Efecto |
+|---|---|---|
+| **Holdings reales** | `snapshot.positions` | Auto-permitidos para acciones principales. No necesitan estar en whitelist. |
+| **Whitelist manual** | `WHITELIST_ASSETS` (.env) | Override manual. También permitidos para acciones principales. |
+| **Watchlist externa** | `WATCHLIST_ASSETS` (.env) | Activos externos rastreados para oportunidades. No entran en acciones principales. |
+| **Universo de mercado** | `MARKET_UNIVERSE_ASSETS` (.env) | Set amplio de activos operables conocidos. Base para futuras oportunidades. |
+
+### Comportamiento clave
+
+- **Un holding nuevo en IOL se permite automáticamente** sin tocar `.env`
+- **WHITELIST_ASSETS sigue funcionando** como override (backward compatible)
+- **Oportunidades externas** muestran su `tracking_status`: `watchlist`, `in_universe`, o `untracked`
+- **Nunca** se promueve una oportunidad externa a acción principal sin que sea holding o esté en whitelist
+
+### Tipos de activo soportados
+`CEDEAR`, `ACCIONES`, `TitulosPublicos`, `FondoComundeInversion`, `ETF`, `BONO`, `ON`
+
+### Configuración (.env)
+```
+WHITELIST_ASSETS=AAPL,MSFT,SPY,QQQ,AL30,BND,CASH
+WATCHLIST_ASSETS=TSLA,NVDA,GOOGL
+MARKET_UNIVERSE_ASSETS=MELI,GLOB,BBAR,GGAL,YPFD
+```
+
+### Campos en API
+`GET /api/recommendations/current` incluye:
+- `allowed_assets.holdings`: activos reales del snapshot
+- `allowed_assets.whitelist`: whitelist manual
+- `allowed_assets.watchlist`: watchlist configurada
+- `allowed_assets.universe`: universo de mercado
+- `allowed_assets.main_allowed`: unión de holdings + whitelist
+- Cada `external_opportunity` tiene `tracking_status`
+
+### Fase futura (preparado)
+El módulo `universe.py` y las config `WATCHLIST_ASSETS` / `MARKET_UNIVERSE_ASSETS` dejan preparada la base para:
+- agregar fuentes de oportunidades más allá de RSS (screeners, rankings)
+- reglas simples de mercado por tipo de activo
+- expandir el universo operable sin cambios de arquitectura
+
 ## Recomendación principal vs oportunidades externas
-- **Recomendación principal de cartera**: usa holdings reales (`snapshot.positions`), análisis de cartera y señales de mercado que afecten la cartera; sus `actions` solo pueden apuntar a activos en cartera.
-- **Oportunidades externas de mercado**: noticias sobre activos no tenidos se guardan como `external_opportunities` (watchlist), con `symbol`, `reason`, `confidence`, `event_type`, `impact`.
+- **Recomendación principal de cartera**: usa holdings reales (`snapshot.positions`), análisis de cartera y señales de mercado que afecten la cartera; sus `actions` solo pueden apuntar a activos en cartera o whitelist.
+- **Oportunidades externas de mercado**: noticias sobre activos no tenidos se guardan como `external_opportunities`, con `symbol`, `reason`, `confidence`, `event_type`, `impact`, `tracking_status`.
 - Las oportunidades externas **no** se mezclan con `actions` y **no** disparan approve/reject.
 
 

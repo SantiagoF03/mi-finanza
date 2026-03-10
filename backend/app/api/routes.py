@@ -92,6 +92,7 @@ def current_recommendation(db: Session = Depends(get_db)):
         "rules_applied": meta.get("rules", []),
         "broker_mode": meta.get("broker_mode", "unknown"),
         "external_opportunities": meta.get("external_opportunities", []),
+        "allowed_assets": meta.get("allowed_assets", {}),
         "unchanged": meta.get("unchanged", False),
         "unchanged_reason": meta.get("unchanged_reason", ""),
         "news_summary": meta.get("news_summary"),

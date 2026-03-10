@@ -1,11 +1,21 @@
-def enforce_rules(recommendation: dict, whitelist: list[str], max_move: float) -> dict:
+def enforce_rules(recommendation: dict, whitelist: list[str], max_move: float, holdings: set[str] | None = None) -> dict:
+    """Apply hard rules to a recommendation.
+
+    `whitelist` is the manual WHITELIST_ASSETS from config.
+    `holdings` (optional) are the real snapshot symbols — always auto-permitted.
+    The effective allowed set is holdings | whitelist.
+    """
+    allowed = set(whitelist)
+    if holdings:
+        allowed = allowed | holdings
+
     adjusted = recommendation.copy()
     filtered_actions = []
     blocked_reasons = []
 
     for action in recommendation.get("actions", []):
         symbol = action.get("symbol")
-        if symbol not in whitelist:
+        if symbol not in allowed:
             blocked_reasons.append(f"{symbol} fuera de whitelist")
             continue
         clamped = max(min(action.get("target_change_pct", 0), max_move), -max_move)

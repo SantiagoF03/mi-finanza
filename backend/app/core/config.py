@@ -46,8 +46,14 @@ class Settings(BaseSettings):
     whitelist_assets: List[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "AL30", "BND", "CASH"]
     )
+    watchlist_assets: List[str] = Field(
+        default_factory=list
+    )
+    market_universe_assets: List[str] = Field(
+        default_factory=list
+    )
 
-    @field_validator("whitelist_assets", "news_rss_urls", mode="before")
+    @field_validator("whitelist_assets", "news_rss_urls", "watchlist_assets", "market_universe_assets", mode="before")
     @classmethod
     def parse_csv_fields(cls, v):
         if isinstance(v, str):
