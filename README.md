@@ -172,14 +172,28 @@ Cada oportunidad externa incluye:
 
 **Candidato observado vs actionable**: un candidato `untracked` (no en watchlist ni universe) aparece pero con menor prioridad y `actionable_external=false`. Un candidato en watchlist es `actionable_external=true`.
 
-## Validación de tipos de activo (runtime)
+## Resolución de tipos de activo
 
-Los tipos de activo se validan en runtime contra `VALID_ASSET_TYPES`:
-`CEDEAR`, `ACCIONES`, `TitulosPublicos`, `FondoComundeInversion`, `ETF`, `BONO`, `ON`
+Implementado en `backend/app/market/assets.py`.
 
-- Si un activo externo tiene tipo no soportado: se marca `asset_type_valid=false`, no se rompe el ciclo
-- `DESCONOCIDO` es un fallback para tipos desconocidos, no es un tipo válido
-- El frontend muestra "tipo no soportado" cuando corresponde
+El sistema resuelve `asset_type` para cualquier símbolo usando múltiples fuentes en orden de prioridad:
+
+1. **Posiciones (holdings)** — lookup directo, más confiable
+2. **Mapa estático `KNOWN_ASSET_TYPES`** — ~100 símbolos conocidos del mercado argentino (CEDEARs, bonos, acciones, ONs, ETFs, FCIs)
+3. **Heurística por sufijo** — patrones simples como terminación en "O" → ON
+4. **Fallback** → `DESCONOCIDO` / `unknown`
+
+### Campo `asset_type_status`
+
+Cada candidato externo ahora incluye `asset_type_status` con tres valores posibles:
+
+| Status | Significado | Efecto en actionable |
+|---|---|---|
+| `known_valid` | Tipo conocido y soportado (ej: CEDEAR, BONO) | No bloquea |
+| `unknown` | No se pudo determinar el tipo | No bloquea (pendiente de resolver) |
+| `unsupported` | Tipo conocido pero no soportado (ej: CRYPTOCURRENCY) | Bloquea actionable |
+
+**Importante**: `DESCONOCIDO` ahora se muestra como `unknown`, **no** como `unsupported`. Un símbolo desconocido en watchlist sigue siendo actionable.
 
 ## Target weights dinámicos (perfiles de inversor)
 
@@ -206,7 +220,7 @@ El análisis de cartera ya **no** usa target weights hardcodeados (AAPL/MSFT/SPY
 - `FondoComundeInversion` -> fci
 - Desconocido -> otros
 
-Si un bucket no tiene holdings, su peso queda "no asignado" sin romper el análisis.
+Si un bucket no tiene holdings, su peso se redistribuye a CASH para que los target weights siempre sumen 1.0.
 
 ## Recomendación principal vs oportunidades externas
 - **Recomendación principal de cartera**: usa holdings reales (`snapshot.positions`), análisis de cartera y señales de mercado que afecten la cartera; sus `actions` solo pueden apuntar a activos en cartera o whitelist.

@@ -68,6 +68,8 @@ def build_target_weights(positions: list[dict], profile: str = "moderado") -> di
     2. Group held symbols by bucket
     3. Distribute each bucket's target equally among its symbols
     4. CASH always gets its own bucket weight directly
+    5. Unallocated bucket weight (no holdings in that bucket) is
+       redistributed to CASH so weights always sum to 1.0
 
     Returns dict like {"AAPL": 0.15, "MSFT": 0.15, "CASH": 0.15, ...}
     """
@@ -84,6 +86,7 @@ def build_target_weights(positions: list[dict], profile: str = "moderado") -> di
         buckets.setdefault(bucket, []).append(sym)
 
     weights: dict[str, float] = {}
+    unallocated = 0.0
 
     # Distribute bucket target equally among symbols in that bucket
     for bucket, target in preset.items():
@@ -95,8 +98,13 @@ def build_target_weights(positions: list[dict], profile: str = "moderado") -> di
             per_symbol = target / len(symbols)
             for sym in symbols:
                 weights[sym] = round(weights.get(sym, 0) + per_symbol, 4)
-        # If no symbols in this bucket, the weight is "unallocated" —
-        # it just means the portfolio doesn't cover this bucket yet.
+        else:
+            # No holdings in this bucket — collect unallocated weight
+            unallocated += target
+
+    # Redistribute unallocated weight to CASH
+    if unallocated > 0:
+        weights["CASH"] = round(weights.get("CASH", 0) + unallocated, 4)
 
     # Ensure CASH is always present
     if "CASH" not in weights:

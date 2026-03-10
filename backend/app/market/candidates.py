@@ -7,12 +7,13 @@ Generates external opportunity candidates from three sources:
 
 Each candidate gets:
 - symbol, source_types, tracking_status, actionable_external,
-  actionable_reason, priority_score, asset_type
+  actionable_reason, priority_score, asset_type, asset_type_status
 """
 
 from __future__ import annotations
 
-from app.recommendations.universe import VALID_ASSET_TYPES, classify_opportunity_status
+from app.market.assets import resolve_asset_type
+from app.recommendations.universe import classify_opportunity_status
 
 
 def generate_external_candidates(
@@ -26,13 +27,6 @@ def generate_external_candidates(
     Deduplicates by symbol, keeping the highest-priority entry and merging sources.
     """
     held_symbols = {p.get("symbol") for p in positions if p.get("symbol")}
-
-    # Build asset_type lookup from positions
-    asset_type_map: dict[str, str] = {}
-    for p in positions:
-        sym = p.get("symbol")
-        if sym:
-            asset_type_map[sym] = p.get("asset_type") or p.get("instrument_type") or "DESCONOCIDO"
 
     # --- Collect all candidates by symbol ---
     candidates: dict[str, dict] = {}
@@ -73,14 +67,12 @@ def generate_external_candidates(
     results = []
     for sym, c in candidates.items():
         tracking = classify_opportunity_status(sym, allowed_assets)
-        asset_type = asset_type_map.get(sym, "DESCONOCIDO")
-        asset_type_valid = asset_type in VALID_ASSET_TYPES
+        asset_type, asset_type_status = resolve_asset_type(sym, positions=positions)
 
         # Priority scoring (simple MVP)
         score = 0.0
         if "news" in c["source_types"]:
             score += 0.4
-            # Boost by best news confidence
             best_conf = max((s["confidence"] for s in c["news_signals"]), default=0.5)
             score += best_conf * 0.3
         if "watchlist" in c["source_types"]:
@@ -88,11 +80,17 @@ def generate_external_candidates(
         if "universe" in c["source_types"]:
             score += 0.1
 
-        # Actionable = in watchlist or universe (not just random untracked news)
+        # Actionable logic using asset_type_status
         actionable = tracking in ("watchlist", "in_universe")
-        if not asset_type_valid and asset_type != "DESCONOCIDO":
+        if asset_type_status == "unsupported":
             actionable = False
             actionable_reason = f"Tipo de activo no soportado: {asset_type}"
+        elif asset_type_status == "unknown":
+            # Unknown type doesn't block — it's just unresolved
+            if actionable:
+                actionable_reason = f"En {tracking}, tipo de activo desconocido (pendiente de resolver)"
+            else:
+                actionable_reason = "No está en watchlist ni en universo configurado"
         elif actionable:
             actionable_reason = f"En {tracking}, habilitado para seguimiento"
         else:
@@ -109,7 +107,8 @@ def generate_external_candidates(
             "actionable_reason": actionable_reason,
             "priority_score": round(score, 2),
             "asset_type": asset_type,
-            "asset_type_valid": asset_type_valid,
+            "asset_type_status": asset_type_status,
+            "asset_type_valid": asset_type_status == "known_valid",
             "reason": best_news["reason"] if best_news else f"Observado desde {', '.join(sorted(c['source_types']))}",
             "confidence": best_news["confidence"] if best_news else 0.3,
             "event_type": best_news["event_type"] if best_news else "otro",

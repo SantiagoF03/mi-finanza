@@ -203,8 +203,14 @@ export default function App() {
                 {op.actionable_external === false && (
                   <span style={{ background: '#ffcdd2', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>no habilitado</span>
                 )}
-                {op.asset_type_valid === false && (
+                {op.asset_type_status === 'unsupported' && (
                   <span style={{ background: '#ffab91', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>tipo no soportado</span>
+                )}
+                {op.asset_type_status === 'unknown' && (
+                  <span style={{ background: '#ffe0b2', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>tipo desconocido</span>
+                )}
+                {op.asset_type_status === 'known_valid' && (
+                  <span style={{ background: '#c8e6c9', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>tipo: {op.asset_type}</span>
                 )}
                 <br />
                 <span style={{ fontSize: '0.9em', color: '#555' }}>
