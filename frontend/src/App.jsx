@@ -182,10 +182,36 @@ export default function App() {
           <ul>
             {current.external_opportunities.map((op, idx) => (
               <li key={`${op.symbol}-${idx}`}>
-                <strong>{op.symbol}</strong> | impacto: {op.impact} | tipo: {op.event_type} | confianza: {(Number(op.confidence || 0) * 100).toFixed(0)}% | motivo: {op.reason}
+                <strong>{op.symbol}</strong>
+                {op.tracking_status && op.tracking_status !== 'untracked' && (
+                  <span style={{ background: '#e3f2fd', padding: '2px 6px', borderRadius: 4, marginLeft: 6, fontSize: '0.85em' }}>
+                    {op.tracking_status === 'watchlist' ? 'en watchlist' : op.tracking_status === 'in_universe' ? 'en universo' : op.tracking_status}
+                  </span>
+                )}
+                {op.tracking_status === 'untracked' && (
+                  <span style={{ background: '#fff3e0', padding: '2px 6px', borderRadius: 4, marginLeft: 6, fontSize: '0.85em' }}>
+                    no rastreado
+                  </span>
+                )}
+                {' '}| impacto: {op.impact} | tipo: {op.event_type} | confianza: {(Number(op.confidence || 0) * 100).toFixed(0)}% | motivo: {op.reason}
               </li>
             ))}
           </ul>
+        </section>
+      )}
+
+      {current?.allowed_assets && (
+        <section>
+          <h2>Activos permitidos</h2>
+          <p><strong>Holdings reales:</strong> {(current.allowed_assets.holdings || []).join(', ') || 'Ninguno'}</p>
+          <p><strong>Whitelist manual:</strong> {(current.allowed_assets.whitelist || []).join(', ') || 'Ninguna'}</p>
+          {(current.allowed_assets.watchlist || []).length > 0 && (
+            <p><strong>Watchlist externa:</strong> {current.allowed_assets.watchlist.join(', ')}</p>
+          )}
+          {(current.allowed_assets.universe || []).length > 0 && (
+            <p><strong>Universo de mercado:</strong> {current.allowed_assets.universe.join(', ')}</p>
+          )}
+          <p><strong>Total permitidos para acciones:</strong> {(current.allowed_assets.main_allowed || []).join(', ')}</p>
         </section>
       )}
 

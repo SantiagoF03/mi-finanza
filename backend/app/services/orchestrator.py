@@ -11,6 +11,7 @@ from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
 from app.recommendations.unchanged import detect_unchanged
+from app.recommendations.universe import build_allowed_assets, classify_opportunity_status
 from app.rules.engine import enforce_rules
 from app.services.logs import app_log
 
@@ -143,8 +144,14 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         "positions": positions,
     }
     analysis = analyze_portfolio(snapshot_dict)
+    allowed_assets = build_allowed_assets(positions)
     rec = generate_recommendation(snapshot_dict, analysis, news_items, settings.max_movement_per_cycle)
-    rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle)
+
+    # Enrich external opportunities with tracking status
+    for op in rec.get("external_opportunities", []):
+        op["tracking_status"] = classify_opportunity_status(op.get("symbol", ""), allowed_assets)
+
+    rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
 
     # --- Unchanged detection ---
     prev_rec = (
@@ -201,6 +208,13 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_inserted": inserted_news,
             "news_used": len(news_items),
             "external_opportunities": rec.get("external_opportunities", []),
+            "allowed_assets": {
+                "holdings": sorted(allowed_assets["holdings"]),
+                "whitelist": sorted(allowed_assets["whitelist"]),
+                "watchlist": sorted(allowed_assets["watchlist"]),
+                "universe": sorted(allowed_assets["universe"]),
+                "main_allowed": sorted(allowed_assets["main_allowed"]),
+            },
             "unchanged": unchanged,
             "unchanged_reason": unchanged_reason,
             "news_summary": news_summary,
