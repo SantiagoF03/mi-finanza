@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session, joinedload
 from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models.models import NewsEvent, PortfolioSnapshot, Recommendation, UserDecision
+from app.models.models import MarketEvent, NewsEvent, PortfolioSnapshot, Recommendation, UserDecision
+from app.news.ingestion import get_active_alerts, get_recent_events, run_ingestion
 from app.schemas.schemas import DecisionIn
 from app.services.orchestrator import get_current_recommendation, run_cycle
 
@@ -135,3 +136,33 @@ def recommendation_decision(recommendation_id: int, payload: DecisionIn, db: Ses
     db.add(decision)
     db.commit()
     return {"status": "ok", "decision_id": decision.id, "recommendation_status": rec.status}
+
+
+# ---------------------------------------------------------------------------
+# Market events & alerts (Part F)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/events/recent")
+def recent_events(db: Session = Depends(get_db)):
+    return get_recent_events(db, limit=30)
+
+
+@router.get("/alerts/current")
+def current_alerts(db: Session = Depends(get_db)):
+    return get_active_alerts(db)
+
+
+@router.post("/events/run-ingestion")
+def manual_ingestion(db: Session = Depends(get_db)):
+    return run_ingestion(db, source_label="manual")
+
+
+@router.post("/alerts/{alert_id}/acknowledge")
+def acknowledge_alert(alert_id: int, db: Session = Depends(get_db)):
+    event = db.query(MarketEvent).filter(MarketEvent.id == alert_id).first()
+    if not event:
+        raise HTTPException(404, "Alert not found")
+    event.acknowledged = True
+    db.commit()
+    return {"status": "ok", "alert_id": alert_id}

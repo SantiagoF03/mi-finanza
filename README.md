@@ -284,6 +284,117 @@ El análisis de cartera ya **no** usa target weights hardcodeados (AAPL/MSFT/SPY
 
 Si un bucket no tiene holdings, su peso se redistribuye a CASH para que los target weights siempre sumen 1.0.
 
+## Market Event Pipeline
+
+### Ingestion Flow
+
+```
+News Provider (RSS/Mock)
+  → Fetch & Deduplicate (by title+URL hash)
+  → Persist raw (news_raw table)
+  → Classify (event_type, impact, related_assets)
+  → Recency Filter (explicit time windows)
+  → Pre-Score (cheap, rule-based)
+  → Assign Triage Level
+  → Persist normalized (news_normalized table)
+  → Create MarketEvent (if observe+)
+  → Trigger alert/recalc if warranted
+```
+
+### Recency Filter (Part B)
+
+Explicit time windows by event type — NOT delegated to LLM:
+
+| Event Type | Max Age |
+|---|---|
+| earnings, guidance, tasas, geopolítico | 24h |
+| inflación, regulatorio, sectorial, ia | 48h |
+| otro | 24h |
+
+News older than 2x the window → `store_only` (persisted but no further processing).
+
+### Pre-Scoring (Part B)
+
+Cheap rule-based score (0.0–1.0) using these signals:
+- Mentions holdings: +0.25
+- Mentions watchlist/universe: +0.10
+- Recency (linear decay over window): up to +0.20
+- Top-tier source (Reuters, Bloomberg, Investing.com, etc.): +0.10
+- Hard news type (earnings, guidance, tasas, etc.): +0.10
+- Non-neutral impact: +0.10
+- Confidence: up to +0.15
+
+### Triage Levels
+
+| Level | Condition | Effect |
+|---|---|---|
+| `store_only` | Old or irrelevant | Persisted, no further processing |
+| `observe` | Moderate score, recent | Shown in events feed, no LLM |
+| `send_to_llm` | Good score, recent | Eligible for LLM explanation next cycle |
+| `trigger_recalc` | High score + holding mention + fresh | Triggers full cycle recalculation |
+
+### LLM Cost Control
+
+The scheduler NEVER calls the LLM unconditionally:
+1. Ingestion runs are lightweight (fetch + classify + score)
+2. Full cycle (with potential LLM) only runs when `trigger_recalc` events exist
+3. `store_only` and `observe` events never reach the LLM
+4. Post-market gets one scheduled full cycle; all other runs are ingestion-only unless triggered
+
+### Alerting
+
+Events with severity >= medium appear as active alerts in the frontend.
+
+Severity mapping:
+- `trigger_recalc` + negativo → **critical**
+- `trigger_recalc` + other → **high**
+- `send_to_llm` → **medium**
+- `observe` → **low**
+
+Alerts can be acknowledged via `POST /api/alerts/{id}/acknowledge`.
+
+### Scheduler (Part D)
+
+Market-hours aware, configurable via settings:
+
+| Phase | Default Schedule | Action |
+|---|---|---|
+| Pre-market | 60min and 15min before open | Ingestion only |
+| Market open | Every 30 min | Ingestion; full cycle only if `trigger_recalc` events |
+| Post-market | Close +5min | Full cycle |
+| Post-market | Close +1h | Light ingestion |
+| Off-hours / Weekend | Nothing | Nothing |
+
+Settings: `SCHEDULER_MARKET_OPEN_HOUR` (default 11 UTC = 8 ART), `SCHEDULER_MARKET_CLOSE_HOUR` (default 20 UTC = 17 ART), `SCHEDULER_OPEN_INTERVAL_MINUTES` (default 30).
+
+### Notifications (Part E — Telegram)
+
+Configure in `.env`:
+```
+NOTIFICATION_ENABLED=true
+NOTIFICATION_CHANNEL=telegram
+TELEGRAM_BOT_TOKEN=your_token
+TELEGRAM_CHAT_ID=your_chat_id
+NOTIFICATION_MIN_SEVERITY=medium
+NOTIFICATION_COOLDOWN_SECONDS=300
+```
+
+### New API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/events/recent` | Recent market events (last 30) |
+| GET | `/api/alerts/current` | Active alerts (unacknowledged, medium+ severity) |
+| POST | `/api/events/run-ingestion` | Manual ingestion trigger |
+| POST | `/api/alerts/{id}/acknowledge` | Acknowledge an alert |
+
+### New DB Tables
+
+- `ingestion_runs` — tracks each ingestion execution
+- `news_raw` — raw fetched news with dedup hash
+- `news_normalized` — classified news with pre-score and triage level
+- `market_events` — events that passed triage, with severity and trigger info
+
 ## Calibración de `suggested_pct`
 
 `suggested_pct` se deriva del peor desvío material detectado:

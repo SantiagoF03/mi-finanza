@@ -15,6 +15,8 @@ export default function App() {
   const [news, setNews] = useState([])
   const [current, setCurrent] = useState(null)
   const [history, setHistory] = useState([])
+  const [events, setEvents] = useState([])
+  const [alerts, setAlerts] = useState([])
   const [error, setError] = useState('')
   const [currentInfo, setCurrentInfo] = useState('')
   const [cooldownMessage, setCooldownMessage] = useState('')
@@ -40,12 +42,14 @@ export default function App() {
     setError('')
     setCurrentInfo('')
     try {
-      const [sRes, aRes, nRes, cRes, hRes] = await Promise.all([
+      const [sRes, aRes, nRes, cRes, hRes, evRes, alRes] = await Promise.all([
         fetch(`${API}/portfolio/summary`),
         fetch(`${API}/portfolio/analysis`),
         fetch(`${API}/news/recent`),
         fetch(`${API}/recommendations/current`),
         fetch(`${API}/history`),
+        fetch(`${API}/events/recent`),
+        fetch(`${API}/alerts/current`),
       ])
 
       if (!sRes.ok || !aRes.ok || !nRes.ok || !hRes.ok) throw new Error('backend_unavailable')
@@ -54,6 +58,8 @@ export default function App() {
       setAnalysis(await aRes.json())
       setNews(await nRes.json())
       setHistory(await hRes.json())
+      if (evRes.ok) setEvents(await evRes.json())
+      if (alRes.ok) setAlerts(await alRes.json())
 
       if (cRes.status === 404) {
         setCurrent(null)
@@ -70,6 +76,8 @@ export default function App() {
       setNews([])
       setCurrent(null)
       setHistory([])
+      setEvents([])
+      setAlerts([])
       setCurrentInfo('')
     }
   }
@@ -103,6 +111,22 @@ export default function App() {
     }
   }
 
+  const triggerIngestion = async () => {
+    setError('')
+    try {
+      const resp = await fetch(`${API}/events/run-ingestion`, { method: 'POST' })
+      if (!resp.ok) throw new Error('ingestion_failed')
+      await load()
+    } catch {
+      setError('No se pudo ejecutar la ingesta de noticias.')
+    }
+  }
+
+  const acknowledgeAlert = async (alertId) => {
+    await fetch(`${API}/alerts/${alertId}/acknowledge`, { method: 'POST' })
+    load()
+  }
+
   const decide = async (decision) => {
     if (!current?.id) return
     await fetch(`${API}/recommendations/${current.id}/decision`, {
@@ -118,6 +142,10 @@ export default function App() {
       <h1>Mi Finanza MVP</h1>
       <button onClick={triggerAnalysis} disabled={cooldownRemaining > 0}>
         Disparar análisis manual
+      </button>
+      {' '}
+      <button onClick={triggerIngestion}>
+        Ingestar noticias
       </button>
       {cooldownMessage && <p style={{ color: '#7a2e0a', fontWeight: 600 }}>{cooldownMessage}</p>}
       {error && <p style={{ color: '#b42318' }}>{error}</p>}
@@ -278,6 +306,49 @@ export default function App() {
           ))}
         </ul>
       </section>
+
+      {alerts.length > 0 && (
+        <section>
+          <h2>Alertas activas</h2>
+          <ul>
+            {alerts.map((a) => (
+              <li key={a.id} style={{ marginBottom: 8, paddingBottom: 6, borderBottom: '1px solid #eee' }}>
+                <span style={{
+                  background: a.severity === 'critical' ? '#d32f2f' : a.severity === 'high' ? '#f57c00' : '#fbc02d',
+                  color: a.severity === 'critical' ? '#fff' : '#333',
+                  padding: '2px 6px', borderRadius: 4, fontSize: '0.8em', marginRight: 6
+                }}>{a.severity}</span>
+                <strong>{a.message}</strong>
+                {a.affected_symbols?.length > 0 && <span> — {a.affected_symbols.join(', ')}</span>}
+                {a.triggered_recalc && <span style={{ background: '#e8f5e9', padding: '2px 6px', borderRadius: 4, marginLeft: 6, fontSize: '0.8em' }}>recalculado</span>}
+                <span style={{ fontSize: '0.85em', color: '#888', marginLeft: 8 }}>{a.trigger_type}</span>
+                {' '}
+                <button onClick={() => acknowledgeAlert(a.id)} style={{ fontSize: '0.8em', padding: '1px 6px' }}>OK</button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {events.length > 0 && (
+        <section>
+          <h2>Eventos de mercado recientes</h2>
+          <ul>
+            {events.map((e) => (
+              <li key={e.id} style={{ marginBottom: 4 }}>
+                <span style={{
+                  background: e.severity === 'critical' ? '#ffcdd2' : e.severity === 'high' ? '#ffe0b2' : e.severity === 'medium' ? '#fff9c4' : '#e8f5e9',
+                  padding: '1px 5px', borderRadius: 3, fontSize: '0.8em', marginRight: 4
+                }}>{e.severity}</span>
+                {e.message}
+                {e.affected_symbols?.length > 0 && <span style={{ fontSize: '0.85em', color: '#666' }}> [{e.affected_symbols.join(', ')}]</span>}
+                {e.triggered_recalc && <span style={{ fontSize: '0.8em', color: '#388e3c', marginLeft: 4 }}>(recalc)</span>}
+                <span style={{ fontSize: '0.8em', color: '#999', marginLeft: 6 }}>{e.created_at}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <section>
         <h2>Historial de recomendaciones</h2>
