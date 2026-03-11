@@ -223,6 +223,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "unchanged_reason": unchanged_reason,
             "news_summary": news_summary,
             "recommendation_explanation_llm": recommendation_explanation_llm,
+            "rebalance_observability": rec.get("rebalance_observability", {}),
         },
     )
     db.add(rec_model)
