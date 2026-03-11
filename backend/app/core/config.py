@@ -43,6 +43,23 @@ class Settings(BaseSettings):
     recommendation_unchanged_pct_threshold: float = 0.01
     recommendation_unchanged_risk_threshold: float = 0.03
 
+    # Scheduler — market-hours aware (Part D)
+    scheduler_market_open_hour: int = 11  # Argentina market open (UTC): 11:00 = 8:00 ART
+    scheduler_market_close_hour: int = 20  # Argentina market close (UTC): 20:00 = 17:00 ART
+    scheduler_premarket_minutes: List[int] = Field(default_factory=lambda: [60, 15])
+    scheduler_open_interval_minutes: int = 30
+    scheduler_postmarket_runs: int = 2
+    scheduler_off_hours_enabled: bool = False
+    scheduler_ingestion_only_off_hours: bool = True
+
+    # Notification (Part E)
+    notification_enabled: bool = False
+    notification_channel: str = "telegram"  # telegram | email
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    notification_min_severity: str = "medium"  # low | medium | high | critical
+    notification_cooldown_seconds: int = 300
+
     whitelist_assets: List[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "AL30", "BND", "CASH"]
     )
@@ -53,7 +70,7 @@ class Settings(BaseSettings):
         default_factory=list
     )
 
-    @field_validator("whitelist_assets", "news_rss_urls", "watchlist_assets", "market_universe_assets", mode="before")
+    @field_validator("whitelist_assets", "news_rss_urls", "watchlist_assets", "market_universe_assets", "scheduler_premarket_minutes", mode="before")
     @classmethod
     def parse_csv_fields(cls, v):
         if isinstance(v, str):

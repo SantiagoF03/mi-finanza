@@ -104,3 +104,74 @@ class RuleConfig(Base):
     min_liquidity_pct: Mapped[float] = mapped_column(Float, default=0.05)
     leverage_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_execution_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+# ---------------------------------------------------------------------------
+# Market event ingestion & alerting
+# ---------------------------------------------------------------------------
+
+
+class IngestionRun(Base):
+    __tablename__ = "ingestion_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(50))
+    status: Mapped[str] = mapped_column(String(20), default="running")
+    items_fetched: Mapped[int] = mapped_column(Integer, default=0)
+    items_new: Mapped[int] = mapped_column(Integer, default=0)
+    items_filtered: Mapped[int] = mapped_column(Integer, default=0)
+    events_created: Mapped[int] = mapped_column(Integer, default=0)
+    alerts_created: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class NewsRaw(Base):
+    __tablename__ = "news_raw"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ingestion_run_id: Mapped[int | None] = mapped_column(ForeignKey("ingestion_runs.id"), nullable=True)
+    source: Mapped[str] = mapped_column(String(200))
+    title: Mapped[str] = mapped_column(String(500))
+    summary: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(String(1000), default="")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    dedup_hash: Mapped[str] = mapped_column(String(64), index=True, default="")
+
+
+class NewsNormalized(Base):
+    __tablename__ = "news_normalized"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    raw_id: Mapped[int] = mapped_column(ForeignKey("news_raw.id"))
+    title: Mapped[str] = mapped_column(String(500))
+    summary: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(200))
+    url: Mapped[str] = mapped_column(String(1000), default="")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    event_type: Mapped[str] = mapped_column(String(50))
+    impact: Mapped[str] = mapped_column(String(20))
+    confidence: Mapped[float] = mapped_column(Float)
+    related_assets: Mapped[list[str]] = mapped_column(JSON, default=list)
+    recency_hours: Mapped[float] = mapped_column(Float, default=0.0)
+    pre_score: Mapped[float] = mapped_column(Float, default=0.0)
+    triage_level: Mapped[str] = mapped_column(String(20), default="store_only")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MarketEvent(Base):
+    __tablename__ = "market_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    news_normalized_id: Mapped[int | None] = mapped_column(ForeignKey("news_normalized.id"), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(50))
+    severity: Mapped[str] = mapped_column(String(20))
+    trigger_type: Mapped[str] = mapped_column(String(30))
+    affected_symbols: Mapped[list[str]] = mapped_column(JSON, default=list)
+    message: Mapped[str] = mapped_column(Text)
+    triggered_recalc: Mapped[bool] = mapped_column(Boolean, default=False)
+    recalc_recommendation_id: Mapped[int | None] = mapped_column(ForeignKey("recommendations.id"), nullable=True)
+    acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
