@@ -8,8 +8,10 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
 
     action = "mantener"
     pct = 0.0
+    raw_pct = 0.0
     actions = []
     external_opportunities = []
+    candidate_deviations = {}
     rationale = "Cartera estable sin señales fuertes."
     risks = "Riesgo moderado de mercado."
     confidence = 0.55
@@ -107,6 +109,18 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             + "."
         )
 
+    # --- Rebalance observability ---
+    rebalance_obs = {}
+    if action == "rebalancear" and candidate_deviations:
+        max_dev_symbol = max(candidate_deviations, key=lambda k: abs(candidate_deviations[k]))
+        rebalance_obs = {
+            "max_rebalance_deviation": round(candidate_deviations[max_dev_symbol], 4),
+            "suggested_pct_raw": round(raw_pct, 4),
+            "suggested_pct_cap": max_move,
+            "suggested_pct_final": pct,
+            "suggested_pct_cap_applied": raw_pct > max_move,
+        }
+
     return {
         "action": action,
         "suggested_pct": pct,
@@ -116,4 +130,5 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         "executive_summary": f"Sugerencia: {action}. Movimiento sugerido: {round(pct*100,2)}% del portfolio.",
         "actions": actions,
         "external_opportunities": external_opportunities,
+        "rebalance_observability": rebalance_obs,
     }

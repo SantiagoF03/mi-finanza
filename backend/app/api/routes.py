@@ -97,6 +97,7 @@ def current_recommendation(db: Session = Depends(get_db)):
         "unchanged_reason": meta.get("unchanged_reason", ""),
         "news_summary": meta.get("news_summary"),
         "recommendation_explanation_llm": meta.get("recommendation_explanation_llm"),
+        "rebalance_observability": meta.get("rebalance_observability", {}),
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 

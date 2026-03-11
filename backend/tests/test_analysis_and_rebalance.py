@@ -475,3 +475,85 @@ def test_real_portfolio_currency_exposure():
 
     # No hardcoded symbols in deviation
     assert "MSFT" not in analysis["rebalance_deviation"]
+
+
+# ---------------------------------------------------------------------------
+# Rebalance observability
+# ---------------------------------------------------------------------------
+
+
+def test_rebalance_observability_cap_applied_true():
+    """When raw_pct exceeds max_move, cap_applied should be True."""
+    # Extreme deviation: SPY=99% of portfolio → raw_pct = abs(dev)*0.5 >> 0.05
+    snapshot = {
+        "total_value": 100,
+        "cash": 1,
+        "currency": "ARS",
+        "positions": [
+            {"symbol": "SPY", "market_value": 99, "asset_type": "ETF", "currency": "ARS", "pnl_pct": 0},
+        ],
+    }
+    analysis = analyze_portfolio(snapshot)
+    rec = generate_recommendation(snapshot, analysis, [], max_move=0.05)
+    obs = rec["rebalance_observability"]
+    if rec["action"] == "rebalancear":
+        assert obs["suggested_pct_cap_applied"] is True
+        assert obs["suggested_pct_raw"] > obs["suggested_pct_cap"]
+        assert obs["suggested_pct_final"] == obs["suggested_pct_cap"]
+
+
+def test_rebalance_observability_cap_applied_false():
+    """When raw_pct does not exceed max_move, cap_applied should be False."""
+    # Mild deviation: balanced-ish portfolio with small deviations
+    snapshot = {
+        "total_value": 100,
+        "cash": 10,
+        "currency": "ARS",
+        "positions": [
+            {"symbol": "AAPL", "market_value": 22, "asset_type": "CEDEAR", "currency": "ARS", "pnl_pct": 0},
+            {"symbol": "MSFT", "market_value": 22, "asset_type": "CEDEAR", "currency": "ARS", "pnl_pct": 0},
+            {"symbol": "GGAL", "market_value": 15, "asset_type": "ACCIONES", "currency": "ARS", "pnl_pct": 0},
+            {"symbol": "AL30", "market_value": 15, "asset_type": "BONO", "currency": "ARS", "pnl_pct": 0},
+            {"symbol": "CRTAFAA", "market_value": 16, "asset_type": "FondoComundeInversion", "currency": "ARS", "pnl_pct": 0},
+        ],
+    }
+    analysis = analyze_portfolio(snapshot)
+    rec = generate_recommendation(snapshot, analysis, [], max_move=0.50)
+    obs = rec["rebalance_observability"]
+    if rec["action"] == "rebalancear":
+        assert obs["suggested_pct_cap_applied"] is False
+        assert obs["suggested_pct_raw"] <= obs["suggested_pct_cap"]
+        assert obs["suggested_pct_final"] == round(max(0.02, obs["suggested_pct_raw"]), 4)
+
+
+def test_rebalance_observability_formula_matches():
+    """suggested_pct_final should match min(cap, max(0.02, raw))."""
+    snapshot = {
+        "total_value": 100,
+        "cash": 5,
+        "currency": "ARS",
+        "positions": [
+            {"symbol": "SPY", "market_value": 60, "asset_type": "ETF", "currency": "ARS", "pnl_pct": 0},
+            {"symbol": "GGAL", "market_value": 35, "asset_type": "ACCIONES", "currency": "ARS", "pnl_pct": 0},
+        ],
+    }
+    analysis = analyze_portfolio(snapshot)
+    rec = generate_recommendation(snapshot, analysis, [], max_move=0.10)
+    obs = rec["rebalance_observability"]
+    if rec["action"] == "rebalancear":
+        expected = round(min(obs["suggested_pct_cap"], max(0.02, obs["suggested_pct_raw"])), 4)
+        assert obs["suggested_pct_final"] == expected
+        assert obs["max_rebalance_deviation"] != 0
+
+
+def test_rebalance_observability_empty_when_not_rebalancing():
+    """When action is not 'rebalancear', observability dict should be empty."""
+    snapshot = {
+        "total_value": 100,
+        "cash": 100,
+        "currency": "ARS",
+        "positions": [],
+    }
+    analysis = analyze_portfolio(snapshot)
+    rec = generate_recommendation(snapshot, analysis, [], max_move=0.10)
+    assert rec["rebalance_observability"] == {}
