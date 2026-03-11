@@ -69,7 +69,8 @@ def test_map_iol_portfolio_to_snapshot():
     assert out["cash"] == 5000
     assert out["positions"][0]["symbol"] == "GGAL"
     assert out["positions"][0]["avg_price"] == 2000
-    assert out["positions"][0]["instrument_type"] == "ACCION"
+    # "ACCION" gets normalized to "ACCIONES" by _normalize_asset_type
+    assert out["positions"][0]["instrument_type"] == "ACCIONES"
 
 
 def test_map_iol_estadocuenta_cash_with_fallbacks():

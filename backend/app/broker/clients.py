@@ -76,6 +76,59 @@ def map_iol_estadocuenta_cash(payload: dict[str, Any]) -> float:
     return 0.0
 
 
+def _normalize_asset_type(iol_tipo: str) -> str:
+    """Normalize IOL's titulo.tipo to our internal asset type format.
+
+    IOL V2 returns lowercase with underscores (e.g. "acciones",
+    "fondos_comunes_de_inversion", "cedears"). We map these to our
+    canonical types: CEDEAR, ACCIONES, BONO, ON, TitulosPublicos,
+    FondoComundeInversion, ETF.
+    """
+    t = (iol_tipo or "").strip()
+    t_lower = t.lower().replace(" ", "_")
+
+    _IOL_TIPO_MAP: dict[str, str] = {
+        "cedears": "CEDEAR", "cedear": "CEDEAR",
+        "acciones": "ACCIONES", "accion": "ACCIONES",
+        "acciones_argentina": "ACCIONES",
+        "bonos": "BONO", "bono": "BONO",
+        "titulos_publicos": "TitulosPublicos",
+        "titulo_publico": "TitulosPublicos",
+        "letras": "TitulosPublicos", "letra": "TitulosPublicos",
+        "obligaciones_negociables": "ON",
+        "obligacion_negociable": "ON", "on": "ON",
+        "fondos_comunes_de_inversion": "FondoComundeInversion",
+        "fondo_comun_de_inversion": "FondoComundeInversion",
+        "fci": "FondoComundeInversion",
+        "etf": "ETF", "etfs": "ETF",
+    }
+
+    if t_lower in _IOL_TIPO_MAP:
+        return _IOL_TIPO_MAP[t_lower]
+
+    # Already in canonical format
+    _CANONICAL = {"CEDEAR", "ACCIONES", "BONO", "ON", "TitulosPublicos",
+                  "FondoComundeInversion", "ETF"}
+    if t in _CANONICAL:
+        return t
+
+    return t or "DESCONOCIDO"
+
+
+def _map_currency(iol_moneda: str | None) -> str:
+    """Normalize IOL currency to ARS/USD."""
+    m = (iol_moneda or "").strip().lower().replace(" ", "_")
+    if m in {"peso_argentino", "pesos", "peso", "ars", "$"}:
+        return "ARS"
+    if m in {"dolar_estadounidense", "dólar_estadounidense",
+             "dolar_eeuu", "dólar_eeuu", "usd", "u$s",
+             "dolar", "dólar", "dolares", "dólares",
+             "dolar_billete", "dolar_mep", "dolar_ccl",
+             "dolar_cable", "us$"}:
+        return "USD"
+    return "ARS"
+
+
 def map_iol_portfolio_to_snapshot(
     payload: dict[str, Any],
     cash_override: float | None = None,
@@ -89,14 +142,6 @@ def map_iol_portfolio_to_snapshot(
     - estructura ya normalizada con "positions"
     """
     positions: list[dict[str, Any]] = []
-
-    def map_currency(iol_moneda: str | None) -> str:
-        m = (iol_moneda or "").strip().lower()
-        if m in {"peso_argentino", "peso argentino", "ars"}:
-            return "ARS"
-        if m in {"dolar_estadounidense", "dólar estadounidense", "usd", "u$s"}:
-            return "USD"
-        return "ARS"
 
     activos = payload.get("activos") or []
     if isinstance(activos, list) and activos:
@@ -113,6 +158,7 @@ def map_iol_portfolio_to_snapshot(
                 continue
 
             iol_tipo = (titulo.get("tipo") or "").strip()
+            normalized_tipo = _normalize_asset_type(iol_tipo)
             iol_moneda = titulo.get("moneda")
 
             try:
@@ -138,9 +184,9 @@ def map_iol_portfolio_to_snapshot(
             positions.append(
                 {
                     "symbol": symbol,
-                    "asset_type": iol_tipo or "DESCONOCIDO",
-                    "instrument_type": iol_tipo or "DESCONOCIDO",
-                    "currency": map_currency(iol_moneda),
+                    "asset_type": normalized_tipo,
+                    "instrument_type": normalized_tipo,
+                    "currency": _map_currency(iol_moneda),
                     "quantity": quantity,
                     "market_value": market_value,
                     "avg_price": avg_price,
@@ -157,12 +203,15 @@ def map_iol_portfolio_to_snapshot(
             if not symbol:
                 continue
 
+            raw_tipo = t.get("tipo") or "DESCONOCIDO"
+            normalized_tipo = _normalize_asset_type(raw_tipo)
+
             positions.append(
                 {
                     "symbol": symbol,
-                    "asset_type": t.get("tipo") or "DESCONOCIDO",
-                    "instrument_type": t.get("tipo") or "DESCONOCIDO",
-                    "currency": payload.get("moneda", "ARS"),
+                    "asset_type": normalized_tipo,
+                    "instrument_type": normalized_tipo,
+                    "currency": _map_currency(payload.get("moneda")),
                     "quantity": float(t.get("cantidad") or 0.0),
                     "market_value": float(t.get("valorizado") or 0.0),
                     "avg_price": float(t.get("precioPromedio") or 0.0),
