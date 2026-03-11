@@ -109,6 +109,7 @@ def test_candidate_has_all_required_fields():
     required_fields = {
         "symbol", "source_types", "tracking_status", "actionable_external",
         "actionable_reason", "priority_score", "asset_type", "asset_type_valid",
+        "asset_type_status", "in_main_allowed", "investable",
         "reason", "confidence", "event_type", "impact",
     }
     assert required_fields.issubset(set(c.keys()))
@@ -149,8 +150,9 @@ def test_invalid_asset_type_does_not_break_cycle():
     assert len(candidates) == 1
     c = candidates[0]
     assert c["asset_type"] == "DESCONOCIDO"
-    # DESCONOCIDO is not in VALID_ASSET_TYPES but is allowed as unknown fallback
-    # actionable is still True because it's in watchlist and type is "DESCONOCIDO" (not positively invalid)
+    assert c["asset_type_status"] == "unknown"  # NOT unsupported
+    # Unknown is still actionable because it's in watchlist
+    assert c["actionable_external"] is True
     assert c["tracking_status"] == "watchlist"
 
 
@@ -219,8 +221,9 @@ def test_build_target_weights_distributes_by_bucket():
     assert abs(weights["MSFT"] - moderado["equity_exterior"] / 2) < 0.001
     # AL30 is the only renta_fija, gets full bucket weight
     assert abs(weights["AL30"] - moderado["renta_fija"]) < 0.001
-    # CASH always present
-    assert abs(weights["CASH"] - moderado["cash"]) < 0.001
+    # CASH includes preset cash + unallocated buckets (equity_local, fci, otros)
+    expected_cash = moderado["cash"] + moderado["equity_local"] + moderado["fci"] + moderado["otros"]
+    assert abs(weights["CASH"] - expected_cash) < 0.001
 
 
 def test_analyzer_uses_dynamic_weights():

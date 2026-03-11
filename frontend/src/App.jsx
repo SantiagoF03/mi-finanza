@@ -181,7 +181,7 @@ export default function App() {
           <p>Estas oportunidades son externas a tu cartera actual. No generan órdenes ni approve/reject.</p>
           <ul>
             {current.external_opportunities.map((op, idx) => (
-              <li key={`${op.symbol}-${idx}`} style={{ marginBottom: 6 }}>
+              <li key={`${op.symbol}-${idx}`} style={{ marginBottom: 10, paddingBottom: 8, borderBottom: '1px solid #eee' }}>
                 <strong>{op.symbol}</strong>
                 {' '}
                 {(op.source_types || []).map((s) => (
@@ -197,20 +197,33 @@ export default function App() {
                     no rastreado
                   </span>
                 )}
-                {op.actionable_external && (
-                  <span style={{ background: '#c8e6c9', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>habilitado</span>
+                {op.asset_type_status === 'unsupported' && (
+                  <span style={{ background: '#ffab91', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>tipo no soportado: {op.asset_type}</span>
                 )}
-                {op.actionable_external === false && (
-                  <span style={{ background: '#ffcdd2', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>no habilitado</span>
+                {op.asset_type_status === 'unknown' && (
+                  <span style={{ background: '#ffe0b2', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>tipo desconocido</span>
                 )}
-                {op.asset_type_valid === false && (
-                  <span style={{ background: '#ffab91', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>tipo no soportado</span>
+                {op.asset_type_status === 'known_valid' && (
+                  <span style={{ background: '#c8e6c9', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>tipo: {op.asset_type}</span>
+                )}
+                {op.investable && (
+                  <span style={{ background: '#a5d6a7', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em', fontWeight: 600 }}>invertible</span>
+                )}
+                {!op.investable && op.actionable_external && (
+                  <span style={{ background: '#c8e6c9', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>seguimiento</span>
+                )}
+                {!op.actionable_external && (
+                  <span style={{ background: '#ffcdd2', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>solo observado</span>
+                )}
+                {op.in_main_allowed && (
+                  <span style={{ background: '#bbdefb', padding: '2px 6px', borderRadius: 4, marginLeft: 2, fontSize: '0.85em' }}>en whitelist</span>
                 )}
                 <br />
                 <span style={{ fontSize: '0.9em', color: '#555' }}>
                   prioridad: {op.priority_score ?? '-'} | impacto: {op.impact} | tipo: {op.event_type} | confianza: {(Number(op.confidence || 0) * 100).toFixed(0)}%
-                  {op.actionable_reason && <> | {op.actionable_reason}</>}
                 </span>
+                <br />
+                <span style={{ fontSize: '0.9em', color: '#666' }}>{op.actionable_reason}</span>
                 <br />
                 <span style={{ fontSize: '0.9em' }}>motivo: {op.reason}</span>
               </li>

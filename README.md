@@ -163,23 +163,47 @@ Las oportunidades externas ahora se generan desde tres fuentes, no solo noticias
 | **universe** | Símbolos en `MARKET_UNIVERSE_ASSETS` aparecen como candidatos observados |
 
 Cada oportunidad externa incluye:
-- `source_types`: lista de fuentes (`["news", "watchlist"]`, etc.)
+- `source_types`: lista de fuentes (`["news", "watchlist"]`, etc.) — refleja TODAS las fuentes combinadas
 - `tracking_status`: clasificación (`watchlist`, `in_universe`, `untracked`)
-- `actionable_external`: true si está en watchlist o universe (habilitado para seguimiento)
-- `actionable_reason`: explicación de por qué es o no es actionable
-- `priority_score`: score simple (news + watchlist > watchlist sola > universe sola)
-- `asset_type` / `asset_type_valid`: tipo de activo y si es soportado
+- `asset_type` / `asset_type_status`: tipo resuelto y su estado (`known_valid`, `unknown`, `unsupported`)
+- `in_main_allowed`: bool — si el símbolo está en whitelist/main_allowed (podría estar en acciones principales)
+- `actionable_external`: bool — habilitado para seguimiento (en watchlist/universe + tipo no unsupported)
+- `investable`: bool — listo para inversión manual (en main_allowed + tipo known_valid)
+- `actionable_reason`: explicación semántica sin contradicciones
+- `priority_score`: score dinámico — sube al combinar fuentes, al tener tipo válido, al ser investable
 
-**Candidato observado vs actionable**: un candidato `untracked` (no en watchlist ni universe) aparece pero con menor prioridad y `actionable_external=false`. Un candidato en watchlist es `actionable_external=true`.
+### Semántica de tres niveles
 
-## Validación de tipos de activo (runtime)
+| Nivel | Flag | Significado |
+|---|---|---|
+| **Observado** | aparece en lista | Solo se ve, sin acción sugerida |
+| **Seguimiento** | `actionable_external=true` | En watchlist/universe, habilitado para tracking activo |
+| **Invertible** | `investable=true` | En whitelist + tipo válido, listo para inversión manual |
 
-Los tipos de activo se validan en runtime contra `VALID_ASSET_TYPES`:
-`CEDEAR`, `ACCIONES`, `TitulosPublicos`, `FondoComundeInversion`, `ETF`, `BONO`, `ON`
+**Ejemplo real**: AAPL en `MARKET_UNIVERSE_ASSETS` + `WHITELIST_ASSETS` → `actionable_external=true`, `investable=true`, `asset_type=CEDEAR`, `asset_type_status=known_valid`.
 
-- Si un activo externo tiene tipo no soportado: se marca `asset_type_valid=false`, no se rompe el ciclo
-- `DESCONOCIDO` es un fallback para tipos desconocidos, no es un tipo válido
-- El frontend muestra "tipo no soportado" cuando corresponde
+## Resolución de tipos de activo
+
+Implementado en `backend/app/market/assets.py`.
+
+El sistema resuelve `asset_type` para cualquier símbolo usando múltiples fuentes en orden de prioridad:
+
+1. **Posiciones (holdings)** — lookup directo, más confiable
+2. **Mapa estático `KNOWN_ASSET_TYPES`** — ~100 símbolos conocidos del mercado argentino (CEDEARs, bonos, acciones, ONs, ETFs, FCIs)
+3. **Heurística por sufijo** — patrones simples como terminación en "O" → ON
+4. **Fallback** → `DESCONOCIDO` / `unknown`
+
+### Campo `asset_type_status`
+
+Cada candidato externo ahora incluye `asset_type_status` con tres valores posibles:
+
+| Status | Significado | Efecto en actionable |
+|---|---|---|
+| `known_valid` | Tipo conocido y soportado (ej: CEDEAR, BONO) | No bloquea |
+| `unknown` | No se pudo determinar el tipo | No bloquea (pendiente de resolver) |
+| `unsupported` | Tipo conocido pero no soportado (ej: CRYPTOCURRENCY) | Bloquea actionable |
+
+**Importante**: `DESCONOCIDO` ahora se muestra como `unknown`, **no** como `unsupported`. Un símbolo desconocido en watchlist sigue siendo actionable.
 
 ## Target weights dinámicos (perfiles de inversor)
 
@@ -206,7 +230,7 @@ El análisis de cartera ya **no** usa target weights hardcodeados (AAPL/MSFT/SPY
 - `FondoComundeInversion` -> fci
 - Desconocido -> otros
 
-Si un bucket no tiene holdings, su peso queda "no asignado" sin romper el análisis.
+Si un bucket no tiene holdings, su peso se redistribuye a CASH para que los target weights siempre sumen 1.0.
 
 ## Recomendación principal vs oportunidades externas
 - **Recomendación principal de cartera**: usa holdings reales (`snapshot.positions`), análisis de cartera y señales de mercado que afecten la cartera; sus `actions` solo pueden apuntar a activos en cartera o whitelist.

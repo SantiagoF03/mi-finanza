@@ -5,14 +5,19 @@ Generates external opportunity candidates from three sources:
 2. Watchlist (WATCHLIST_ASSETS config)
 3. Market universe (MARKET_UNIVERSE_ASSETS config)
 
-Each candidate gets:
-- symbol, source_types, tracking_status, actionable_external,
-  actionable_reason, priority_score, asset_type
+Each candidate gets a consistent set of fields:
+- symbol, source_types, tracking_status
+- asset_type, asset_type_status (known_valid|unknown|unsupported)
+- actionable_external (tracked for follow-up)
+- investable (in main_allowed + known_valid — ready for manual investment)
+- actionable_reason (human-readable explanation)
+- priority_score (dynamic, reflects combined sources/signals)
 """
 
 from __future__ import annotations
 
-from app.recommendations.universe import VALID_ASSET_TYPES, classify_opportunity_status
+from app.market.assets import resolve_asset_type
+from app.recommendations.universe import classify_opportunity_status
 
 
 def generate_external_candidates(
@@ -26,13 +31,7 @@ def generate_external_candidates(
     Deduplicates by symbol, keeping the highest-priority entry and merging sources.
     """
     held_symbols = {p.get("symbol") for p in positions if p.get("symbol")}
-
-    # Build asset_type lookup from positions
-    asset_type_map: dict[str, str] = {}
-    for p in positions:
-        sym = p.get("symbol")
-        if sym:
-            asset_type_map[sym] = p.get("asset_type") or p.get("instrument_type") or "DESCONOCIDO"
+    main_allowed = allowed_assets.get("main_allowed", set())
 
     # --- Collect all candidates by symbol ---
     candidates: dict[str, dict] = {}
@@ -73,14 +72,15 @@ def generate_external_candidates(
     results = []
     for sym, c in candidates.items():
         tracking = classify_opportunity_status(sym, allowed_assets)
-        asset_type = asset_type_map.get(sym, "DESCONOCIDO")
-        asset_type_valid = asset_type in VALID_ASSET_TYPES
+        asset_type, asset_type_status = resolve_asset_type(sym, positions=positions)
+        in_main = sym in main_allowed
 
-        # Priority scoring (simple MVP)
+        # --- Priority scoring (dynamic, reflects combined sources/signals) ---
         score = 0.0
+        source_count = len(c["source_types"])
+
         if "news" in c["source_types"]:
             score += 0.4
-            # Boost by best news confidence
             best_conf = max((s["confidence"] for s in c["news_signals"]), default=0.5)
             score += best_conf * 0.3
         if "watchlist" in c["source_types"]:
@@ -88,15 +88,38 @@ def generate_external_candidates(
         if "universe" in c["source_types"]:
             score += 0.1
 
-        # Actionable = in watchlist or universe (not just random untracked news)
+        # Boost for multiple sources
+        if source_count >= 2:
+            score += 0.1 * (source_count - 1)
+
+        # Boost if type is known (more actionable)
+        if asset_type_status == "known_valid":
+            score += 0.05
+
+        # Boost if in main_allowed (investable)
+        if in_main:
+            score += 0.1
+
+        # --- Actionable semantics ---
+        # actionable_external: is this worth tracking as an external opportunity?
+        #   True if in watchlist/universe AND type is not unsupported
         actionable = tracking in ("watchlist", "in_universe")
-        if not asset_type_valid and asset_type != "DESCONOCIDO":
+        if asset_type_status == "unsupported":
             actionable = False
-            actionable_reason = f"Tipo de activo no soportado: {asset_type}"
-        elif actionable:
-            actionable_reason = f"En {tracking}, habilitado para seguimiento"
-        else:
-            actionable_reason = "No está en watchlist ni en universo configurado"
+
+        # investable: is this ready for potential manual investment?
+        #   True if in main_allowed AND type is known_valid
+        investable = in_main and asset_type_status == "known_valid"
+
+        # --- Build actionable_reason (human-readable, no contradictions) ---
+        actionable_reason = _build_actionable_reason(
+            tracking=tracking,
+            asset_type=asset_type,
+            asset_type_status=asset_type_status,
+            actionable=actionable,
+            investable=investable,
+            in_main=in_main,
+        )
 
         # Pick best news signal for display
         best_news = max(c["news_signals"], key=lambda s: s["confidence"], default=None) if c["news_signals"] else None
@@ -105,11 +128,14 @@ def generate_external_candidates(
             "symbol": sym,
             "source_types": sorted(c["source_types"]),
             "tracking_status": tracking,
+            "in_main_allowed": in_main,
             "actionable_external": actionable,
+            "investable": investable,
             "actionable_reason": actionable_reason,
             "priority_score": round(score, 2),
             "asset_type": asset_type,
-            "asset_type_valid": asset_type_valid,
+            "asset_type_status": asset_type_status,
+            "asset_type_valid": asset_type_status == "known_valid",
             "reason": best_news["reason"] if best_news else f"Observado desde {', '.join(sorted(c['source_types']))}",
             "confidence": best_news["confidence"] if best_news else 0.3,
             "event_type": best_news["event_type"] if best_news else "otro",
@@ -119,6 +145,52 @@ def generate_external_candidates(
     # Sort by priority descending
     results.sort(key=lambda x: x["priority_score"], reverse=True)
     return results
+
+
+def _build_actionable_reason(
+    *,
+    tracking: str,
+    asset_type: str,
+    asset_type_status: str,
+    actionable: bool,
+    investable: bool,
+    in_main: bool,
+) -> str:
+    """Build a consistent, non-contradictory actionable_reason string."""
+    parts = []
+
+    # Where is it tracked?
+    tracking_label = {
+        "watchlist": "En watchlist",
+        "in_universe": "En universo de mercado",
+        "in_holdings": "En cartera (holding)",
+        "untracked": "No rastreado",
+    }.get(tracking, tracking)
+    parts.append(tracking_label)
+
+    # Asset type status
+    if asset_type_status == "known_valid":
+        parts.append(f"tipo {asset_type} (válido)")
+    elif asset_type_status == "unknown":
+        parts.append("tipo de activo pendiente de resolver")
+    elif asset_type_status == "unsupported":
+        parts.append(f"tipo {asset_type} no soportado")
+
+    # Investment readiness
+    if investable:
+        parts.append("habilitado para inversión (en whitelist)")
+    elif in_main:
+        if asset_type_status == "unknown":
+            parts.append("en whitelist, pero tipo desconocido")
+        elif asset_type_status == "unsupported":
+            parts.append("en whitelist, pero tipo no soportado")
+    elif actionable:
+        parts.append("habilitado para seguimiento")
+    else:
+        if asset_type_status != "unsupported":
+            parts.append("solo observado")
+
+    return ". ".join(parts)
 
 
 def _empty_candidate(symbol: str) -> dict:
