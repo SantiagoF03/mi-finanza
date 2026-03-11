@@ -1,5 +1,33 @@
 from app.core.config import get_settings
-from app.portfolio.profiles import build_target_weights
+from app.portfolio.profiles import build_target_weights, get_bucket
+
+
+def _infer_economic_currency(symbol: str, asset_type: str, trading_currency: str) -> str:
+    """Infer the economic exposure currency for a position.
+
+    CEDEARs and ETFs represent USD-denominated assets even though they
+    trade in ARS on the Argentine market. Bonos with GD prefix are
+    dollar-linked globals.
+    """
+    at = (asset_type or "").upper()
+
+    # CEDEARs and ETFs → USD economic exposure
+    if at in {"CEDEAR", "ETF"}:
+        return "USD"
+
+    # Bonos: GD* = dollar-linked globals, AL* = peso-linked
+    if at == "BONO":
+        sym = (symbol or "").upper()
+        if sym.startswith("GD") or sym.startswith("AE"):
+            return "USD"
+        return trading_currency
+
+    # ACCIONES → ARS (local equities)
+    if at == "ACCIONES":
+        return "ARS"
+
+    # FCI, ON, TitulosPublicos, DESCONOCIDO, others → use trading currency
+    return trading_currency
 
 
 def analyze_portfolio(snapshot: dict, target_weights: dict | None = None) -> dict:
@@ -31,13 +59,29 @@ def analyze_portfolio(snapshot: dict, target_weights: dict | None = None) -> dic
     cash_weight = max(0, cash) / total_value
     weights_by_asset["CASH"] = round(cash_weight, 4)
 
-    weights_by_currency = {}
+    # Economic currency exposure (not just trading currency)
+    weights_by_currency: dict[str, float] = {}
     for p in positions:
-        ccy = p.get("currency", snapshot.get("currency", "USD"))
-        weights_by_currency[ccy] = weights_by_currency.get(ccy, 0) + max(0, p.get("market_value", 0)) / total_value
-    base_ccy = snapshot.get("currency", "USD")
+        asset_type = p.get("asset_type") or p.get("instrument_type") or "DESCONOCIDO"
+        trading_ccy = p.get("currency", snapshot.get("currency", "ARS"))
+        econ_ccy = _infer_economic_currency(p.get("symbol", ""), asset_type, trading_ccy)
+        mv = max(0, p.get("market_value", 0))
+        weights_by_currency[econ_ccy] = weights_by_currency.get(econ_ccy, 0) + mv / total_value
+
+    # Cash goes to snapshot base currency
+    base_ccy = snapshot.get("currency", "ARS")
     weights_by_currency[base_ccy] = weights_by_currency.get(base_ccy, 0) + cash_weight
     weights_by_currency = {k: round(v, 4) for k, v in weights_by_currency.items()}
+
+    # Bucket-level analysis for transparency
+    weights_by_bucket: dict[str, float] = {}
+    for p in positions:
+        asset_type = p.get("asset_type") or p.get("instrument_type") or "DESCONOCIDO"
+        bucket = get_bucket(asset_type)
+        mv = max(0, p.get("market_value", 0))
+        weights_by_bucket[bucket] = weights_by_bucket.get(bucket, 0) + mv / total_value
+    weights_by_bucket["cash"] = weights_by_bucket.get("cash", 0) + cash_weight
+    weights_by_bucket = {k: round(v, 4) for k, v in weights_by_bucket.items()}
 
     concentration_score = round(max(weights_by_asset.values()), 4)
     pnl_volatility_proxy = sum(abs(p.get("pnl_pct", 0)) for p in positions) / max(len(positions), 1)
@@ -55,6 +99,7 @@ def analyze_portfolio(snapshot: dict, target_weights: dict | None = None) -> dic
     return {
         "weights_by_asset": weights_by_asset,
         "weights_by_currency": weights_by_currency,
+        "weights_by_bucket": weights_by_bucket,
         "concentration_score": concentration_score,
         "risk_score": risk_score,
         "rebalance_deviation": rebalance_deviation,

@@ -136,9 +136,24 @@ export default function App() {
       {analysis && (
         <section>
           <h2>Análisis de cartera</h2>
-          <p>Concentración: {analysis.concentration_score}</p>
-          <p>Score de riesgo: {analysis.risk_score}</p>
-          <p>Composición por moneda: {JSON.stringify(analysis.weights_by_currency)}</p>
+          <p>Concentración: {(analysis.concentration_score * 100).toFixed(1)}%</p>
+          <p>Score de riesgo: {(analysis.risk_score * 100).toFixed(1)}%</p>
+          <h3>Exposición por moneda (económica)</h3>
+          <ul>
+            {Object.entries(analysis.weights_by_currency || {}).map(([ccy, w]) => (
+              <li key={ccy}>{ccy}: {(w * 100).toFixed(1)}%</li>
+            ))}
+          </ul>
+          {analysis.weights_by_bucket && (
+            <>
+              <h3>Distribución por bucket</h3>
+              <ul>
+                {Object.entries(analysis.weights_by_bucket).map(([bucket, w]) => (
+                  <li key={bucket}>{bucket}: {(w * 100).toFixed(1)}%</li>
+                ))}
+              </ul>
+            </>
+          )}
           <p>Alertas: {analysis.alerts?.join(' | ') || 'Sin alertas'}</p>
         </section>
       )}

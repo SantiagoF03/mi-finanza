@@ -205,6 +205,58 @@ Cada candidato externo ahora incluye `asset_type_status` con tres valores posibl
 
 **Importante**: `DESCONOCIDO` ahora se muestra como `unknown`, **no** como `unsupported`. Un símbolo desconocido en watchlist sigue siendo actionable.
 
+## Normalización de tipos de activo IOL
+
+Implementado en `backend/app/broker/clients.py` → `_normalize_asset_type()`.
+
+IOL V2 devuelve `titulo.tipo` en formato lowercase con underscores (`"acciones"`, `"cedears"`, `"fondos_comunes_de_inversion"`). El sistema normaliza automáticamente al formato canónico:
+
+| IOL devuelve | Normalizado a |
+|---|---|
+| `acciones`, `accion` | `ACCIONES` |
+| `cedears`, `cedear` | `CEDEAR` |
+| `bonos`, `bono` | `BONO` |
+| `letras`, `titulos_publicos` | `TitulosPublicos` |
+| `obligaciones_negociables` | `ON` |
+| `fondos_comunes_de_inversion`, `fci` | `FondoComundeInversion` |
+| `etf`, `etfs` | `ETF` |
+
+Sin esta normalización, posiciones como BYMA (`acciones`) o CRTAFAA (`fondos_comunes_de_inversion`) caían al bucket "otros", dejando buckets como `equity_local` y `fci` vacíos y distorsionando todo el rebalanceo.
+
+## Composición por moneda (exposición económica)
+
+Implementado en `backend/app/portfolio/analyzer.py` → `_infer_economic_currency()`.
+
+`weights_by_currency` refleja **exposición económica**, no solo la moneda de trading:
+
+| Tipo de activo | Moneda económica | Motivo |
+|---|---|---|
+| `CEDEAR` | USD | Representan acciones/ETFs de EE.UU. |
+| `ETF` | USD | ETFs internacionales (SPY, QQQ, etc.) |
+| `BONO` (GD*, AE*) | USD | Bonos globales dollar-linked |
+| `BONO` (AL*, otros) | Trading currency | Bonos peso-linked |
+| `ACCIONES` | ARS | Acciones locales argentinas |
+| `FondoComundeInversion` | Trading currency | Depende del FCI |
+| `DESCONOCIDO` | Trading currency | Fallback conservador |
+
+**Antes**: SPY (CEDEAR/ETF traded en ARS) mostraba 100% ARS. **Ahora**: muestra como USD.
+
+## Distribución por bucket (`weights_by_bucket`)
+
+El análisis ahora incluye `weights_by_bucket` para transparencia:
+
+```json
+"weights_by_bucket": {
+  "equity_exterior": 0.55,
+  "equity_local": 0.09,
+  "renta_fija": 0.12,
+  "fci": 0.22,
+  "cash": 0.02
+}
+```
+
+Esto permite verificar que los buckets están correctamente poblados y que el rebalanceo tiene sentido.
+
 ## Target weights dinámicos (perfiles de inversor)
 
 Implementado en `backend/app/portfolio/profiles.py`.
@@ -231,6 +283,22 @@ El análisis de cartera ya **no** usa target weights hardcodeados (AAPL/MSFT/SPY
 - Desconocido -> otros
 
 Si un bucket no tiene holdings, su peso se redistribuye a CASH para que los target weights siempre sumen 1.0.
+
+## Calibración de `suggested_pct`
+
+`suggested_pct` se deriva del peor desvío material detectado:
+
+```
+raw_pct = abs(worst_deviation) * 0.5
+suggested_pct = min(MAX_MOVEMENT_PER_CYCLE, max(0.02, raw_pct))
+```
+
+- **Escala gradual**: sugiere corregir ~50% del peor desvío por ciclo, no el desvío completo
+- **Mínimo 2%**: evita sugerencias triviales
+- **Capped a `MAX_MOVEMENT_PER_CYCLE`** (default 10%): previene movimientos excesivos
+- **Confianza dinámica**: escala de 55% a 70% según severidad del desvío (20% dev = máxima severidad)
+
+Ejemplo: desvío de 12% → sugiere 6%. Desvío de 28% → sugiere 10% (capped). Desvío de 8% → sugiere 4%.
 
 ## Recomendación principal vs oportunidades externas
 - **Recomendación principal de cartera**: usa holdings reales (`snapshot.positions`), análisis de cartera y señales de mercado que afecten la cartera; sus `actions` solo pueden apuntar a activos en cartera o whitelist.

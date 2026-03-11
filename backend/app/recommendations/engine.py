@@ -63,10 +63,15 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             worst = max(candidate_deviations, key=lambda k: abs(candidate_deviations[k]))
             dev = candidate_deviations[worst]
             action = "rebalancear"
-            pct = min(max_move, abs(dev))
-            actions = [{"symbol": worst, "target_change_pct": -pct if dev > 0 else pct, "reason": "Desvío vs objetivo"}]
+            # Scale: suggest correcting ~50% of the worst deviation per cycle,
+            # capped at max_move. Minimum 2% to avoid trivial suggestions.
+            raw_pct = abs(dev) * 0.5
+            pct = round(min(max_move, max(0.02, raw_pct)), 4)
+            # Scale confidence with deviation severity (20% dev = max severity)
+            severity = min(abs(dev) / 0.20, 1.0)
+            confidence = round(0.55 + severity * 0.15, 2)
+            actions = [{"symbol": worst, "target_change_pct": round(-pct if dev > 0 else pct, 4), "reason": "Desvío vs objetivo"}]
             rationale = "Se detectó desvío material contra cartera objetivo."
-            confidence = 0.66
 
     elif positive_hits:
         related_in_portfolio = []
