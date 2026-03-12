@@ -8,6 +8,7 @@ from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.market.candidates import generate_external_candidates
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
+from app.news.ingestion import get_llm_eligible_news, run_ingestion
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
@@ -175,24 +176,42 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     )
     rec.pop("_news_items", None)
 
+    # --- Ingestion: ensure triage pipeline has run (best-effort) ---
+    ingestion_meta = {}
+    try:
+        ingestion_result = run_ingestion(db, source_label=f"cycle_{source}")
+        ingestion_meta = {
+            "ingestion_status": ingestion_result.get("status"),
+            "items_fetched": ingestion_result.get("items_fetched", 0),
+            "items_new": ingestion_result.get("items_new", 0),
+            "triage_counts": ingestion_result.get("triage_counts", {}),
+            "holdings_source": ingestion_result.get("holdings_source", "unknown"),
+        }
+    except Exception as exc:
+        ingestion_meta = {"ingestion_status": "failed", "ingestion_error": str(exc)[:200]}
+
     # --- LLM explanation layer (best-effort, never breaks cycle) ---
+    # CRITICAL: LLM only receives triage-filtered news (send_to_llm + trigger_recalc)
+    llm_news_items = []
+    try:
+        llm_news_items = get_llm_eligible_news(db)
+    except Exception:
+        llm_news_items = []
+
     news_summary = None
     recommendation_explanation_llm = None
-    try:
-        news_summary = llm_summarize(news_items, snapshot_dict, analysis)
-        print("LLM news_summary OK:", news_summary)
-    except Exception as exc:
-        print("LLM summarize failed:", repr(exc))
-        news_summary = None
+    if llm_news_items:
+        try:
+            news_summary = llm_summarize(llm_news_items, snapshot_dict, analysis)
+        except Exception:
+            news_summary = None
 
-    try:
-        recommendation_explanation_llm = llm_explain(
-        rec, snapshot_dict, analysis, news_items, unchanged=unchanged
-        )
-        print("LLM recommendation_explanation_llm OK:", recommendation_explanation_llm)
-    except Exception as exc:
-        print("LLM explain failed:", repr(exc))
-        recommendation_explanation_llm = None
+        try:
+            recommendation_explanation_llm = llm_explain(
+                rec, snapshot_dict, analysis, llm_news_items, unchanged=unchanged
+            )
+        except Exception:
+            recommendation_explanation_llm = None
 
     rec_model = Recommendation(
         action=rec["action"],
@@ -211,6 +230,8 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_source": news_source,
             "news_inserted": inserted_news,
             "news_used": len(news_items),
+            "llm_news_used": len(llm_news_items),
+            "ingestion": ingestion_meta,
             "external_opportunities": rec.get("external_opportunities", []),
             "allowed_assets": {
                 "holdings": sorted(allowed_assets["holdings"]),

@@ -17,7 +17,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
-from app.news.ingestion import get_pending_recalc_events, run_ingestion
+from app.news.ingestion import get_pending_recalc_events, has_llm_eligible_news, run_ingestion
 from app.services.orchestrator import run_cycle
 
 scheduler = BackgroundScheduler(job_defaults={"coalesce": True, "max_instances": 1})
@@ -68,11 +68,23 @@ def scheduled_ingestion():
 
 
 def scheduled_full_cycle():
-    """Full analysis cycle (used at market close)."""
+    """Full analysis cycle (used at market close).
+
+    Gated: only runs run_cycle if there are LLM-eligible news or
+    pending trigger_recalc events, unless scheduler_postmarket_force_cycle is True.
+    """
+    settings = get_settings()
     db = SessionLocal()
     try:
         run_ingestion(db, source_label="scheduler_close")
-        run_cycle(db, source="scheduler")
+
+        should_run = (
+            settings.scheduler_postmarket_force_cycle
+            or has_llm_eligible_news(db)
+            or bool(get_pending_recalc_events(db))
+        )
+        if should_run:
+            run_cycle(db, source="scheduler")
     finally:
         db.close()
 
