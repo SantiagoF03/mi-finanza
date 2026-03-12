@@ -70,8 +70,64 @@ npm --prefix frontend run dev
 4. Ejecutá `POST /api/analysis/run`.
 5. Consultá `GET /api/portfolio/summary` y verificá que posiciones/cash vienen de IOL.
 
-## Restricción
-No hay endpoints de compra/venta implementados. Solo lectura.
+## Ejecución de órdenes (aprobación del usuario)
+
+El flujo de ejecución es **semi-automático**: la app sugiere, el usuario decide.
+
+### Flujo completo
+
+```
+Motor rule-based → Recomendación (pending/blocked)
+  → Usuario aprueba en UI → POST /api/recommendations/{id}/approve
+    → Se crean OrderExecution rows (execution_requested)
+    → Broker.place_order() → execution_sent
+    → Resultado: executed / partially_executed / rejected_by_broker / failed
+  → Usuario rechaza → POST /api/recommendations/{id}/reject
+    → Sin órdenes. Recomendación queda en "rejected".
+```
+
+### Invariantes de seguridad
+- **El scheduler NUNCA ejecuta órdenes** — solo ingesta y análisis
+- **El LLM NUNCA ejecuta órdenes** — solo explica
+- **Solo `POST /api/recommendations/{id}/approve`** dispara ejecución real
+- Recomendación debe estar en `pending` o `blocked` para aprobar/rechazar
+
+### Estados de ejecución
+
+| Estado | Significado |
+|---|---|
+| `execution_requested` | Orden creada, pendiente de envío |
+| `execution_sent` | Enviada al broker |
+| `executed` | Ejecutada exitosamente |
+| `partially_executed` | Ejecución parcial |
+| `rejected_by_broker` | Rechazada por el broker |
+| `failed` | Error técnico |
+
+### Broker modes para ejecución
+- `BROKER_MODE=mock`: MockBrokerClient simula órdenes exitosas
+- `BROKER_MODE=real`: IolBrokerClient envía órdenes reales via `POST /api/v2/operar`
+
+## PWA / Mobile
+
+La app es instalable como PWA (Progressive Web App):
+- Manifest con íconos, theme_color, display standalone
+- Service worker con cache offline (vite-plugin-pwa)
+- UI responsive con tabs para navegación móvil
+- Botones de aprobar/rechazar grandes y touch-friendly
+- Web push subscription infrastructure (VAPID keys)
+
+## Endpoints de ejecución y notificaciones
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/recommendations/{id}/approve` | Aprobar y ejecutar órdenes |
+| POST | `/api/recommendations/{id}/reject` | Rechazar sin ejecutar |
+| GET | `/api/executions/recent` | Ejecuciones recientes |
+| GET | `/api/executions/{id}` | Detalle de una ejecución |
+| GET | `/api/notifications/settings` | Config de notificaciones |
+| PUT | `/api/notifications/settings` | Actualizar config |
+| POST | `/api/push/subscribe` | Registrar push subscription |
+| GET | `/api/push/vapid-public-key` | Obtener VAPID public key |
 
 
 ## Corrección de recomendación (símbolos reales)
