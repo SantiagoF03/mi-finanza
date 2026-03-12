@@ -257,23 +257,37 @@ El análisis ahora incluye `weights_by_bucket` para transparencia:
 
 Esto permite verificar que los buckets están correctamente poblados y que el rebalanceo tiene sentido.
 
-## Target weights dinámicos (perfiles de inversor)
+## Perfil de inversor objetivo
 
-Implementado en `backend/app/portfolio/profiles.py`.
+Implementado en `backend/app/portfolio/profiles.py` y `backend/app/core/config.py`.
 
-El análisis de cartera ya **no** usa target weights hardcodeados (AAPL/MSFT/SPY). En cambio:
+El perfil del inversor es una **configuración explícita** del sistema — no una suposición difusa ni una inferencia del LLM.
 
-1. Se lee `INVESTOR_PROFILE` del `.env` (default: `moderado`)
-2. El profile define targets por **bucket** (no por símbolo)
-3. Los buckets se distribuyen entre los holdings reales
+### Configuración
+
+```
+INVESTOR_PROFILE_TARGET=moderate_aggressive   # perfil objetivo del usuario
+```
+
+Se puede actualizar en runtime via API:
+- `GET /api/profile/settings` — leer config actual
+- `PUT /api/profile/settings` — cambiar perfil y overrides
 
 ### Perfiles disponibles
 
-| Perfil | cash | renta_fija | equity_ext | equity_local | fci | otros |
-|---|---|---|---|---|---|---|
-| conservador | 25% | 40% | 15% | 10% | 5% | 5% |
-| moderado | 15% | 25% | 30% | 15% | 10% | 5% |
-| agresivo | 5% | 10% | 45% | 25% | 10% | 5% |
+| Perfil | cash | renta_fija | equity_ext | equity_local | fci | otros | max_single | max_equity |
+|---|---|---|---|---|---|---|---|---|
+| conservative | 25% | 40% | 15% | 10% | 5% | 5% | 30% | 35% |
+| moderate | 15% | 25% | 30% | 15% | 10% | 5% | 35% | 55% |
+| **moderate_aggressive** | **10%** | **15%** | **40%** | **20%** | **10%** | **5%** | **40%** | **70%** |
+| aggressive | 5% | 10% | 45% | 25% | 10% | 5% | 45% | 80% |
+
+### Efecto en el sistema
+
+- El análisis de cartera usa los thresholds del perfil para alertas y rebalanceo
+- El rationale menciona explícitamente el perfil aplicado (ej: "perfil moderado-agresivo")
+- Si el perfil es `moderate_aggressive`, la lógica NO castiga equity/growth como si fuera conservador
+- Los alerts de concentración y equity band se ajustan al perfil
 
 ### Mapeo asset_type -> bucket
 - `BONO`, `ON`, `TitulosPublicos` -> renta_fija
@@ -284,17 +298,62 @@ El análisis de cartera ya **no** usa target weights hardcodeados (AAPL/MSFT/SPY
 
 Si un bucket no tiene holdings, su peso se redistribuye a CASH para que los target weights siempre sumen 1.0.
 
+## Motor principal usa noticias triageadas
+
+El motor de recomendación (`generate_recommendation`) y el LLM se alimentan **exclusivamente** del pipeline de ingestion + triage. No usan noticias crudas del provider.
+
+### Flujo completo
+
+```
+News Provider (RSS/Mock)
+  → Ingestion Pipeline (dedup, classify, score, triage)
+  → news_normalized (persist)
+  → get_engine_eligible_news() → observe + send_to_llm + trigger_recalc → Motor principal
+  → get_llm_eligible_news()    → send_to_llm + trigger_recalc          → LLM explicativo
+```
+
+### Observabilidad en metadata
+
+Cada recomendación incluye en `metadata_json`:
+- `news_used_engine`: cantidad de noticias triageadas usadas por el motor principal
+- `news_used_llm`: cantidad de noticias usadas por el LLM
+- `ingestion.triage_counts`: desglose por nivel de triage
+- `ingestion.holdings_source`: `snapshot` o `whitelist`
+- `profile_applied`: perfil de inversor usado
+- `rationale_reasons`: lista estructurada de motivos (ver GAP 3)
+
+## Rationale enriquecido
+
+Las recomendaciones incluyen `rationale_reasons` con motivos estructurados:
+
+| Tipo | Cuándo aparece |
+|---|---|
+| `target_profile_reason` | Desvío vs target del perfil objetivo |
+| `concentration_reason` | Sobreconcentración en un activo |
+| `overlap_reason` | Overlap entre ETFs (SPY/QQQ/ACWI/VOO/VTI/IVV) |
+| `risk_reduction_reason` | Equity band excedida o sugerencia de pasar a liquidez |
+| `return_expectation_reason` | Catalizador positivo o sugerencia de aumentar posición |
+
+### Cómo interpretar una reducción de posición
+
+- Si dice `concentration_reason` → el activo excede el peso máximo del perfil
+- Si dice `overlap_reason` → hay redundancia entre ETFs de renta variable USA
+- Si dice `risk_reduction_reason` → equity total excede la banda del perfil
+- Si dice `target_profile_reason` → desvío técnico vs target
+- **Destino**: en esta versión, la sugerencia es pasar a liquidez. No hay reasignación multi-activo automática
+
 ## Market Event Pipeline
 
 ### Ingestion Flow
 
 ```
 News Provider (RSS/Mock)
-  → Fetch & Deduplicate (by title+URL hash)
+  → Fetch & Deduplicate (by canonical URL + normalized title fallback)
   → Persist raw (news_raw table)
   → Classify (event_type, impact, related_assets)
   → Recency Filter (explicit time windows)
-  → Pre-Score (cheap, rule-based)
+  → Pre-Score (cheap, rule-based, uses real holdings from snapshot)
+  → Topic hash + multi-source repetition detection
   → Assign Triage Level
   → Persist normalized (news_normalized table)
   → Create MarketEvent (if observe+)
@@ -387,6 +446,8 @@ NOTIFICATION_COOLDOWN_SECONDS=300
 | GET | `/api/alerts/current` | Active alerts (unacknowledged, medium+ severity) |
 | POST | `/api/events/run-ingestion` | Manual ingestion trigger |
 | POST | `/api/alerts/{id}/acknowledge` | Acknowledge an alert |
+| GET | `/api/profile/settings` | Leer perfil de inversor y thresholds actuales |
+| PUT | `/api/profile/settings` | Actualizar perfil objetivo y overrides |
 
 ### New DB Tables
 

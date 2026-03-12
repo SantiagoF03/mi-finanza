@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import desc
 from sqlalchemy.orm import Session, joinedload
 
@@ -7,6 +8,7 @@ from app.core.config import get_settings
 from app.db.session import get_db
 from app.models.models import MarketEvent, NewsEvent, PortfolioSnapshot, Recommendation, UserDecision
 from app.news.ingestion import get_active_alerts, get_recent_events, run_ingestion
+from app.portfolio.profiles import PROFILE_PRESETS, get_profile_label, get_profile_thresholds, resolve_profile
 from app.schemas.schemas import DecisionIn
 from app.services.orchestrator import get_current_recommendation, run_cycle
 
@@ -99,6 +101,9 @@ def current_recommendation(db: Session = Depends(get_db)):
         "news_summary": meta.get("news_summary"),
         "recommendation_explanation_llm": meta.get("recommendation_explanation_llm"),
         "rebalance_observability": meta.get("rebalance_observability", {}),
+        "rationale_reasons": meta.get("rationale_reasons", []),
+        "profile_applied": meta.get("profile_applied"),
+        "profile_label": meta.get("profile_label"),
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 
@@ -166,3 +171,68 @@ def acknowledge_alert(alert_id: int, db: Session = Depends(get_db)):
     event.acknowledged = True
     db.commit()
     return {"status": "ok", "alert_id": alert_id}
+
+
+# ---------------------------------------------------------------------------
+# Profile settings (GAP 4)
+# ---------------------------------------------------------------------------
+
+VALID_PROFILES = {"conservative", "moderate", "moderate_aggressive", "aggressive",
+                  "conservador", "moderado", "agresivo"}
+
+
+class ProfileSettingsIn(BaseModel):
+    investor_profile_target: str | None = None
+    max_single_asset_weight: float | None = None
+    max_equity_band: float | None = None
+    max_us_equity_concentration: float | None = None
+
+
+@router.get("/profile/settings")
+def get_profile_settings():
+    settings = get_settings()
+    profile = settings.investor_profile_target or settings.investor_profile
+    canonical = resolve_profile(profile)
+    thresholds = get_profile_thresholds(profile)
+
+    return {
+        "investor_profile_target": canonical,
+        "profile_label": get_profile_label(profile),
+        "available_profiles": ["conservative", "moderate", "moderate_aggressive", "aggressive"],
+        "thresholds": thresholds,
+        "overrides": {
+            "max_single_asset_weight": settings.max_single_asset_weight or None,
+            "max_equity_band": settings.max_equity_band or None,
+            "max_us_equity_concentration": settings.max_us_equity_concentration or None,
+        },
+        "bucket_targets": PROFILE_PRESETS.get(canonical, PROFILE_PRESETS.get("moderate", {})),
+    }
+
+
+@router.put("/profile/settings")
+def update_profile_settings(payload: ProfileSettingsIn):
+    settings = get_settings()
+
+    if payload.investor_profile_target is not None:
+        profile = payload.investor_profile_target
+        canonical = resolve_profile(profile)
+        if canonical not in {"conservative", "moderate", "moderate_aggressive", "aggressive"}:
+            raise HTTPException(400, f"Perfil inválido: {profile}. Válidos: conservative, moderate, moderate_aggressive, aggressive")
+        settings.investor_profile_target = canonical
+
+    if payload.max_single_asset_weight is not None:
+        if not 0 <= payload.max_single_asset_weight <= 1:
+            raise HTTPException(400, "max_single_asset_weight debe estar entre 0 y 1")
+        settings.max_single_asset_weight = payload.max_single_asset_weight
+
+    if payload.max_equity_band is not None:
+        if not 0 <= payload.max_equity_band <= 1:
+            raise HTTPException(400, "max_equity_band debe estar entre 0 y 1")
+        settings.max_equity_band = payload.max_equity_band
+
+    if payload.max_us_equity_concentration is not None:
+        if not 0 <= payload.max_us_equity_concentration <= 1:
+            raise HTTPException(400, "max_us_equity_concentration debe estar entre 0 y 1")
+        settings.max_us_equity_concentration = payload.max_us_equity_concentration
+
+    return get_profile_settings()

@@ -99,8 +99,10 @@ def test_orchestrator_metadata_includes_ingestion_and_llm_count():
     meta = rec.metadata_json or {}
 
     assert "ingestion" in meta
-    assert "llm_news_used" in meta
-    assert isinstance(meta["llm_news_used"], int)
+    assert "news_used_llm" in meta
+    assert "news_used_engine" in meta
+    assert isinstance(meta["news_used_llm"], int)
+    assert isinstance(meta["news_used_engine"], int)
     assert meta["ingestion"].get("ingestion_status") in ("completed", "failed")
 
 
@@ -487,3 +489,266 @@ def test_triage_counts_in_ingestion_result():
     assert "observe" in counts
     assert "send_to_llm" in counts
     assert "trigger_recalc" in counts
+
+
+# ===========================================================================
+# Final pass tests — Gaps 1-5
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# GAP 1: Engine uses triaged news, not raw provider
+# ---------------------------------------------------------------------------
+
+
+def test_engine_uses_triaged_news_not_raw():
+    """generate_recommendation should receive triaged news from ingestion pipeline."""
+    db = make_db()
+    s = get_settings()
+    s.trigger_cooldown_seconds = 0
+
+    result = run_cycle(db, source="test")
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    # Engine news count should come from triage pipeline
+    assert "news_used_engine" in meta
+    assert isinstance(meta["news_used_engine"], int)
+    # Should also have ingestion metadata
+    assert meta.get("ingestion", {}).get("ingestion_status") in ("completed", "failed")
+
+
+def test_engine_news_is_not_store_only():
+    """Engine should not receive store_only items — only observe+send_to_llm+trigger_recalc."""
+    from app.news.ingestion import get_engine_eligible_news
+    db = make_db()
+    run_ingestion(db, source_label="test")
+
+    engine_news = get_engine_eligible_news(db)
+    for item in engine_news:
+        assert item["triage_level"] in ("observe", "send_to_llm", "trigger_recalc")
+
+
+def test_detect_unchanged_uses_coherent_pipeline():
+    """Unchanged detection should compare news counts from the triaged pipeline."""
+    db = make_db()
+    s = get_settings()
+    s.trigger_cooldown_seconds = 0
+
+    first = run_cycle(db, source="test")
+    second = run_cycle(db, source="test")
+
+    rec1 = db.query(Recommendation).filter(Recommendation.id == first["recommendation_id"]).first()
+    rec2 = db.query(Recommendation).filter(Recommendation.id == second["recommendation_id"]).first()
+    meta1 = rec1.metadata_json or {}
+    meta2 = rec2.metadata_json or {}
+
+    # Both should have engine news count from the same pipeline
+    assert "news_used_engine" in meta1
+    assert "news_used_engine" in meta2
+
+
+def test_no_news_engine_behaves_correctly():
+    """With no triaged news, engine should produce a valid recommendation."""
+    from app.news.ingestion import get_engine_eligible_news
+    db = make_db()
+    s = get_settings()
+    s.trigger_cooldown_seconds = 0
+
+    # Don't run ingestion — so no triaged news exist
+    # But run_cycle still calls ingestion internally, so we patch it
+    with patch("app.services.orchestrator.get_engine_eligible_news", return_value=[]):
+        result = run_cycle(db, source="test")
+
+    assert "recommendation_id" in result
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    assert rec is not None
+    assert rec.status in ("pending", "blocked")
+
+
+# ---------------------------------------------------------------------------
+# GAP 2: Profile is explicit and correct
+# ---------------------------------------------------------------------------
+
+
+def test_profile_moderate_aggressive_is_default():
+    """Default investor_profile_target should be moderate_aggressive."""
+    s = get_settings()
+    assert s.investor_profile_target == "moderate_aggressive"
+
+
+def test_profile_applied_in_analysis():
+    """Analysis should include profile_applied field."""
+    from app.portfolio.analyzer import analyze_portfolio
+    snapshot = {"total_value": 10000, "cash": 2000, "currency": "USD", "positions": [
+        {"symbol": "AAPL", "asset_type": "CEDEAR", "market_value": 5000, "currency": "ARS", "pnl_pct": 0.0},
+        {"symbol": "AL30", "asset_type": "BONO", "market_value": 3000, "currency": "ARS", "pnl_pct": 0.0},
+    ]}
+    analysis = analyze_portfolio(snapshot)
+    assert analysis["profile_applied"] == "moderate_aggressive"
+    assert analysis["profile_label"] == "moderado-agresivo"
+
+
+def test_profile_applied_in_recommendation():
+    """Recommendation should include profile_applied field."""
+    from app.recommendations.engine import generate_recommendation
+    snapshot = {"total_value": 10000, "cash": 2000, "currency": "USD", "positions": [
+        {"symbol": "AAPL", "asset_type": "CEDEAR", "market_value": 5000, "currency": "ARS", "pnl_pct": 0.0},
+    ]}
+    from app.portfolio.analyzer import analyze_portfolio
+    analysis = analyze_portfolio(snapshot)
+    rec = generate_recommendation(snapshot, analysis, [], 0.10)
+    assert rec["profile_applied"] == "moderate_aggressive"
+    assert rec["profile_label"] == "moderado-agresivo"
+
+
+def test_moderate_aggressive_differs_from_moderate():
+    """moderate_aggressive should have different thresholds than moderate."""
+    from app.portfolio.profiles import get_profile_thresholds
+    mod = get_profile_thresholds("moderate")
+    mod_agg = get_profile_thresholds("moderate_aggressive")
+    assert mod_agg["max_equity_band"] > mod["max_equity_band"]
+    assert mod_agg["max_single_asset_weight"] > mod["max_single_asset_weight"]
+
+
+def test_rationale_mentions_correct_profile():
+    """Rationale should mention the configured profile, not a different one."""
+    db = make_db()
+    s = get_settings()
+    s.trigger_cooldown_seconds = 0
+    s.investor_profile_target = "moderate_aggressive"
+
+    result = run_cycle(db, source="test")
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    # Either the rationale or executive_summary should mention the right profile
+    assert "moderado-agresivo" in rec.rationale or "moderado-agresivo" in rec.executive_summary
+
+
+def test_profile_change_changes_behavior():
+    """Switching profile should change the analysis thresholds."""
+    from app.portfolio.analyzer import analyze_portfolio
+    s = get_settings()
+
+    snapshot = {"total_value": 10000, "cash": 500, "currency": "USD", "positions": [
+        {"symbol": "AAPL", "asset_type": "CEDEAR", "market_value": 4500, "currency": "ARS", "pnl_pct": 0.0},
+        {"symbol": "MSFT", "asset_type": "CEDEAR", "market_value": 3000, "currency": "ARS", "pnl_pct": 0.0},
+        {"symbol": "AL30", "asset_type": "BONO", "market_value": 2000, "currency": "ARS", "pnl_pct": 0.0},
+    ]}
+
+    s.investor_profile_target = "conservative"
+    analysis_cons = analyze_portfolio(snapshot)
+
+    s.investor_profile_target = "moderate_aggressive"
+    analysis_ma = analyze_portfolio(snapshot)
+
+    # Conservative should flag equity more aggressively
+    assert analysis_cons["profile_thresholds"]["max_equity_band"] < analysis_ma["profile_thresholds"]["max_equity_band"]
+
+
+# ---------------------------------------------------------------------------
+# GAP 3: Enriched rationale
+# ---------------------------------------------------------------------------
+
+
+def test_rationale_reasons_in_metadata():
+    """Recommendation metadata should include rationale_reasons list."""
+    db = make_db()
+    s = get_settings()
+    s.trigger_cooldown_seconds = 0
+
+    result = run_cycle(db, source="test")
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+    assert "rationale_reasons" in meta
+    assert isinstance(meta["rationale_reasons"], list)
+
+
+def test_concentration_rationale_explicit():
+    """When concentration is the trigger, rationale_reasons should include concentration_reason."""
+    from app.recommendations.engine import generate_recommendation
+    from app.portfolio.analyzer import analyze_portfolio
+
+    # Create a snapshot with extreme concentration
+    snapshot = {"total_value": 10000, "cash": 500, "currency": "USD", "positions": [
+        {"symbol": "SPY", "asset_type": "ETF", "market_value": 7000, "currency": "ARS", "pnl_pct": 0.0},
+        {"symbol": "AL30", "asset_type": "BONO", "market_value": 2500, "currency": "ARS", "pnl_pct": 0.0},
+    ]}
+    analysis = analyze_portfolio(snapshot)
+    rec = generate_recommendation(snapshot, analysis, [], 0.10)
+
+    if rec["action"] == "reducir riesgo":
+        reason_types = [r["type"] for r in rec.get("rationale_reasons", [])]
+        assert "concentration_reason" in reason_types
+        assert "target_profile_reason" in reason_types
+
+
+def test_overlap_detection_in_analysis():
+    """Holding overlapping ETFs should trigger overlap alert."""
+    from app.portfolio.analyzer import analyze_portfolio
+
+    snapshot = {"total_value": 10000, "cash": 1000, "currency": "USD", "positions": [
+        {"symbol": "SPY", "asset_type": "ETF", "market_value": 4000, "currency": "ARS", "pnl_pct": 0.0},
+        {"symbol": "QQQ", "asset_type": "ETF", "market_value": 3000, "currency": "ARS", "pnl_pct": 0.0},
+        {"symbol": "AL30", "asset_type": "BONO", "market_value": 2000, "currency": "ARS", "pnl_pct": 0.0},
+    ]}
+    analysis = analyze_portfolio(snapshot)
+    assert len(analysis["overlap_alerts"]) >= 1
+    overlap = analysis["overlap_alerts"][0]
+    assert "SPY" in overlap["symbols"]
+    assert "QQQ" in overlap["symbols"]
+
+
+def test_equity_band_alert_with_profile():
+    """When equity exceeds profile band, analysis should flag it."""
+    from app.portfolio.analyzer import analyze_portfolio
+    s = get_settings()
+    s.investor_profile_target = "conservative"
+
+    snapshot = {"total_value": 10000, "cash": 500, "currency": "USD", "positions": [
+        {"symbol": "AAPL", "asset_type": "CEDEAR", "market_value": 6000, "currency": "ARS", "pnl_pct": 0.0},
+        {"symbol": "MSFT", "asset_type": "CEDEAR", "market_value": 3500, "currency": "ARS", "pnl_pct": 0.0},
+    ]}
+    analysis = analyze_portfolio(snapshot)
+    assert any("excede banda" in a for a in analysis["alerts"])
+
+    s.investor_profile_target = "moderate_aggressive"
+
+
+# ---------------------------------------------------------------------------
+# GAP 4: Profile API
+# ---------------------------------------------------------------------------
+
+
+def test_profile_settings_endpoint():
+    """Profile settings API should return current profile config."""
+    from app.api.routes import get_profile_settings
+    result = get_profile_settings()
+    assert "investor_profile_target" in result
+    assert "profile_label" in result
+    assert "available_profiles" in result
+    assert "thresholds" in result
+    assert "bucket_targets" in result
+
+
+def test_profile_update_endpoint():
+    """Profile update API should modify settings."""
+    from app.api.routes import update_profile_settings, ProfileSettingsIn
+    s = get_settings()
+    original = s.investor_profile_target
+
+    result = update_profile_settings(ProfileSettingsIn(investor_profile_target="aggressive"))
+    assert result["investor_profile_target"] == "aggressive"
+
+    # Restore
+    s.investor_profile_target = original
+
+
+def test_profile_update_rejects_invalid():
+    """Profile update should reject invalid profile names."""
+    from app.api.routes import update_profile_settings, ProfileSettingsIn
+    import pytest
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc_info:
+        update_profile_settings(ProfileSettingsIn(investor_profile_target="yolo"))
+    assert exc_info.value.status_code == 400

@@ -430,21 +430,8 @@ def run_ingestion(db: Session, source_label: str = "manual") -> dict:
 # ---------------------------------------------------------------------------
 
 
-def get_llm_eligible_news(db: Session, hours_back: int = 72) -> list[dict]:
-    """Return news items eligible for LLM analysis (send_to_llm + trigger_recalc).
-
-    This is the ONLY source of news for the LLM layer. The orchestrator
-    must use this instead of loading all news from the provider directly.
-    """
-    cutoff = datetime.utcnow() - timedelta(hours=hours_back)
-    rows = (
-        db.query(NewsNormalized)
-        .filter(NewsNormalized.triage_level.in_(["send_to_llm", "trigger_recalc"]))
-        .filter(NewsNormalized.created_at >= cutoff)
-        .order_by(desc(NewsNormalized.pre_score))
-        .limit(20)
-        .all()
-    )
+def _news_rows_to_dicts(rows) -> list[dict]:
+    """Convert NewsNormalized rows to dicts for engine/LLM consumption."""
     return [
         {
             "title": r.title,
@@ -461,6 +448,41 @@ def get_llm_eligible_news(db: Session, hours_back: int = 72) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def get_engine_eligible_news(db: Session, hours_back: int = 72) -> list[dict]:
+    """Return news items eligible for the main recommendation engine.
+
+    Includes observe + send_to_llm + trigger_recalc (excludes store_only).
+    This is the primary news input for generate_recommendation().
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=hours_back)
+    rows = (
+        db.query(NewsNormalized)
+        .filter(NewsNormalized.triage_level.in_(["observe", "send_to_llm", "trigger_recalc"]))
+        .filter(NewsNormalized.created_at >= cutoff)
+        .order_by(desc(NewsNormalized.pre_score))
+        .limit(30)
+        .all()
+    )
+    return _news_rows_to_dicts(rows)
+
+
+def get_llm_eligible_news(db: Session, hours_back: int = 72) -> list[dict]:
+    """Return news items eligible for LLM analysis (send_to_llm + trigger_recalc).
+
+    This is the ONLY source of news for the LLM layer — stricter than engine.
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=hours_back)
+    rows = (
+        db.query(NewsNormalized)
+        .filter(NewsNormalized.triage_level.in_(["send_to_llm", "trigger_recalc"]))
+        .filter(NewsNormalized.created_at >= cutoff)
+        .order_by(desc(NewsNormalized.pre_score))
+        .limit(20)
+        .all()
+    )
+    return _news_rows_to_dicts(rows)
 
 
 def has_llm_eligible_news(db: Session, hours_back: int = 72) -> bool:

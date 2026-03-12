@@ -31,9 +31,13 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = True
     analysis_frequency_days: int = 4
     trigger_cooldown_seconds: int = 60
-    investor_profile: str = "moderado"
+    investor_profile: str = "moderado"  # legacy alias, prefer investor_profile_target
+    investor_profile_target: str = "moderate_aggressive"
     max_movement_per_cycle: float = 0.10
     min_liquidity_pct: float = 0.05
+    max_single_asset_weight: float = 0.0  # 0 = use profile default
+    max_equity_band: float = 0.0  # 0 = use profile default
+    max_us_equity_concentration: float = 0.0  # 0 = use profile default
     llm_enabled: bool = False
     llm_provider: str = "openai"
     llm_api_key: str = ""

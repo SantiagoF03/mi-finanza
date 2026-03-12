@@ -1,4 +1,14 @@
+from app.core.config import get_settings
+from app.portfolio.profiles import get_profile_label, get_profile_thresholds, resolve_profile
+
+
 def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], max_move: float) -> dict:
+    settings = get_settings()
+    profile = settings.investor_profile_target or settings.investor_profile
+    canonical_profile = resolve_profile(profile)
+    profile_label = get_profile_label(profile)
+    thresholds = get_profile_thresholds(profile)
+
     alerts = analysis.get("alerts", [])
     negative_hits = [n for n in news if n.get("impact") == "negativo"]
     positive_hits = [n for n in news if n.get("impact") == "positivo"]
@@ -12,9 +22,10 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
     actions = []
     external_opportunities = []
     candidate_deviations = {}
-    rationale = "Cartera estable sin señales fuertes."
+    rationale = f"Cartera estable sin señales fuertes (perfil {profile_label})."
     risks = "Riesgo moderado de mercado."
     confidence = 0.55
+    rationale_reasons = []
 
     for item in news:
         for symbol in item.get("related_assets", []):
@@ -43,16 +54,37 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         confidence = 0.3
         rationale = "No hay evidencia suficiente por portfolio vacío."
 
-    elif "Sobreconcentración en un activo > 40%." in alerts and analysis.get("weights_by_asset"):
+    elif any("Sobreconcentración" in a for a in alerts) and analysis.get("weights_by_asset"):
         candidate_weights = {
             symbol: weight for symbol, weight in analysis["weights_by_asset"].items() if symbol in held_set
         }
         if candidate_weights:
             symbol = max(candidate_weights, key=candidate_weights.get)
+            weight = candidate_weights[symbol]
+            max_single = thresholds.get("max_single_asset_weight", 0.40)
             action = "reducir riesgo"
             pct = min(max_move, 0.08)
             actions = [{"symbol": symbol, "target_change_pct": -pct, "reason": "Sobreconcentración"}]
-            rationale = f"{symbol} excede concentración tolerada; conviene recortar y pasar a liquidez."
+            rationale_reasons.append({
+                "type": "concentration_reason",
+                "detail": f"{symbol} representa {round(weight*100,1)}% del portfolio, excede el límite de {int(max_single*100)}% para perfil {profile_label}.",
+            })
+
+            # Check overlap
+            overlap_alerts = analysis.get("overlap_alerts", [])
+            overlapping = [oa for oa in overlap_alerts if symbol in oa.get("symbols", [])]
+            if overlapping:
+                oa = overlapping[0]
+                rationale_reasons.append({
+                    "type": "overlap_reason",
+                    "detail": f"Overlap detectado con {', '.join(oa['symbols'])} que combinan {round(oa['combined_weight']*100,1)}% del portfolio.",
+                })
+
+            rationale_reasons.append({
+                "type": "target_profile_reason",
+                "detail": f"Para el perfil {profile_label}, se sugiere recortar y pasar a liquidez hasta que la posición esté dentro de bandas.",
+            })
+            rationale = _build_rationale(rationale_reasons, profile_label)
             confidence = 0.72
 
     elif any(abs(v) > 0.07 for v in analysis.get("rebalance_deviation", {}).values()):
@@ -65,15 +97,51 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             worst = max(candidate_deviations, key=lambda k: abs(candidate_deviations[k]))
             dev = candidate_deviations[worst]
             action = "rebalancear"
-            # Scale: suggest correcting ~50% of the worst deviation per cycle,
-            # capped at max_move. Minimum 2% to avoid trivial suggestions.
             raw_pct = abs(dev) * 0.5
             pct = round(min(max_move, max(0.02, raw_pct)), 4)
-            # Scale confidence with deviation severity (20% dev = max severity)
             severity = min(abs(dev) / 0.20, 1.0)
             confidence = round(0.55 + severity * 0.15, 2)
             actions = [{"symbol": worst, "target_change_pct": round(-pct if dev > 0 else pct, 4), "reason": "Desvío vs objetivo"}]
-            rationale = "Se detectó desvío material contra cartera objetivo."
+
+            actual_weight = analysis.get("weights_by_asset", {}).get(worst, 0)
+            target_weight = actual_weight - dev
+
+            rationale_reasons.append({
+                "type": "target_profile_reason",
+                "detail": f"Desvío de {worst}: actual {round(actual_weight*100,1)}% vs target {round(target_weight*100,1)}% (perfil {profile_label}).",
+            })
+
+            # Check if equity band exceeded
+            equity_weight = analysis.get("equity_weight", 0)
+            max_equity = thresholds.get("max_equity_band", 0.70)
+            if equity_weight > max_equity:
+                rationale_reasons.append({
+                    "type": "risk_reduction_reason",
+                    "detail": f"Equity total ({round(equity_weight*100,1)}%) excede banda del perfil {profile_label} ({int(max_equity*100)}%). Reducir exposición a renta variable.",
+                })
+
+            # Check overlap
+            overlap_alerts = analysis.get("overlap_alerts", [])
+            overlapping = [oa for oa in overlap_alerts if worst in oa.get("symbols", [])]
+            if overlapping:
+                oa = overlapping[0]
+                rationale_reasons.append({
+                    "type": "overlap_reason",
+                    "detail": f"Overlap: {', '.join(oa['symbols'])} combinan {round(oa['combined_weight']*100,1)}% del portfolio. Reducir redundancia.",
+                })
+
+            if dev > 0:
+                rationale_reasons.append({
+                    "type": "risk_reduction_reason",
+                    "detail": f"Se sugiere reducir {worst} y pasar a liquidez. No hay reasignación multi-activo automática en esta versión.",
+                })
+            else:
+                rationale_reasons.append({
+                    "type": "return_expectation_reason",
+                    "detail": f"Se sugiere aumentar {worst} desde liquidez para acercar al target del perfil.",
+                })
+
+            rationale = _build_rationale(rationale_reasons, profile_label)
 
     elif positive_hits:
         related_in_portfolio = []
@@ -86,7 +154,15 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             action = "aumentar posición"
             pct = min(max_move, 0.04)
             actions = [{"symbol": asset, "target_change_pct": pct, "reason": "Evento positivo consistente"}]
-            rationale = f"Catalizador positivo en {asset} con impacto acotado y perfil moderado."
+            rationale_reasons.append({
+                "type": "return_expectation_reason",
+                "detail": f"Catalizador positivo en {asset} con impacto acotado.",
+            })
+            rationale_reasons.append({
+                "type": "target_profile_reason",
+                "detail": f"Movimiento compatible con perfil {profile_label}.",
+            })
+            rationale = _build_rationale(rationale_reasons, profile_label)
             confidence = 0.58
 
     if not news:
@@ -108,6 +184,7 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             + ", ".join(invalid_symbols)
             + "."
         )
+        rationale_reasons = []
 
     # --- Rebalance observability ---
     rebalance_obs = {}
@@ -127,8 +204,19 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         "confidence": round(confidence, 2),
         "rationale": rationale,
         "risks": risks,
-        "executive_summary": f"Sugerencia: {action}. Movimiento sugerido: {round(pct*100,2)}% del portfolio.",
+        "executive_summary": f"Sugerencia: {action}. Movimiento sugerido: {round(pct*100,2)}% del portfolio. Perfil: {profile_label}.",
         "actions": actions,
         "external_opportunities": external_opportunities,
         "rebalance_observability": rebalance_obs,
+        "rationale_reasons": rationale_reasons,
+        "profile_applied": canonical_profile,
+        "profile_label": profile_label,
     }
+
+
+def _build_rationale(reasons: list[dict], profile_label: str) -> str:
+    """Build a structured rationale string from reason list."""
+    if not reasons:
+        return f"Cartera estable (perfil {profile_label})."
+    parts = [r["detail"] for r in reasons]
+    return " ".join(parts)

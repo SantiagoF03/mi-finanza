@@ -164,8 +164,10 @@ export default function App() {
       {analysis && (
         <section>
           <h2>Análisis de cartera</h2>
+          {analysis.profile_label && <p><strong>Perfil aplicado:</strong> {analysis.profile_label}</p>}
           <p>Concentración: {(analysis.concentration_score * 100).toFixed(1)}%</p>
           <p>Score de riesgo: {(analysis.risk_score * 100).toFixed(1)}%</p>
+          {analysis.equity_weight != null && <p>Equity total: {(analysis.equity_weight * 100).toFixed(1)}%</p>}
           <h3>Exposición por moneda (económica)</h3>
           <ul>
             {Object.entries(analysis.weights_by_currency || {}).map(([ccy, w]) => (
@@ -201,7 +203,21 @@ export default function App() {
           <p>Acción: <strong>{current.action}</strong></p>
           <p>Porcentaje sugerido: {(current.suggested_pct * 100).toFixed(2)}%</p>
           <p>Confianza: {(current.confidence * 100).toFixed(0)}%</p>
+          {current.profile_label && <p>Perfil: <strong>{current.profile_label}</strong></p>}
           <p>Motivo: {current.recommendation_explanation_llm || current.rationale}</p>
+          {(current.rationale_reasons || []).length > 0 && (
+            <div style={{ background: '#f8f9fa', padding: '8px 12px', borderRadius: 6, margin: '8px 0' }}>
+              <strong>Detalle del análisis:</strong>
+              <ul style={{ margin: '4px 0' }}>
+                {current.rationale_reasons.map((r, i) => (
+                  <li key={i} style={{ fontSize: '0.9em' }}>
+                    <span style={{ background: '#e3f2fd', padding: '1px 5px', borderRadius: 3, fontSize: '0.8em', marginRight: 4 }}>{r.type}</span>
+                    {r.detail}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <p>Riesgos: {current.risks}</p>
           <p>Resumen ejecutivo: {current.executive_summary}</p>
           <p>Reglas aplicadas: {(current.rules_applied || []).join(' | ') || 'Sin bloqueos'}</p>
