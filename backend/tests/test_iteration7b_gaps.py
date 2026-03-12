@@ -722,7 +722,8 @@ def test_equity_band_alert_with_profile():
 def test_profile_settings_endpoint():
     """Profile settings API should return current profile config."""
     from app.api.routes import get_profile_settings
-    result = get_profile_settings()
+    db = make_db()
+    result = get_profile_settings(db=db)
     assert "investor_profile_target" in result
     assert "profile_label" in result
     assert "available_profiles" in result
@@ -736,7 +737,8 @@ def test_profile_update_endpoint():
     s = get_settings()
     original = s.investor_profile_target
 
-    result = update_profile_settings(ProfileSettingsIn(investor_profile_target="aggressive"))
+    db = make_db()
+    result = update_profile_settings(ProfileSettingsIn(investor_profile_target="aggressive"), db=db)
     assert result["investor_profile_target"] == "aggressive"
 
     # Restore

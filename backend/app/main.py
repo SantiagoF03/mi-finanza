@@ -19,6 +19,17 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+
+    # Load persisted settings from DB (P4)
+    from app.db.session import SessionLocal
+    try:
+        db = SessionLocal()
+        from app.api.routes import _load_persisted_settings
+        _load_persisted_settings(db)
+        db.close()
+    except Exception:
+        pass
+
     start_scheduler()
 
 
