@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     scheduler_postmarket_runs: int = 2
     scheduler_off_hours_enabled: bool = False
     scheduler_ingestion_only_off_hours: bool = True
+    scheduler_postmarket_force_cycle: bool = False  # if True, post-market runs full cycle even without events
 
     # Notification (Part E)
     notification_enabled: bool = False

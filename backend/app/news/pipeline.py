@@ -149,6 +149,7 @@ def parse_rss_items(xml_text: str, portfolio_symbols: list[str]) -> list[dict]:
     for item in root.findall(".//item"):
         title = (item.findtext("title") or "").strip()
         summary = (item.findtext("description") or "").strip()
+        link = (item.findtext("link") or "").strip()
         pub_date_raw = (item.findtext("pubDate") or "").strip()
 
         created_at = now
@@ -174,6 +175,8 @@ def parse_rss_items(xml_text: str, portfolio_symbols: list[str]) -> list[dict]:
                 "confidence": classified["confidence"],
                 "related_assets": classified["related_assets"],
                 "summary": summary[:1000],
+                "url": link,
+                "source": "",  # will be set by ingestion from feed URL
                 "created_at": created_at,
             }
         )

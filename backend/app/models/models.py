@@ -123,6 +123,7 @@ class IngestionRun(Base):
     events_created: Mapped[int] = mapped_column(Integer, default=0)
     alerts_created: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str] = mapped_column(Text, default="")
+    holdings_source: Mapped[str] = mapped_column(String(30), default="whitelist")  # snapshot | whitelist
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -158,6 +159,8 @@ class NewsNormalized(Base):
     recency_hours: Mapped[float] = mapped_column(Float, default=0.0)
     pre_score: Mapped[float] = mapped_column(Float, default=0.0)
     triage_level: Mapped[str] = mapped_column(String(20), default="store_only")
+    topic_hash: Mapped[str] = mapped_column(String(32), default="", index=True)
+    multi_source_count: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
