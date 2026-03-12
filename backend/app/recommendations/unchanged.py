@@ -57,7 +57,7 @@ def detect_unchanged(
         reasons.append("Alertas de análisis cambiaron.")
 
     # 6. news fingerprint (count of news used changed meaningfully)
-    prev_news_used = prev_meta.get("news_used", 0)
+    prev_news_used = prev_meta.get("news_used_engine", prev_meta.get("news_used", 0))
     new_news_used = len(new_rec.get("_news_items", []))  # caller attaches this temporarily
     if abs(new_news_used - prev_news_used) >= 2:
         reasons.append(f"Cantidad de noticias cambió: {prev_news_used} -> {new_news_used}")

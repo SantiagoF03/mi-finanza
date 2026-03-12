@@ -1,5 +1,5 @@
 from app.core.config import get_settings
-from app.portfolio.profiles import build_target_weights, get_bucket
+from app.portfolio.profiles import build_target_weights, get_bucket, get_profile_label, get_profile_thresholds, resolve_profile
 
 
 def _infer_economic_currency(symbol: str, asset_type: str, trading_currency: str) -> str:
@@ -32,9 +32,13 @@ def _infer_economic_currency(symbol: str, asset_type: str, trading_currency: str
 
 def analyze_portfolio(snapshot: dict, target_weights: dict | None = None) -> dict:
     positions = snapshot.get("positions", [])
+    settings = get_settings()
+    profile = settings.investor_profile_target or settings.investor_profile
+    canonical_profile = resolve_profile(profile)
+    profile_label = get_profile_label(profile)
+    thresholds = get_profile_thresholds(profile)
     if target_weights is None:
-        settings = get_settings()
-        target_weights = build_target_weights(positions, profile=settings.investor_profile)
+        target_weights = build_target_weights(positions, profile=profile)
     cash = snapshot.get("cash", 0)
 
     alerts = []
@@ -89,12 +93,34 @@ def analyze_portfolio(snapshot: dict, target_weights: dict | None = None) -> dic
 
     rebalance_deviation = {symbol: round(weights_by_asset.get(symbol, 0) - target, 4) for symbol, target in target_weights.items()}
 
-    if concentration_score > 0.40:
-        alerts.append("Sobreconcentración en un activo > 40%.")
+    conc_threshold = thresholds.get("concentration_alert_threshold", 0.40)
+    max_equity = thresholds.get("max_equity_band", 0.70)
+
+    # Equity band = equity_exterior + equity_local
+    equity_weight = weights_by_bucket.get("equity_exterior", 0) + weights_by_bucket.get("equity_local", 0)
+
+    if concentration_score > conc_threshold:
+        alerts.append(f"Sobreconcentración en un activo > {int(conc_threshold*100)}% (perfil {profile_label}).")
     if any(v > 0.70 for v in weights_by_currency.values()):
         alerts.append("Exceso de exposición por moneda > 70%.")
+    if equity_weight > max_equity:
+        alerts.append(f"Equity total ({round(equity_weight*100,1)}%) excede banda del perfil {profile_label} ({int(max_equity*100)}%).")
     if any(abs(v) > 0.07 for v in rebalance_deviation.values()):
         alerts.append("Desvío relevante vs cartera objetivo detectado.")
+
+    # --- Overlap detection (SPY/QQQ/ACWI) ---
+    overlap_groups = [{"SPY", "QQQ", "ACWI", "VTI", "VOO", "IVV"}]
+    overlap_alerts = []
+    for group in overlap_groups:
+        held_in_group = [s for s in group if s in weights_by_asset and weights_by_asset[s] > 0.01]
+        if len(held_in_group) >= 2:
+            combined = sum(weights_by_asset.get(s, 0) for s in held_in_group)
+            overlap_alerts.append({
+                "symbols": sorted(held_in_group),
+                "combined_weight": round(combined, 4),
+                "reason": f"Overlap detectado: {', '.join(sorted(held_in_group))} combinan {round(combined*100,1)}% del portfolio.",
+            })
+            alerts.append(f"Overlap: {', '.join(sorted(held_in_group))} combinan {round(combined*100,1)}% del portfolio.")
 
     return {
         "weights_by_asset": weights_by_asset,
@@ -103,5 +129,10 @@ def analyze_portfolio(snapshot: dict, target_weights: dict | None = None) -> dic
         "concentration_score": concentration_score,
         "risk_score": risk_score,
         "rebalance_deviation": rebalance_deviation,
+        "equity_weight": round(equity_weight, 4),
+        "overlap_alerts": overlap_alerts,
+        "profile_applied": canonical_profile,
+        "profile_label": profile_label,
+        "profile_thresholds": thresholds,
         "alerts": alerts,
     }

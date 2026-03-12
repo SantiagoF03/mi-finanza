@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.market.candidates import generate_external_candidates
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
-from app.news.ingestion import get_llm_eligible_news, run_ingestion
+from app.news.ingestion import get_engine_eligible_news, get_llm_eligible_news, run_ingestion
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
@@ -51,6 +51,7 @@ def _supersede_open_recommendations(db: Session, new_id: int) -> None:
 
 
 def _load_news_items(snapshot_positions: list[dict]) -> tuple[list[dict], str]:
+    """Legacy news loading — used only for NewsEvent persistence (backward compat)."""
     provider = get_news_provider()
     symbols = [p.get("symbol") for p in snapshot_positions if p.get("symbol")]
 
@@ -136,8 +137,26 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     for p in positions:
         db.add(PortfolioPosition(snapshot_id=snapshot.id, **p))
 
+    # --- Legacy news persistence (backward compat for NewsEvent table) ---
     news_items, news_source = _load_news_items(positions)
     inserted_news = _persist_news_without_duplicates(db, news_items)
+
+    # --- Ingestion: ensure triage pipeline has run (best-effort) ---
+    ingestion_meta = {}
+    try:
+        ingestion_result = run_ingestion(db, source_label=f"cycle_{source}")
+        ingestion_meta = {
+            "ingestion_status": ingestion_result.get("status"),
+            "items_fetched": ingestion_result.get("items_fetched", 0),
+            "items_new": ingestion_result.get("items_new", 0),
+            "triage_counts": ingestion_result.get("triage_counts", {}),
+            "holdings_source": ingestion_result.get("holdings_source", "unknown"),
+        }
+    except Exception as exc:
+        ingestion_meta = {"ingestion_status": "failed", "ingestion_error": str(exc)[:200]}
+
+    # --- Main engine uses triaged news (observe + send_to_llm + trigger_recalc) ---
+    engine_news = get_engine_eligible_news(db)
 
     snapshot_dict = {
         "total_value": total,
@@ -147,7 +166,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     }
     analysis = analyze_portfolio(snapshot_dict)
     allowed_assets = build_allowed_assets(positions)
-    rec = generate_recommendation(snapshot_dict, analysis, news_items, settings.max_movement_per_cycle)
+    rec = generate_recommendation(snapshot_dict, analysis, engine_news, settings.max_movement_per_cycle)
 
     # Replace news-only external_opportunities with full candidate sourcing
     rec["external_opportunities"] = generate_external_candidates(
@@ -165,8 +184,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         .order_by(desc(Recommendation.created_at))
         .first()
     )
-    # Attach news count temporarily for unchanged detection
-    rec["_news_items"] = news_items
+    rec["_news_items"] = engine_news
     unchanged, unchanged_reason = detect_unchanged(
         rec,
         prev_rec,
@@ -176,27 +194,9 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     )
     rec.pop("_news_items", None)
 
-    # --- Ingestion: ensure triage pipeline has run (best-effort) ---
-    ingestion_meta = {}
-    try:
-        ingestion_result = run_ingestion(db, source_label=f"cycle_{source}")
-        ingestion_meta = {
-            "ingestion_status": ingestion_result.get("status"),
-            "items_fetched": ingestion_result.get("items_fetched", 0),
-            "items_new": ingestion_result.get("items_new", 0),
-            "triage_counts": ingestion_result.get("triage_counts", {}),
-            "holdings_source": ingestion_result.get("holdings_source", "unknown"),
-        }
-    except Exception as exc:
-        ingestion_meta = {"ingestion_status": "failed", "ingestion_error": str(exc)[:200]}
-
     # --- LLM explanation layer (best-effort, never breaks cycle) ---
-    # CRITICAL: LLM only receives triage-filtered news (send_to_llm + trigger_recalc)
-    llm_news_items = []
-    try:
-        llm_news_items = get_llm_eligible_news(db)
-    except Exception:
-        llm_news_items = []
+    # LLM only receives send_to_llm + trigger_recalc (stricter than engine)
+    llm_news_items = get_llm_eligible_news(db)
 
     news_summary = None
     recommendation_explanation_llm = None
@@ -229,8 +229,8 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "broker_mode": broker_mode,
             "news_source": news_source,
             "news_inserted": inserted_news,
-            "news_used": len(news_items),
-            "llm_news_used": len(llm_news_items),
+            "news_used_engine": len(engine_news),
+            "news_used_llm": len(llm_news_items),
             "ingestion": ingestion_meta,
             "external_opportunities": rec.get("external_opportunities", []),
             "allowed_assets": {
@@ -245,6 +245,9 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_summary": news_summary,
             "recommendation_explanation_llm": recommendation_explanation_llm,
             "rebalance_observability": rec.get("rebalance_observability", {}),
+            "rationale_reasons": rec.get("rationale_reasons", []),
+            "profile_applied": rec.get("profile_applied"),
+            "profile_label": rec.get("profile_label"),
         },
     )
     db.add(rec_model)
@@ -264,6 +267,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_source": news_source,
             "news_inserted": inserted_news,
             "unchanged": unchanged,
+            "profile_applied": rec.get("profile_applied"),
         },
     )
 
