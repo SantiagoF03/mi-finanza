@@ -178,3 +178,42 @@ class MarketEvent(Base):
     recalc_recommendation_id: Mapped[int | None] = mapped_column(ForeignKey("recommendations.id"), nullable=True)
     acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Execution layer — user-approved order execution
+# States: pending → execution_requested → execution_sent →
+#   executed | partially_executed | rejected_by_broker | failed
+# ---------------------------------------------------------------------------
+
+
+class OrderExecution(Base):
+    __tablename__ = "order_executions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    recommendation_id: Mapped[int] = mapped_column(ForeignKey("recommendations.id"))
+    recommendation_action_id: Mapped[int | None] = mapped_column(ForeignKey("recommendation_actions.id"), nullable=True)
+    symbol: Mapped[str] = mapped_column(String(20))
+    side: Mapped[str] = mapped_column(String(10))  # buy | sell
+    quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_change_pct: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    broker_order_id: Mapped[str] = mapped_column(String(100), default="")
+    broker_response: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    executed_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    executed_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    recommendation: Mapped[Recommendation] = relationship()
+
+
+class PushSubscription(Base):
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    endpoint: Mapped[str] = mapped_column(Text)
+    p256dh: Mapped[str] = mapped_column(String(200))
+    auth: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

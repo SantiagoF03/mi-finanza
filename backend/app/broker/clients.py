@@ -340,7 +340,80 @@ class IolBrokerClient(BrokerClient):
         )
 
 
+    def _authorized_post(self, path: str, json_body: dict | None = None) -> httpx.Response:
+        self._ensure_auth()
+        assert self._access_token is not None
+
+        resp = self._client.post(
+            f"{self.api_base}{path}",
+            json=json_body,
+            headers={"Authorization": f"Bearer {self._access_token}"},
+        )
+
+        if resp.status_code in {401, 403}:
+            if self._refresh_access_token():
+                assert self._access_token is not None
+                resp = self._client.post(
+                    f"{self.api_base}{path}",
+                    json=json_body,
+                    headers={"Authorization": f"Bearer {self._access_token}"},
+                )
+
+        resp.raise_for_status()
+        return resp
+
+    def place_order(self, symbol: str, side: str, quantity: float, price: float | None = None) -> dict:
+        """Place an order via IOL API.
+
+        Returns dict with at least: order_id, status, raw_response.
+        side: 'buy' or 'sell' (mapped to IOL compra/venta).
+        """
+        iol_side = "compra" if side == "buy" else "venta"
+        # IOL V2 endpoint for placing orders
+        body = {
+            "mercado": "bCBA",
+            "simbolo": symbol,
+            "cantidad": int(quantity),
+            "precio": price or 0,
+            "plazo": "t2",
+            "operacion": iol_side,
+        }
+        try:
+            resp = self._authorized_post("/api/v2/operar", json_body=body)
+            data = resp.json()
+            return {
+                "order_id": str(data.get("numeroOperacion", "")),
+                "status": "sent",
+                "raw_response": data,
+            }
+        except httpx.HTTPStatusError as exc:
+            return {
+                "order_id": "",
+                "status": "rejected",
+                "error": str(exc),
+                "raw_response": exc.response.json() if exc.response else {},
+            }
+        except Exception as exc:
+            return {
+                "order_id": "",
+                "status": "error",
+                "error": str(exc),
+                "raw_response": {},
+            }
+
+    def get_order_status(self, order_id: str) -> dict:
+        """Check order status via IOL API."""
+        try:
+            resp = self._authorized_get(f"/api/v2/operaciones/{order_id}")
+            data = resp.json()
+            return {"order_id": order_id, "raw_response": data, "status": data.get("estado", "unknown")}
+        except Exception as exc:
+            return {"order_id": order_id, "status": "error", "error": str(exc)}
+
+
 class MockBrokerClient(BrokerClient):
+    _mock_orders: list[dict] = []
+
     def get_portfolio_snapshot(self) -> dict:
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -389,3 +462,23 @@ class MockBrokerClient(BrokerClient):
                 },
             ],
         }
+
+    def place_order(self, symbol: str, side: str, quantity: float, price: float | None = None) -> dict:
+        """Mock order placement — always succeeds."""
+        import uuid
+        order_id = f"MOCK-{uuid.uuid4().hex[:8].upper()}"
+        order = {
+            "order_id": order_id,
+            "status": "sent",
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price or 100.0,
+            "raw_response": {"mock": True, "numeroOperacion": order_id},
+        }
+        self._mock_orders.append(order)
+        return order
+
+    def get_order_status(self, order_id: str) -> dict:
+        """Mock order status — always returns executed."""
+        return {"order_id": order_id, "status": "terminada", "raw_response": {"mock": True}}

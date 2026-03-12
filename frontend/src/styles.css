@@ -1,6 +1,304 @@
-body { font-family: Inter, system-ui, sans-serif; background: #f7f8fb; margin: 0; }
-.container { max-width: 980px; margin: 0 auto; padding: 24px; }
-section { background: white; margin-top: 16px; padding: 16px; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
-button { margin-right: 8px; padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; cursor: pointer; }
-.actions { margin-top: 10px; }
-ul { padding-left: 20px; }
+/* Mi Finanza MVP — Responsive / Mobile-first */
+
+:root {
+  --primary: #1a73e8;
+  --primary-light: #e8f0fe;
+  --danger: #b42318;
+  --danger-light: #ffcdd2;
+  --success: #2e7d32;
+  --success-light: #e8f5e9;
+  --warning: #f57c00;
+  --warning-light: #fff3e0;
+  --bg: #f7f8fb;
+  --card: #ffffff;
+  --text: #1f2937;
+  --text-secondary: #6b7280;
+  --border: #e5e7eb;
+  --radius: 12px;
+  --shadow: 0 1px 4px rgba(0,0,0,0.08);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  margin: 0;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  line-height: 1.5;
+}
+
+.container {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+/* Header */
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.app-header h1 {
+  font-size: 1.4rem;
+  margin: 0;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Cards */
+section, .card {
+  background: var(--card);
+  margin-top: 12px;
+  padding: 16px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+section h2 {
+  font-size: 1.1rem;
+  margin: 0 0 12px 0;
+  color: var(--text);
+}
+
+section h3 {
+  font-size: 0.95rem;
+  margin: 12px 0 6px 0;
+}
+
+/* Buttons */
+button, .btn {
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 0.9rem;
+  font-weight: 500;
+  background: var(--card);
+  color: var(--text);
+  transition: all 0.15s ease;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:active { transform: scale(0.97); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.btn-primary {
+  background: var(--primary);
+  color: white;
+  border-color: var(--primary);
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: white;
+  border-color: var(--danger);
+}
+
+.btn-success {
+  background: var(--success);
+  color: white;
+  border-color: var(--success);
+}
+
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 0.8rem;
+}
+
+/* Action buttons row (approve/reject) */
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.actions button {
+  flex: 1;
+  min-width: 120px;
+  padding: 12px 16px;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* Lists */
+ul { padding-left: 16px; margin: 4px 0; }
+li { margin-bottom: 4px; }
+
+/* Badges */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+
+.badge-critical { background: var(--danger); color: white; }
+.badge-high { background: var(--warning); color: white; }
+.badge-medium { background: #fbc02d; color: #333; }
+.badge-low { background: var(--success-light); color: var(--success); }
+
+.badge-pending { background: #e3f2fd; color: #1565c0; }
+.badge-approved { background: var(--success-light); color: var(--success); }
+.badge-rejected { background: var(--danger-light); color: var(--danger); }
+.badge-executed { background: #c8e6c9; color: #1b5e20; }
+.badge-failed { background: #ffcdd2; color: #b71c1c; }
+
+/* Info boxes */
+.info-box {
+  padding: 10px 14px;
+  border-radius: 8px;
+  margin: 8px 0;
+  font-size: 0.9rem;
+}
+
+.info-unchanged { background: var(--success-light); font-weight: 600; }
+.info-blocked { background: var(--danger-light); color: var(--danger); }
+.info-cooldown { color: #7a2e0a; font-weight: 600; }
+
+/* Detail panel */
+.detail-panel {
+  background: #f8f9fa;
+  padding: 10px 14px;
+  border-radius: 8px;
+  margin: 8px 0;
+}
+
+.detail-panel ul { margin: 4px 0; }
+
+.reason-tag {
+  background: #e3f2fd;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  margin-right: 4px;
+}
+
+/* Execution status */
+.execution-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.execution-row:last-child { border-bottom: none; }
+
+/* Alert items */
+.alert-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.alert-item:last-child { border-bottom: none; }
+
+.alert-content { flex: 1; min-width: 200px; }
+
+/* Opportunity cards */
+.opportunity-item {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.opportunity-item:last-child { border-bottom: none; }
+
+.opp-badges { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; }
+
+.opp-badge {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+
+/* History items */
+.history-item {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+
+/* Error message */
+.error-msg { color: var(--danger); padding: 8px 0; }
+
+/* Responsive: stack on mobile */
+@media (max-width: 640px) {
+  .container { padding: 10px; }
+
+  .app-header { flex-direction: column; align-items: stretch; }
+  .app-header h1 { text-align: center; }
+  .header-actions { justify-content: center; }
+  .header-actions button { flex: 1; }
+
+  section { padding: 12px; margin-top: 10px; }
+  section h2 { font-size: 1rem; }
+
+  .actions button {
+    flex: 1 1 100%;
+    min-width: unset;
+  }
+
+  button { padding: 10px 14px; }
+}
+
+/* PWA install banner */
+.install-banner {
+  background: var(--primary-light);
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.install-banner button {
+  white-space: nowrap;
+}
+
+/* Tabs for navigation */
+.tab-bar {
+  display: flex;
+  gap: 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-bottom: 2px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.tab-btn {
+  padding: 10px 16px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: none;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+  margin-bottom: -2px;
+}
+
+.tab-btn.active {
+  color: var(--primary);
+  border-bottom-color: var(--primary);
+}

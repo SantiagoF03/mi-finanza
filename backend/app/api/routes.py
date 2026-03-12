@@ -6,10 +6,16 @@ from sqlalchemy.orm import Session, joinedload
 from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models.models import MarketEvent, NewsEvent, PortfolioSnapshot, Recommendation, UserDecision
+from app.models.models import MarketEvent, NewsEvent, PortfolioSnapshot, PushSubscription, Recommendation, UserDecision
 from app.news.ingestion import get_active_alerts, get_recent_events, run_ingestion
 from app.portfolio.profiles import PROFILE_PRESETS, get_profile_label, get_profile_thresholds, resolve_profile
 from app.schemas.schemas import DecisionIn
+from app.services.execution import (
+    approve_and_execute,
+    get_execution_by_id,
+    get_recent_executions,
+    reject_recommendation,
+)
 from app.services.orchestrator import get_current_recommendation, run_cycle
 
 router = APIRouter()
@@ -236,3 +242,133 @@ def update_profile_settings(payload: ProfileSettingsIn):
         settings.max_us_equity_concentration = payload.max_us_equity_concentration
 
     return get_profile_settings()
+
+
+# ---------------------------------------------------------------------------
+# Execution layer — approve triggers IOL execution (Priority 2)
+# ---------------------------------------------------------------------------
+
+
+class ApproveIn(BaseModel):
+    note: str = ""
+
+
+@router.post("/recommendations/{recommendation_id}/approve")
+def approve_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = None, db: Session = Depends(get_db)):
+    """Approve a recommendation and trigger order execution via broker.
+
+    This is THE ONLY way to trigger real execution. Scheduler NEVER executes orders.
+    """
+    note = payload.note if payload else ""
+    result = approve_and_execute(db, recommendation_id, note=note)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.post("/recommendations/{recommendation_id}/reject")
+def reject_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = None, db: Session = Depends(get_db)):
+    """Reject a recommendation. No orders are placed."""
+    note = payload.note if payload else ""
+    result = reject_recommendation(db, recommendation_id, note=note)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.get("/executions/recent")
+def recent_executions(db: Session = Depends(get_db)):
+    return get_recent_executions(db, limit=20)
+
+
+@router.get("/executions/{execution_id}")
+def get_execution(execution_id: int, db: Session = Depends(get_db)):
+    result = get_execution_by_id(db, execution_id)
+    if not result:
+        raise HTTPException(404, "Execution not found")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Notification settings (Priority 3)
+# ---------------------------------------------------------------------------
+
+
+class NotificationSettingsIn(BaseModel):
+    notification_enabled: bool | None = None
+    notification_min_severity: str | None = None
+    notification_cooldown_seconds: int | None = None
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+
+
+@router.get("/notifications/settings")
+def get_notification_settings():
+    settings = get_settings()
+    return {
+        "notification_enabled": settings.notification_enabled,
+        "notification_channel": settings.notification_channel,
+        "notification_min_severity": settings.notification_min_severity,
+        "notification_cooldown_seconds": settings.notification_cooldown_seconds,
+        "telegram_configured": bool(settings.telegram_bot_token and settings.telegram_chat_id),
+    }
+
+
+@router.put("/notifications/settings")
+def update_notification_settings(payload: NotificationSettingsIn):
+    settings = get_settings()
+
+    if payload.notification_enabled is not None:
+        settings.notification_enabled = payload.notification_enabled
+
+    if payload.notification_min_severity is not None:
+        valid = {"low", "medium", "high", "critical"}
+        if payload.notification_min_severity not in valid:
+            raise HTTPException(400, f"Severidad inválida. Válidas: {', '.join(sorted(valid))}")
+        settings.notification_min_severity = payload.notification_min_severity
+
+    if payload.notification_cooldown_seconds is not None:
+        if payload.notification_cooldown_seconds < 0:
+            raise HTTPException(400, "Cooldown debe ser >= 0")
+        settings.notification_cooldown_seconds = payload.notification_cooldown_seconds
+
+    if payload.telegram_bot_token is not None:
+        settings.telegram_bot_token = payload.telegram_bot_token
+
+    if payload.telegram_chat_id is not None:
+        settings.telegram_chat_id = payload.telegram_chat_id
+
+    return get_notification_settings()
+
+
+# ---------------------------------------------------------------------------
+# Web Push subscriptions (Priority 3 — PWA)
+# ---------------------------------------------------------------------------
+
+
+class PushSubscriptionIn(BaseModel):
+    endpoint: str
+    keys: dict  # {p256dh: str, auth: str}
+
+
+@router.post("/push/subscribe")
+def push_subscribe(payload: PushSubscriptionIn, db: Session = Depends(get_db)):
+    """Register a web push subscription."""
+    existing = db.query(PushSubscription).filter(PushSubscription.endpoint == payload.endpoint).first()
+    if existing:
+        return {"status": "already_subscribed", "id": existing.id}
+
+    sub = PushSubscription(
+        endpoint=payload.endpoint,
+        p256dh=payload.keys.get("p256dh", ""),
+        auth=payload.keys.get("auth", ""),
+    )
+    db.add(sub)
+    db.commit()
+    return {"status": "subscribed", "id": sub.id}
+
+
+@router.get("/push/vapid-public-key")
+def get_vapid_public_key():
+    settings = get_settings()
+    return {"vapid_public_key": settings.vapid_public_key}

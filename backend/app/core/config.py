@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     notification_min_severity: str = "medium"  # low | medium | high | critical
     notification_cooldown_seconds: int = 300
 
+    # Web push (VAPID keys — generate with: npx web-push generate-vapid-keys)
+    vapid_public_key: str = ""
+    vapid_private_key: str = ""
+    vapid_contact_email: str = ""
+
     whitelist_assets: List[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "AL30", "BND", "CASH"]
     )
