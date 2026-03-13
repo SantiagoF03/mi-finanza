@@ -56,18 +56,30 @@ _MIN_VOLUME_FILTER = 0
 def refresh_instrument_catalog(db: Session, force_seed: bool = False) -> dict:
     """Refresh the instrument catalog from IOL or static seed.
 
-    Returns summary dict with counts.
+    Returns summary dict with:
+    - discovery_source_attempted: what we tried ("iol", "static_seed", "none")
+    - discovery_source_effective: what actually provided data ("iol", "static_seed")
+    - used_static_seed: bool — True if static seed was the actual data source
+    - coverage_status: "full" | "partial" | "seed_only" | "failed"
+    - panel_results: per-panel observability
+    - summary_by_asset_type: counts per asset type discovered
     """
     settings = get_settings()
     now = datetime.now(timezone.utc)
 
     instruments_found: list[dict] = []
     panel_results: list[dict] = []
+    discovery_source_attempted = "none"
+    discovery_source_effective = "none"
+    used_static_seed = False
 
     # Try IOL real discovery if credentials are available
     if settings.broker_mode == "real" and settings.iol_username and not force_seed:
+        discovery_source_attempted = "iol"
         try:
             instruments_found, panel_results = _discover_from_iol()
+            if instruments_found:
+                discovery_source_effective = "iol"
         except Exception as exc:
             logger.warning("IOL discovery failed, falling back to static seed: %s", exc)
             instruments_found = []
@@ -75,10 +87,28 @@ def refresh_instrument_catalog(db: Session, force_seed: bool = False) -> dict:
 
     # Fallback or supplement: static seed from KNOWN_ASSET_TYPES
     if not instruments_found or force_seed:
+        if discovery_source_attempted == "none":
+            discovery_source_attempted = "static_seed"
         instruments_found = _seed_from_static()
+        discovery_source_effective = "static_seed"
+        used_static_seed = True
         if not panel_results:
             panel_results = [{"panel": "static_seed", "status": "ok",
                               "instruments_found": len(instruments_found)}]
+
+    # Compute coverage_status from panel_results
+    if discovery_source_effective == "static_seed":
+        coverage_status = "seed_only"
+    elif panel_results:
+        statuses = {pr.get("status") for pr in panel_results}
+        if statuses == {"error"}:
+            coverage_status = "failed"
+        elif "error" in statuses or "empty" in statuses:
+            coverage_status = "partial"
+        else:
+            coverage_status = "full"
+    else:
+        coverage_status = "failed"
 
     # Upsert into DB
     created = 0
@@ -155,15 +185,25 @@ def refresh_instrument_catalog(db: Session, force_seed: bool = False) -> dict:
 
     total = db.query(InstrumentCatalog).filter(InstrumentCatalog.is_active == True).count()
 
+    # Build summary_by_asset_type from what was actually discovered
+    summary_by_asset_type: dict[str, int] = {}
+    for inst in instruments_found:
+        at = inst.get("asset_type", "DESCONOCIDO")
+        summary_by_asset_type[at] = summary_by_asset_type.get(at, 0) + 1
+
     return {
         "status": "ok",
-        "source": "iol" if settings.broker_mode == "real" else "static_seed",
+        "discovery_source_attempted": discovery_source_attempted,
+        "discovery_source_effective": discovery_source_effective,
+        "used_static_seed": used_static_seed,
+        "coverage_status": coverage_status,
         "created": created,
         "updated": updated,
         "deactivated": deactivated,
         "total_active": total,
         "symbols_found": len(seen_symbols),
         "panel_results": panel_results,
+        "summary_by_asset_type": summary_by_asset_type,
     }
 
 
