@@ -335,6 +335,7 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
 
             order_exec.broker_order_id = result.get("order_id", "")
             order_exec.broker_response = result.get("raw_response", {})
+            order_exec.endpoint_used = result.get("endpoint_used", "")
             order_exec.sent_at = datetime.utcnow()
 
             if result.get("status") == "sent":
@@ -387,6 +388,7 @@ def _exec_summary(order_exec: OrderExecution) -> dict:
         "quantity_planned": order_exec.quantity_planned,
         "quantity_sent": order_exec.quantity_sent,
         "broker_order_id": order_exec.broker_order_id,
+        "endpoint_used": order_exec.endpoint_used,
         "error": order_exec.error_message,
         "blocked_reason": order_exec.blocked_reason,
     }
@@ -450,6 +452,7 @@ def _exec_to_dict(e: OrderExecution) -> dict:
         "position_value_used": e.position_value_used,
         "blocked_reason": e.blocked_reason,
         "broker_order_id": e.broker_order_id,
+        "endpoint_used": e.endpoint_used,
         "error_message": e.error_message,
         "executed_quantity": e.executed_quantity,
         "executed_price": e.executed_price,

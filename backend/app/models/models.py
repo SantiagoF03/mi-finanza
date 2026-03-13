@@ -207,6 +207,7 @@ class OrderExecution(Base):
     quantity_planned: Mapped[float | None] = mapped_column(Float, nullable=True)
     quantity_sent: Mapped[float | None] = mapped_column(Float, nullable=True)
     validation_status: Mapped[str] = mapped_column(String(30), default="")
+    endpoint_used: Mapped[str] = mapped_column(String(100), default="")
     executed_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
     executed_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
