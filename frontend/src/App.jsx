@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 
-const API = 'http://localhost:8000/api'
+const API = (import.meta.env.VITE_API_BASE || window.location.origin) + '/api'
 
 function formatRemaining(totalSeconds) {
   const seconds = Math.max(0, Number(totalSeconds || 0))

@@ -1,6 +1,6 @@
-"""Notification dispatcher (Part E — fortified).
+"""Notification dispatcher (Part E — fortified + real web push P3).
 
-Sends alerts via Telegram (or email, extensible).
+Sends alerts via Telegram + Web Push.
 Only dispatches when:
 - notification_enabled is True
 - event severity >= notification_min_severity
@@ -12,11 +12,15 @@ Argentina market hours (BYMA) as primary clock; US sensitivity for CEDEARs/ETFs.
 
 from __future__ import annotations
 
+import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
@@ -157,6 +161,158 @@ def _send_telegram(message: str, bot_token: str, chat_id: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Real Web Push (Priority 3)
+# ---------------------------------------------------------------------------
+
+
+def _send_single_web_push(
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+    payload: dict,
+) -> bool:
+    """Send a single web push notification using pywebpush or py_vapid fallback.
+
+    Returns True if sent successfully, False otherwise.
+    """
+    settings = get_settings()
+    if not settings.vapid_private_key or not settings.vapid_public_key:
+        logger.warning("VAPID keys not configured, cannot send web push")
+        return False
+
+    subscription_info = {
+        "endpoint": endpoint,
+        "keys": {
+            "p256dh": p256dh,
+            "auth": auth,
+        },
+    }
+
+    vapid_claims = {
+        "sub": f"mailto:{settings.vapid_contact_email}" if settings.vapid_contact_email else "mailto:admin@mifinanza.local",
+    }
+
+    # Try pywebpush first (preferred, handles encryption)
+    try:
+        from pywebpush import webpush
+        webpush(
+            subscription_info=subscription_info,
+            data=json.dumps(payload),
+            vapid_private_key=settings.vapid_private_key,
+            vapid_claims=vapid_claims,
+        )
+        return True
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning("pywebpush failed for %s...: %s", endpoint[:50], exc)
+        return False
+
+    # Fallback: use py_vapid for auth header + httpx for delivery
+    try:
+        from py_vapid import Vapid
+
+        vapid = Vapid.from_raw(settings.vapid_private_key)
+        auth_headers = vapid.sign({
+            "aud": _extract_origin(endpoint),
+            "sub": vapid_claims["sub"],
+        })
+
+        data_bytes = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Authorization": auth_headers["Authorization"],
+            "Crypto-Key": auth_headers.get("Crypto-Key", ""),
+            "Content-Type": "application/json",
+            "TTL": "86400",
+        }
+
+        resp = httpx.post(endpoint, content=data_bytes, headers=headers, timeout=10)
+        if resp.status_code in (200, 201, 202):
+            return True
+        logger.warning("Web push HTTP %d for %s...", resp.status_code, endpoint[:50])
+        return False
+
+    except ImportError:
+        logger.warning("Neither pywebpush nor py_vapid available")
+        return False
+    except Exception as exc:
+        logger.warning("Web push fallback failed for %s...: %s", endpoint[:50], exc)
+        return False
+
+
+def _extract_origin(url: str) -> str:
+    """Extract origin (scheme + host) from a URL."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def send_web_push_to_all(
+    db,
+    *,
+    title: str,
+    body: str,
+    severity: str = "medium",
+    deep_link: str = "/",
+) -> dict:
+    """Send a web push notification to all active subscriptions.
+
+    Handles invalid/expired subscriptions by removing them.
+    """
+    from app.models.models import PushSubscription
+
+    settings = get_settings()
+    if not settings.vapid_private_key or not settings.vapid_public_key:
+        return {"sent": 0, "failed": 0, "removed": 0, "reason": "vapid_not_configured"}
+
+    subs = db.query(PushSubscription).all()
+    if not subs:
+        return {"sent": 0, "failed": 0, "removed": 0, "reason": "no_subscriptions"}
+
+    payload = {
+        "title": title,
+        "body": body,
+        "severity": severity,
+        "deep_link": deep_link,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    sent = 0
+    failed = 0
+    removed = 0
+    to_remove = []
+
+    for sub in subs:
+        success = _send_single_web_push(
+            endpoint=sub.endpoint,
+            p256dh=sub.p256dh,
+            auth=sub.auth,
+            payload=payload,
+        )
+        if success:
+            sent += 1
+        else:
+            failed += 1
+            # Check if subscription is expired/invalid (410 Gone)
+            # Mark for removal on repeated failures
+            to_remove.append(sub.id)
+
+    # Remove invalid subscriptions (best-effort)
+    if to_remove:
+        try:
+            for sub_id in to_remove:
+                sub_obj = db.query(PushSubscription).filter(PushSubscription.id == sub_id).first()
+                if sub_obj:
+                    db.delete(sub_obj)
+                    removed += 1
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    return {"sent": sent, "failed": failed, "removed": removed}
+
+
 def dispatch_execution_notification(order_execution) -> dict:
     """Send notification about an execution state change."""
     settings = get_settings()
@@ -173,6 +329,7 @@ def dispatch_execution_notification(order_execution) -> dict:
         "executed": f"Orden {side} de {symbol} ejecutada exitosamente.",
         "partially_executed": f"Orden {side} de {symbol} ejecutada parcialmente.",
         "rejected_by_broker": f"Orden {side} de {symbol} rechazada por el broker.",
+        "validation_failed": f"Orden {side} de {symbol} bloqueada por validación.",
         "failed": f"Orden {side} de {symbol} falló.",
     }
     msg = f"Mi Finanza - Ejecución\n\n{status_msg.get(status, f'{symbol}: {status}')}"
@@ -187,7 +344,7 @@ def dispatch_execution_notification(order_execution) -> dict:
 def dispatch_alerts(db, events: list) -> dict:
     """Dispatch notifications for qualifying events.
 
-    Returns summary of what was sent.
+    Returns summary of what was sent. Sends via Telegram + Web Push.
     """
     global _last_notification_at
 
@@ -229,18 +386,47 @@ def dispatch_alerts(db, events: list) -> dict:
 
     message = _format_alert_message(qualifying, ar_phase, us_phase)
 
-    sent = False
+    telegram_sent = False
     if settings.notification_channel == "telegram":
         if settings.telegram_bot_token and settings.telegram_chat_id:
-            sent = _send_telegram(message, settings.telegram_bot_token, settings.telegram_chat_id)
+            telegram_sent = _send_telegram(message, settings.telegram_bot_token, settings.telegram_chat_id)
 
-    if sent:
+    # --- Web Push (P3): send to all subscriptions ---
+    push_result = {"sent": 0, "failed": 0, "removed": 0}
+    try:
+        # Build push payload from first qualifying event
+        first = qualifying[0]
+        severity = getattr(first, "severity", "medium")
+        symbols = ", ".join(getattr(first, "affected_symbols", []) or [])
+        push_title = f"Mi Finanza - {severity.upper()}"
+        push_body = getattr(first, "message", "Alerta de mercado")
+        if symbols:
+            push_body += f" ({symbols})"
+        if len(qualifying) > 1:
+            push_body += f" +{len(qualifying) - 1} más"
+
+        push_result = send_web_push_to_all(
+            db,
+            title=push_title,
+            body=push_body,
+            severity=severity,
+            deep_link="/alerts",
+        )
+    except Exception as exc:
+        logger.warning("Web push dispatch failed: %s", exc)
+
+    any_sent = telegram_sent or push_result.get("sent", 0) > 0
+    if any_sent:
         _last_notification_at = now
 
     return {
-        "sent": sent,
+        "sent": any_sent,
         "channel": settings.notification_channel,
         "events_count": len(qualifying),
         "market_phase_ar": ar_phase,
         "market_phase_us": us_phase,
+        "telegram_sent": telegram_sent,
+        "web_push_sent": push_result.get("sent", 0),
+        "web_push_failed": push_result.get("failed", 0),
+        "web_push_removed": push_result.get("removed", 0),
     }

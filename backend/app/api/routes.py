@@ -6,7 +6,8 @@ from sqlalchemy.orm import Session, joinedload
 from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.db.session import get_db
-from app.models.models import MarketEvent, NewsEvent, PortfolioSnapshot, PushSubscription, Recommendation, UserDecision
+from app.market.discovery import get_catalog_instruments, get_eligible_universe_symbols, refresh_instrument_catalog
+from app.models.models import MarketEvent, NewsEvent, PortfolioSnapshot, PushSubscription, Recommendation, UserDecision, UserSettings
 from app.news.ingestion import get_active_alerts, get_recent_events, run_ingestion
 from app.portfolio.profiles import PROFILE_PRESETS, get_profile_label, get_profile_thresholds, resolve_profile
 from app.schemas.schemas import DecisionIn
@@ -180,11 +181,68 @@ def acknowledge_alert(alert_id: int, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Profile settings (GAP 4)
+# Profile settings (GAP 4) — now with DB persistence (P4)
 # ---------------------------------------------------------------------------
 
 VALID_PROFILES = {"conservative", "moderate", "moderate_aggressive", "aggressive",
                   "conservador", "moderado", "agresivo"}
+
+_PERSISTED_SETTINGS_KEYS = {
+    "investor_profile_target",
+    "notification_enabled",
+    "notification_min_severity",
+    "notification_cooldown_seconds",
+    "notification_channel",
+    "max_single_asset_weight",
+    "max_equity_band",
+    "max_us_equity_concentration",
+}
+
+
+def _load_persisted_settings(db: Session) -> None:
+    """Load persisted settings from DB into the in-memory Settings singleton."""
+    settings = get_settings()
+    rows = db.query(UserSettings).filter(UserSettings.key.in_(_PERSISTED_SETTINGS_KEYS)).all()
+    for row in rows:
+        key = row.key
+        val = row.value
+        if key == "investor_profile_target" and val:
+            settings.investor_profile_target = val
+        elif key == "notification_enabled":
+            settings.notification_enabled = val.lower() in ("true", "1", "yes")
+        elif key == "notification_min_severity" and val:
+            settings.notification_min_severity = val
+        elif key == "notification_cooldown_seconds" and val:
+            try:
+                settings.notification_cooldown_seconds = int(val)
+            except ValueError:
+                pass
+        elif key == "notification_channel" and val:
+            settings.notification_channel = val
+        elif key == "max_single_asset_weight" and val:
+            try:
+                settings.max_single_asset_weight = float(val)
+            except ValueError:
+                pass
+        elif key == "max_equity_band" and val:
+            try:
+                settings.max_equity_band = float(val)
+            except ValueError:
+                pass
+        elif key == "max_us_equity_concentration" and val:
+            try:
+                settings.max_us_equity_concentration = float(val)
+            except ValueError:
+                pass
+
+
+def _persist_setting(db: Session, key: str, value: str) -> None:
+    """Upsert a single setting into DB."""
+    existing = db.query(UserSettings).filter(UserSettings.key == key).first()
+    if existing:
+        existing.value = value
+    else:
+        db.add(UserSettings(key=key, value=value))
 
 
 class ProfileSettingsIn(BaseModel):
@@ -195,7 +253,8 @@ class ProfileSettingsIn(BaseModel):
 
 
 @router.get("/profile/settings")
-def get_profile_settings():
+def get_profile_settings(db: Session = Depends(get_db)):
+    _load_persisted_settings(db)
     settings = get_settings()
     profile = settings.investor_profile_target or settings.investor_profile
     canonical = resolve_profile(profile)
@@ -216,7 +275,7 @@ def get_profile_settings():
 
 
 @router.put("/profile/settings")
-def update_profile_settings(payload: ProfileSettingsIn):
+def update_profile_settings(payload: ProfileSettingsIn, db: Session = Depends(get_db)):
     settings = get_settings()
 
     if payload.investor_profile_target is not None:
@@ -225,23 +284,28 @@ def update_profile_settings(payload: ProfileSettingsIn):
         if canonical not in {"conservative", "moderate", "moderate_aggressive", "aggressive"}:
             raise HTTPException(400, f"Perfil inválido: {profile}. Válidos: conservative, moderate, moderate_aggressive, aggressive")
         settings.investor_profile_target = canonical
+        _persist_setting(db, "investor_profile_target", canonical)
 
     if payload.max_single_asset_weight is not None:
         if not 0 <= payload.max_single_asset_weight <= 1:
             raise HTTPException(400, "max_single_asset_weight debe estar entre 0 y 1")
         settings.max_single_asset_weight = payload.max_single_asset_weight
+        _persist_setting(db, "max_single_asset_weight", str(payload.max_single_asset_weight))
 
     if payload.max_equity_band is not None:
         if not 0 <= payload.max_equity_band <= 1:
             raise HTTPException(400, "max_equity_band debe estar entre 0 y 1")
         settings.max_equity_band = payload.max_equity_band
+        _persist_setting(db, "max_equity_band", str(payload.max_equity_band))
 
     if payload.max_us_equity_concentration is not None:
         if not 0 <= payload.max_us_equity_concentration <= 1:
             raise HTTPException(400, "max_us_equity_concentration debe estar entre 0 y 1")
         settings.max_us_equity_concentration = payload.max_us_equity_concentration
+        _persist_setting(db, "max_us_equity_concentration", str(payload.max_us_equity_concentration))
 
-    return get_profile_settings()
+    db.commit()
+    return get_profile_settings(db)
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +354,7 @@ def get_execution(execution_id: int, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# Notification settings (Priority 3)
+# Notification settings (Priority 3) — now with DB persistence (P4)
 # ---------------------------------------------------------------------------
 
 
@@ -303,7 +367,8 @@ class NotificationSettingsIn(BaseModel):
 
 
 @router.get("/notifications/settings")
-def get_notification_settings():
+def get_notification_settings(db: Session = Depends(get_db)):
+    _load_persisted_settings(db)
     settings = get_settings()
     return {
         "notification_enabled": settings.notification_enabled,
@@ -315,22 +380,25 @@ def get_notification_settings():
 
 
 @router.put("/notifications/settings")
-def update_notification_settings(payload: NotificationSettingsIn):
+def update_notification_settings(payload: NotificationSettingsIn, db: Session = Depends(get_db)):
     settings = get_settings()
 
     if payload.notification_enabled is not None:
         settings.notification_enabled = payload.notification_enabled
+        _persist_setting(db, "notification_enabled", str(payload.notification_enabled))
 
     if payload.notification_min_severity is not None:
         valid = {"low", "medium", "high", "critical"}
         if payload.notification_min_severity not in valid:
             raise HTTPException(400, f"Severidad inválida. Válidas: {', '.join(sorted(valid))}")
         settings.notification_min_severity = payload.notification_min_severity
+        _persist_setting(db, "notification_min_severity", payload.notification_min_severity)
 
     if payload.notification_cooldown_seconds is not None:
         if payload.notification_cooldown_seconds < 0:
             raise HTTPException(400, "Cooldown debe ser >= 0")
         settings.notification_cooldown_seconds = payload.notification_cooldown_seconds
+        _persist_setting(db, "notification_cooldown_seconds", str(payload.notification_cooldown_seconds))
 
     if payload.telegram_bot_token is not None:
         settings.telegram_bot_token = payload.telegram_bot_token
@@ -338,7 +406,8 @@ def update_notification_settings(payload: NotificationSettingsIn):
     if payload.telegram_chat_id is not None:
         settings.telegram_chat_id = payload.telegram_chat_id
 
-    return get_notification_settings()
+    db.commit()
+    return get_notification_settings(db)
 
 
 # ---------------------------------------------------------------------------
@@ -372,3 +441,85 @@ def push_subscribe(payload: PushSubscriptionIn, db: Session = Depends(get_db)):
 def get_vapid_public_key():
     settings = get_settings()
     return {"vapid_public_key": settings.vapid_public_key}
+
+
+@router.post("/push/test")
+def push_test(db: Session = Depends(get_db)):
+    """Send a test push notification to all active subscriptions."""
+    from app.notifications.dispatcher import send_web_push_to_all
+    result = send_web_push_to_all(
+        db,
+        title="Mi Finanza - Test",
+        body="Push notifications funcionan correctamente.",
+        severity="low",
+        deep_link="/",
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Instrument Catalog & Dynamic Universe (Priority 1)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/instruments/catalog")
+def get_instruments_catalog(
+    active_only: bool = True,
+    eligible_only: bool = False,
+    asset_type: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """Get instruments from the catalog with optional filters."""
+    asset_types = [asset_type] if asset_type else None
+    instruments = get_catalog_instruments(
+        db,
+        active_only=active_only,
+        eligible_only=eligible_only,
+        asset_types=asset_types,
+    )
+    return {
+        "count": len(instruments),
+        "instruments": instruments,
+    }
+
+
+@router.post("/instruments/refresh")
+def refresh_instruments(db: Session = Depends(get_db)):
+    """Refresh the instrument catalog from IOL or static seed."""
+    result = refresh_instrument_catalog(db)
+    return result
+
+
+@router.get("/universe/current")
+def current_universe(db: Session = Depends(get_db)):
+    """Get the current dynamic universe: holdings + catalog eligible + config."""
+    from app.recommendations.universe import build_allowed_assets
+
+    # Get latest snapshot positions
+    snapshot = (
+        db.query(PortfolioSnapshot)
+        .options(joinedload(PortfolioSnapshot.positions))
+        .order_by(desc(PortfolioSnapshot.id))
+        .first()
+    )
+    positions = []
+    if snapshot:
+        positions = [
+            {"symbol": p.symbol, "asset_type": p.asset_type}
+            for p in snapshot.positions
+        ]
+
+    catalog_symbols = get_eligible_universe_symbols(db)
+    allowed = build_allowed_assets(positions, catalog_symbols=catalog_symbols)
+
+    return {
+        "holdings": sorted(allowed["holdings"]),
+        "whitelist": sorted(allowed["whitelist"]),
+        "watchlist": sorted(allowed["watchlist"]),
+        "universe_total": len(allowed["universe"]),
+        "universe_sample": sorted(list(allowed["universe"]))[:50],
+        "catalog_dynamic_count": len(allowed.get("catalog_dynamic", set())),
+        "main_allowed": sorted(allowed["main_allowed"]),
+        "external_allowed_count": len(allowed["external_allowed"]),
+        "all_known_count": len(allowed["all_known"]),
+    }

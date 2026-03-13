@@ -201,6 +201,12 @@ class OrderExecution(Base):
     broker_order_id: Mapped[str] = mapped_column(String(100), default="")
     broker_response: Mapped[dict] = mapped_column(JSON, default=dict)
     error_message: Mapped[str] = mapped_column(Text, default="")
+    blocked_reason: Mapped[str] = mapped_column(Text, default="")
+    portfolio_value_used: Mapped[float | None] = mapped_column(Float, nullable=True)
+    position_value_used: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quantity_planned: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quantity_sent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    validation_status: Mapped[str] = mapped_column(String(30), default="")
     executed_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
     executed_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -217,3 +223,45 @@ class PushSubscription(Base):
     p256dh: Mapped[str] = mapped_column(String(200))
     auth: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Instrument Catalog — dynamic universe of tradeable instruments (P1)
+# ---------------------------------------------------------------------------
+
+
+class InstrumentCatalog(Base):
+    __tablename__ = "instrument_catalog"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(200), default="")
+    asset_type: Mapped[str] = mapped_column(String(30), default="DESCONOCIDO")
+    market: Mapped[str] = mapped_column(String(30), default="BCBA")
+    currency: Mapped[str] = mapped_column(String(10), default="ARS")
+    tradable: Mapped[bool] = mapped_column(Boolean, default=True)
+    source: Mapped[str] = mapped_column(String(50), default="iol_discovery")
+    source_category: Mapped[str] = mapped_column(String(50), default="")
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    avg_volume: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    investable_local: Mapped[bool] = mapped_column(Boolean, default=True)
+    eligible_for_external_discovery: Mapped[bool] = mapped_column(Boolean, default=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# User Settings — persisted settings (P4)
+# ---------------------------------------------------------------------------
+
+
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

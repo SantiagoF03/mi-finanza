@@ -7,6 +7,7 @@ from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.market.candidates import generate_external_candidates
+from app.market.discovery import get_eligible_universe_symbols
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.ingestion import get_engine_eligible_news, get_llm_eligible_news, run_ingestion
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
@@ -165,7 +166,14 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         "positions": positions,
     }
     analysis = analyze_portfolio(snapshot_dict)
-    allowed_assets = build_allowed_assets(positions)
+
+    # Build dynamic universe from instrument_catalog (P1)
+    try:
+        catalog_symbols = get_eligible_universe_symbols(db)
+    except Exception:
+        catalog_symbols = set()
+
+    allowed_assets = build_allowed_assets(positions, catalog_symbols=catalog_symbols)
     rec = generate_recommendation(snapshot_dict, analysis, engine_news, settings.max_movement_per_cycle)
 
     # Replace news-only external_opportunities with full candidate sourcing
@@ -237,7 +245,8 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
                 "holdings": sorted(allowed_assets["holdings"]),
                 "whitelist": sorted(allowed_assets["whitelist"]),
                 "watchlist": sorted(allowed_assets["watchlist"]),
-                "universe": sorted(allowed_assets["universe"]),
+                "universe": sorted(list(allowed_assets["universe"])[:50]),  # cap for metadata size
+                "catalog_dynamic_count": len(allowed_assets.get("catalog_dynamic", set())),
                 "main_allowed": sorted(allowed_assets["main_allowed"]),
             },
             "unchanged": unchanged,

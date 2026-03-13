@@ -2,13 +2,14 @@
 
 This module resolves the effective set of allowed assets for:
 - main recommendation actions (holdings + whitelist override)
-- external opportunities (watchlist + universe)
+- external opportunities (watchlist + universe + instrument_catalog dynamic)
 
 Hierarchy:
 1. Holdings reales (snapshot.positions) → always auto-permitted for main actions
 2. WHITELIST_ASSETS (.env) → manual override, also permitted for main actions
 3. WATCHLIST_ASSETS (.env) → external assets to track as opportunities
-4. MARKET_UNIVERSE_ASSETS (.env) → broader set of known/operable assets
+4. MARKET_UNIVERSE_ASSETS (.env) → manual broader set (optional override)
+5. instrument_catalog (DB) → dynamic universe from IOL discovery (PRIMARY source)
 """
 
 from __future__ import annotations
@@ -28,24 +29,22 @@ VALID_ASSET_TYPES = {
 # "DESCONOCIDO" is NOT valid — it's a fallback marker for unknown types
 
 
-def build_allowed_assets(snapshot_positions: list[dict]) -> dict:
-    """Build the full allowed-assets map from holdings + config.
+def build_allowed_assets(snapshot_positions: list[dict], catalog_symbols: set[str] | None = None) -> dict:
+    """Build the full allowed-assets map from holdings + config + catalog.
 
-    Returns a dict with:
-    - holdings: set of symbols from snapshot (auto-permitted)
-    - whitelist: set from WHITELIST_ASSETS config (manual override)
-    - watchlist: set from WATCHLIST_ASSETS config (external tracking)
-    - universe: set from MARKET_UNIVERSE_ASSETS config (broader operable set)
-    - main_allowed: union of holdings + whitelist (what can appear in main actions)
-    - external_allowed: union of watchlist + universe (what can appear as opportunities)
-    - all_known: union of everything
+    catalog_symbols: set of eligible symbols from instrument_catalog (dynamic).
+    If None, only manual config is used (backward compatible).
     """
     settings = get_settings()
 
     holdings = {p.get("symbol") for p in snapshot_positions if p.get("symbol")}
     whitelist = set(settings.whitelist_assets)
     watchlist = set(settings.watchlist_assets)
-    universe = set(settings.market_universe_assets)
+    manual_universe = set(settings.market_universe_assets)
+    catalog_dynamic = catalog_symbols or set()
+
+    # Universe = manual config + dynamic catalog
+    universe = manual_universe | catalog_dynamic
 
     main_allowed = holdings | whitelist
     external_allowed = watchlist | universe
@@ -56,6 +55,7 @@ def build_allowed_assets(snapshot_positions: list[dict]) -> dict:
         "whitelist": whitelist,
         "watchlist": watchlist,
         "universe": universe,
+        "catalog_dynamic": catalog_dynamic,
         "main_allowed": main_allowed,
         "external_allowed": external_allowed,
         "all_known": all_known,

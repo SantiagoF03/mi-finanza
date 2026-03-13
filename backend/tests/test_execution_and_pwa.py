@@ -25,6 +25,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db.session import Base
 from app.models.models import (
     OrderExecution,
+    PortfolioPosition,
+    PortfolioSnapshot,
     PushSubscription,
     Recommendation,
     RecommendationAction,
@@ -38,6 +40,20 @@ def db():
     session = sessionmaker(bind=engine)()
     yield session
     session.close()
+
+
+def _make_snapshot(db: Session) -> PortfolioSnapshot:
+    """Create a portfolio snapshot with AAPL position for execution tests."""
+    snap = PortfolioSnapshot(total_value=100000, cash=12000, currency="USD")
+    db.add(snap)
+    db.flush()
+    db.add(PortfolioPosition(
+        snapshot_id=snap.id, symbol="AAPL", asset_type="CEDEAR",
+        instrument_type="CEDEAR", currency="USD", quantity=20,
+        market_value=38000, avg_price=180, pnl_pct=0.11,
+    ))
+    db.flush()
+    return snap
 
 
 def _make_recommendation(db: Session, action="rebalancear", status="pending") -> Recommendation:
@@ -89,6 +105,7 @@ def test_order_execution_model_creation(db):
 
 def test_approve_triggers_execution(db):
     """Approving a recommendation creates OrderExecution rows and calls broker."""
+    _make_snapshot(db)
     rec = _make_recommendation(db)
     db.commit()
 
@@ -159,6 +176,7 @@ def test_approve_mantener_no_orders(db):
 
 def test_execution_states_on_broker_failure(db):
     """When broker fails, execution status is 'failed'."""
+    _make_snapshot(db)
     rec = _make_recommendation(db)
     db.commit()
 
@@ -176,6 +194,7 @@ def test_execution_states_on_broker_failure(db):
 
 def test_execution_rejected_by_broker(db):
     """When broker rejects, execution status is 'rejected_by_broker'."""
+    _make_snapshot(db)
     rec = _make_recommendation(db)
     db.commit()
 
