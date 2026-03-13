@@ -7,7 +7,7 @@ from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.market.candidates import generate_external_candidates
-from app.market.discovery import get_eligible_universe_symbols
+from app.market.discovery import get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.ingestion import get_engine_eligible_news, get_llm_eligible_news, run_ingestion
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
@@ -167,9 +167,43 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     }
     analysis = analyze_portfolio(snapshot_dict)
 
-    # Build dynamic universe from instrument_catalog (P1)
+    # Build dynamic universe from instrument_catalog — auto-bootstrap if empty or stale
     try:
         catalog_symbols = get_eligible_universe_symbols(db)
+
+        # Auto-bootstrap: if catalog is empty, seed it
+        if not catalog_symbols:
+            app_log(db, "Catálogo vacío, ejecutando bootstrap automático", context={"source": source})
+            try:
+                refresh_instrument_catalog(db)
+                catalog_symbols = get_eligible_universe_symbols(db)
+            except Exception as exc:
+                app_log(db, "Bootstrap de catálogo falló (safe fallback)", level="WARNING",
+                        context={"error": str(exc)[:200]})
+
+        # Staleness check: refresh if catalog hasn't been updated in 24h
+        if catalog_symbols:
+            try:
+                from app.models.models import InstrumentCatalog
+                from sqlalchemy import func
+                last_seen = db.query(func.max(InstrumentCatalog.last_seen_at)).scalar()
+                if last_seen:
+                    from datetime import timezone as tz
+                    if last_seen.tzinfo is None:
+                        last_seen = last_seen.replace(tzinfo=tz.utc)
+                    staleness = datetime.now(tz.utc) - last_seen
+                    if staleness > timedelta(hours=24):
+                        app_log(db, "Catálogo stale, refrescando", context={
+                            "staleness_hours": round(staleness.total_seconds() / 3600, 1),
+                        })
+                        try:
+                            refresh_instrument_catalog(db)
+                            catalog_symbols = get_eligible_universe_symbols(db)
+                        except Exception:
+                            pass  # keep existing catalog_symbols
+            except Exception:
+                pass  # staleness check is best-effort
+
     except Exception:
         catalog_symbols = set()
 

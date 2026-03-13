@@ -40,6 +40,44 @@ from app.models.models import (
 from app.services.logs import app_log
 
 
+def _get_fresh_quote(broker, symbol: str, side: str) -> dict:
+    """Attempt to get a fresh tradeable price from the broker.
+
+    Returns dict with:
+    - available: bool
+    - price: float | None  (best bid for sell, best ask for buy, or last)
+    - source: str           (e.g. "bid", "ask", "last", "none")
+
+    In mock mode: returns a synthetic quote so tests proceed.
+    In real mode: would query IOL cotizaciones for fresh pricing.
+    If no fresh quote is available, returns available=False.
+    """
+    # MockBrokerClient — always provide a quote so mock flow isn't blocked
+    if hasattr(broker, "_mock_orders"):
+        return {"available": True, "price": None, "source": "market_order"}
+
+    # Real broker — attempt to get fresh quote from IOL
+    try:
+        resp = broker._authorized_get(f"/api/v2/Cotizaciones/detalle/bCBA/{symbol}")
+        data = resp.json()
+        if isinstance(data, dict):
+            if side == "sell":
+                price = data.get("puntas", {}).get("precioCompra") or data.get("ultimoPrecio")
+            else:
+                price = data.get("puntas", {}).get("precioVenta") or data.get("ultimoPrecio")
+            if price and float(price) > 0:
+                source = "bid" if side == "sell" else "ask"
+                return {"available": True, "price": float(price), "source": source}
+            # Has data but no usable price
+            last = data.get("ultimoPrecio")
+            if last and float(last) > 0:
+                return {"available": True, "price": float(last), "source": "last"}
+    except Exception:
+        pass
+
+    return {"available": False, "price": None, "source": "none"}
+
+
 def _get_execution_broker():
     settings = get_settings()
     if settings.broker_mode == "mock":
@@ -78,7 +116,7 @@ def _plan_order(
     - portfolio_value_used: float
     - position_value_used: float
     - blocked_reason: str (empty if valid)
-    - last_price_used: float | None
+    - snapshot_price_ref: float | None  (for traceability ONLY, never sent to broker)
     """
     symbol = action.symbol
     target_pct = action.target_change_pct
@@ -98,7 +136,7 @@ def _plan_order(
                 "portfolio_value_used": portfolio_value,
                 "position_value_used": 0,
                 "blocked_reason": f"No position found for {symbol} in latest snapshot. Cannot sell.",
-                "last_price_used": None,
+                "snapshot_price_ref": None,
             }
 
         position_value = position.market_value or 0
@@ -112,7 +150,7 @@ def _plan_order(
                 "portfolio_value_used": portfolio_value,
                 "position_value_used": position_value,
                 "blocked_reason": f"Position quantity for {symbol} is {position_qty}. Cannot sell zero/negative.",
-                "last_price_used": None,
+                "snapshot_price_ref": None,
             }
 
         # Calculate the amount to sell as % of portfolio value applied to position
@@ -125,7 +163,7 @@ def _plan_order(
                 "portfolio_value_used": portfolio_value,
                 "position_value_used": position_value,
                 "blocked_reason": f"Position market_value for {symbol} is {position_value}. Cannot calculate.",
-                "last_price_used": None,
+                "snapshot_price_ref": None,
             }
 
         # Price per unit from position data
@@ -138,7 +176,7 @@ def _plan_order(
                 "portfolio_value_used": portfolio_value,
                 "position_value_used": position_value,
                 "blocked_reason": f"Derived price per unit for {symbol} is {price_per_unit}. Cannot calculate.",
-                "last_price_used": None,
+                "snapshot_price_ref": None,
             }
 
         # Quantity to sell — cannot exceed held quantity
@@ -155,7 +193,7 @@ def _plan_order(
                 "portfolio_value_used": portfolio_value,
                 "position_value_used": position_value,
                 "blocked_reason": f"Calculated sell quantity for {symbol} rounds to 0 (target_value={target_value:.2f}, price={price_per_unit:.2f}).",
-                "last_price_used": price_per_unit,
+                "snapshot_price_ref": price_per_unit,
             }
 
         return {
@@ -165,7 +203,7 @@ def _plan_order(
             "portfolio_value_used": portfolio_value,
             "position_value_used": position_value,
             "blocked_reason": "",
-            "last_price_used": price_per_unit,
+            "snapshot_price_ref": price_per_unit,
         }
 
     # --- Buy (increase position / new position) ---
@@ -181,7 +219,7 @@ def _plan_order(
             "portfolio_value_used": portfolio_value,
             "position_value_used": position.market_value if position else 0,
             "blocked_reason": f"Target buy value for {symbol} is 0. abs_pct={abs_pct}.",
-            "last_price_used": None,
+            "snapshot_price_ref": None,
         }
 
     # Need a price — from position or fail
@@ -199,7 +237,7 @@ def _plan_order(
             "portfolio_value_used": portfolio_value,
             "position_value_used": position.market_value if position else 0,
             "blocked_reason": f"No price reference for {symbol}. Cannot calculate buy quantity.",
-            "last_price_used": None,
+            "snapshot_price_ref": None,
         }
 
     # Don't buy more than available cash
@@ -214,7 +252,7 @@ def _plan_order(
             "portfolio_value_used": portfolio_value,
             "position_value_used": position.market_value if position else 0,
             "blocked_reason": f"Buy quantity for {symbol} rounds to 0 (buy_value={buy_value:.2f}, price={price_per_unit:.2f}, cash={cash:.2f}).",
-            "last_price_used": price_per_unit,
+            "snapshot_price_ref": price_per_unit,
         }
 
     return {
@@ -224,7 +262,7 @@ def _plan_order(
         "portfolio_value_used": portfolio_value,
         "position_value_used": position.market_value if position else 0,
         "blocked_reason": "",
-        "last_price_used": price_per_unit,
+        "snapshot_price_ref": price_per_unit,
     }
 
 
@@ -324,13 +362,33 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
             "position_value_used": plan["position_value_used"],
         })
 
+        # --- FRESH QUOTE (never use snapshot-derived price for broker) ---
+        quote = _get_fresh_quote(broker, action.symbol, plan["side"])
+        if not quote["available"]:
+            order_exec.status = "validation_failed"
+            order_exec.validation_status = "failed"
+            order_exec.blocked_reason = (
+                f"No fresh quote available for {action.symbol}. Cannot send order without live pricing."
+            )
+            order_exec.error_message = order_exec.blocked_reason
+            order_exec.completed_at = datetime.utcnow()
+
+            app_log(db, f"Orden {plan['side']} para {action.symbol} bloqueada: sin cotización fresca", context={
+                "order_execution_id": order_exec.id,
+                "symbol": action.symbol,
+            })
+            executions.append(_exec_summary(order_exec))
+            continue
+
         # --- BROKER EXECUTION ---
+        # price=quote["price"] → if None, broker sends precioMercado (market order)
+        # if quote has a fresh price, broker sends precioLimite with live price
         try:
             result = broker.place_order(
                 symbol=action.symbol,
                 side=plan["side"],
                 quantity=plan["quantity_planned"],
-                price=plan["last_price_used"],
+                price=quote["price"],
             )
 
             order_exec.broker_order_id = result.get("order_id", "")

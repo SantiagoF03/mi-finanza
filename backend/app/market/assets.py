@@ -135,6 +135,7 @@ def resolve_asset_type(
     symbol: str,
     positions: list[dict] | None = None,
     extra_map: dict[str, str] | None = None,
+    catalog_map: dict[str, str] | None = None,
 ) -> tuple[str, str]:
     """Resolve the asset_type for a symbol.
 
@@ -146,9 +147,10 @@ def resolve_asset_type(
     Resolution order:
     1. Positions (holdings) — direct lookup
     2. extra_map (caller-provided overrides)
-    3. KNOWN_ASSET_TYPES (static map)
-    4. Heuristic inference
-    5. Fallback to DESCONOCIDO / unknown
+    3. catalog_map (from InstrumentCatalog)
+    4. KNOWN_ASSET_TYPES (static map)
+    5. Heuristic inference
+    6. Fallback to DESCONOCIDO / unknown
     """
     if not symbol:
         return "DESCONOCIDO", "unknown"
@@ -168,21 +170,44 @@ def resolve_asset_type(
         status = "known_valid" if at in VALID_ASSET_TYPES else "unsupported"
         return at, status
 
-    # 3. From static known map
+    # 3. From InstrumentCatalog (dynamic discovery)
+    if catalog_map and symbol in catalog_map:
+        at = catalog_map[symbol]
+        if at and at != "DESCONOCIDO":
+            status = "known_valid" if at in VALID_ASSET_TYPES else "unsupported"
+            return at, status
+
+    # 4. From static known map
     if symbol in KNOWN_ASSET_TYPES:
         at = KNOWN_ASSET_TYPES[symbol]
         status = "known_valid" if at in VALID_ASSET_TYPES else "unsupported"
         return at, status
 
-    # 4. Heuristic: check suffix patterns
+    # 5. Heuristic: check suffix patterns
     upper = symbol.upper()
     for suffix, at in _SUFFIX_RULES:
         if len(upper) > 2 and upper.endswith(suffix):
             if at in VALID_ASSET_TYPES:
                 return at, "known_valid"
 
-    # 5. Unknown
+    # 6. Unknown
     return "DESCONOCIDO", "unknown"
+
+
+def build_catalog_asset_type_map(db) -> dict[str, str]:
+    """Build a symbol->asset_type map from the InstrumentCatalog table.
+
+    This avoids coupling resolve_asset_type to SQLAlchemy directly.
+    Import lazily to avoid circular imports.
+    """
+    from app.models.models import InstrumentCatalog
+
+    results = (
+        db.query(InstrumentCatalog.symbol, InstrumentCatalog.asset_type)
+        .filter(InstrumentCatalog.is_active == True)  # noqa: E712
+        .all()
+    )
+    return {r[0]: r[1] for r in results if r[1] and r[1] != "DESCONOCIDO"}
 
 
 def build_asset_type_map(
