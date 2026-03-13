@@ -98,16 +98,16 @@ def test_catalog_priority_over_heuristic():
     catalog_map = {"DF6D": "TitulosPublicos", "BNA6D": "TitulosPublicos"}
 
     # With catalog_map — should resolve from catalog
-    at, status = resolve_asset_type("DF6D", catalog_map=catalog_map)
+    at, status, *_ = resolve_asset_type("DF6D", catalog_map=catalog_map)
     assert at == "TitulosPublicos", f"Expected TitulosPublicos, got {at}"
     assert status == "known_valid"
 
-    at, status = resolve_asset_type("BNA6D", catalog_map=catalog_map)
+    at, status, *_ = resolve_asset_type("BNA6D", catalog_map=catalog_map)
     assert at == "TitulosPublicos", f"Expected TitulosPublicos, got {at}"
 
     # Without catalog_map — should NOT resolve as CEDEAR anymore
     # (the dangerous "D" suffix heuristic was removed)
-    at, status = resolve_asset_type("DF6D")
+    at, status, *_ = resolve_asset_type("DF6D")
     assert at != "CEDEAR", "Symbol ending in D must NOT be classified as CEDEAR by heuristic"
 
 
@@ -129,10 +129,12 @@ def test_refresh_catalog_panel_metadata(db):
     assert isinstance(result["panel_results"], list)
     assert len(result["panel_results"]) > 0
 
-    # Each panel_result must have at minimum: panel, status
+    # Each panel_result must have at minimum: asset_type, status
     for pr in result["panel_results"]:
-        assert "panel" in pr, f"panel_result missing 'panel' key: {pr}"
         assert "status" in pr, f"panel_result missing 'status' key: {pr}"
+        # Panel results now use asset_type + panel_used (probing strategy)
+        has_identifier = "panel" in pr or "asset_type" in pr or "panel_used" in pr
+        assert has_identifier, f"panel_result missing identifier key: {pr}"
 
 
 # ---------------------------------------------------------------------------

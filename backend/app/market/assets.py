@@ -47,6 +47,63 @@ KNOWN_ASSET_TYPES: dict[str, str] = {
     "BIOX": "CEDEAR",
     "VIST": "CEDEAR",
     "CAAP": "CEDEAR",
+    "VZ": "CEDEAR",
+    "JNJ": "CEDEAR",
+    "T": "CEDEAR",
+    "PFE": "CEDEAR",
+    "ABBV": "CEDEAR",
+    "MRK": "CEDEAR",
+    "XOM": "CEDEAR",
+    "CVX": "CEDEAR",
+    "HD": "CEDEAR",
+    "UNH": "CEDEAR",
+    "COST": "CEDEAR",
+    "CRM": "CEDEAR",
+    "ADBE": "CEDEAR",
+    "CSCO": "CEDEAR",
+    "TXN": "CEDEAR",
+    "QCOM": "CEDEAR",
+    "AVGO": "CEDEAR",
+    "ORCL": "CEDEAR",
+    "IBM": "CEDEAR",
+    "GE": "CEDEAR",
+    "CAT": "CEDEAR",
+    "DE": "CEDEAR",
+    "MMM": "CEDEAR",
+    "NKE": "CEDEAR",
+    "MCD": "CEDEAR",
+    "SBUX": "CEDEAR",
+    "LMT": "CEDEAR",
+    "RTX": "CEDEAR",
+    "HON": "CEDEAR",
+    "UPS": "CEDEAR",
+    "AXP": "CEDEAR",
+    "GS": "CEDEAR",
+    "MS": "CEDEAR",
+    "C": "CEDEAR",
+    "WFC": "CEDEAR",
+    "BRK.B": "CEDEAR",
+    "SNAP": "CEDEAR",
+    "UBER": "CEDEAR",
+    "SQ": "CEDEAR",
+    "SHOP": "CEDEAR",
+    "SE": "CEDEAR",
+    "SPOT": "CEDEAR",
+    "ZM": "CEDEAR",
+    "DOCU": "CEDEAR",
+    "ABNB": "CEDEAR",
+    "COIN": "CEDEAR",
+    "PYPL": "CEDEAR",
+    "SQ": "CEDEAR",
+    "X": "CEDEAR",
+    "FCX": "CEDEAR",
+    "NEM": "CEDEAR",
+    "BIDU": "CEDEAR",
+    "JD": "CEDEAR",
+    "NIO": "CEDEAR",
+    "LI": "CEDEAR",
+    "XPEV": "CEDEAR",
+    "ERJ": "CEDEAR",
     # ETFs
     "SPY": "ETF",
     "QQQ": "ETF",
@@ -137,13 +194,13 @@ def resolve_asset_type(
     positions: list[dict] | None = None,
     extra_map: dict[str, str] | None = None,
     catalog_map: dict[str, str] | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Resolve the asset_type for a symbol.
 
-    Returns (asset_type, status) where status is one of:
-    - "known_valid": type is known and in VALID_ASSET_TYPES
-    - "unknown": couldn't determine the type
-    - "unsupported": type is known but not in VALID_ASSET_TYPES
+    Returns (asset_type, status, source) where:
+    - status: "known_valid" | "unknown" | "unsupported"
+    - source: which layer resolved it:
+        "holdings", "extra_map", "catalog", "known_assets", "heuristic", "unknown"
 
     Resolution order:
     1. Positions (holdings) — direct lookup
@@ -154,7 +211,7 @@ def resolve_asset_type(
     6. Fallback to DESCONOCIDO / unknown
     """
     if not symbol:
-        return "DESCONOCIDO", "unknown"
+        return "DESCONOCIDO", "unknown", "unknown"
 
     # 1. From positions
     if positions:
@@ -163,36 +220,36 @@ def resolve_asset_type(
                 at = p.get("asset_type") or p.get("instrument_type") or ""
                 if at and at != "DESCONOCIDO":
                     status = "known_valid" if at in VALID_ASSET_TYPES else "unsupported"
-                    return at, status
+                    return at, status, "holdings"
 
     # 2. From extra_map (caller can pass additional mappings)
     if extra_map and symbol in extra_map:
         at = extra_map[symbol]
         status = "known_valid" if at in VALID_ASSET_TYPES else "unsupported"
-        return at, status
+        return at, status, "extra_map"
 
     # 3. From InstrumentCatalog (dynamic discovery)
     if catalog_map and symbol in catalog_map:
         at = catalog_map[symbol]
         if at and at != "DESCONOCIDO":
             status = "known_valid" if at in VALID_ASSET_TYPES else "unsupported"
-            return at, status
+            return at, status, "catalog"
 
     # 4. From static known map
     if symbol in KNOWN_ASSET_TYPES:
         at = KNOWN_ASSET_TYPES[symbol]
         status = "known_valid" if at in VALID_ASSET_TYPES else "unsupported"
-        return at, status
+        return at, status, "known_assets"
 
     # 5. Heuristic: check suffix patterns
     upper = symbol.upper()
     for suffix, at in _SUFFIX_RULES:
         if len(upper) > 2 and upper.endswith(suffix):
             if at in VALID_ASSET_TYPES:
-                return at, "known_valid"
+                return at, "known_valid", "heuristic"
 
     # 6. Unknown
-    return "DESCONOCIDO", "unknown"
+    return "DESCONOCIDO", "unknown", "unknown"
 
 
 def build_catalog_asset_type_map(db) -> dict[str, str]:
@@ -214,12 +271,12 @@ def build_catalog_asset_type_map(db) -> dict[str, str]:
 def build_asset_type_map(
     positions: list[dict],
     extra_symbols: set[str] | None = None,
-) -> dict[str, tuple[str, str]]:
+) -> dict[str, tuple[str, str, str]]:
     """Build a complete asset_type map for positions + extra symbols.
 
-    Returns dict of symbol -> (asset_type, asset_type_status).
+    Returns dict of symbol -> (asset_type, asset_type_status, resolution_source).
     """
-    result: dict[str, tuple[str, str]] = {}
+    result: dict[str, tuple[str, str, str]] = {}
 
     # All position symbols
     for p in positions:

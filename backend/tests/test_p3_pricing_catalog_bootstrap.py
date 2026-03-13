@@ -173,12 +173,12 @@ def test_catalog_symbol_resolves_asset_type(db):
     assert catalog_map["NEWSTOCK"] == "ACCIONES"
 
     # Resolve — should find it via catalog
-    asset_type, status = resolve_asset_type("NEWSTOCK", catalog_map=catalog_map)
+    asset_type, status, *_ = resolve_asset_type("NEWSTOCK", catalog_map=catalog_map)
     assert asset_type == "ACCIONES"
     assert status == "known_valid"
 
     # Without catalog_map, it would fall to DESCONOCIDO
-    asset_type_no_catalog, status_no_catalog = resolve_asset_type("NEWSTOCK")
+    asset_type_no_catalog, status_no_catalog, *_ = resolve_asset_type("NEWSTOCK")
     assert asset_type_no_catalog == "DESCONOCIDO"
     assert status_no_catalog == "unknown"
 

@@ -84,7 +84,7 @@ def generate_external_candidates(
     results = []
     for sym, c in candidates.items():
         tracking = classify_opportunity_status(sym, allowed_assets)
-        asset_type, asset_type_status = resolve_asset_type(sym, positions=positions, catalog_map=catalog_map)
+        asset_type, asset_type_status, asset_type_source = resolve_asset_type(sym, positions=positions, catalog_map=catalog_map)
         in_main = sym in main_allowed
 
         # --- Priority scoring (dynamic, reflects combined sources/signals) ---
@@ -149,6 +149,7 @@ def generate_external_candidates(
             "priority_score": round(score, 2),
             "asset_type": asset_type,
             "asset_type_status": asset_type_status,
+            "asset_type_source": asset_type_source,
             "asset_type_valid": asset_type_status == "known_valid",
             "reason": best_news["reason"] if best_news else f"Observado desde {', '.join(sorted(c['source_types']))}",
             "confidence": best_news["confidence"] if best_news else 0.3,
