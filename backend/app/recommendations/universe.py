@@ -34,17 +34,23 @@ def build_allowed_assets(snapshot_positions: list[dict], catalog_symbols: set[st
 
     catalog_symbols: set of eligible symbols from instrument_catalog (dynamic).
     If None, only manual config is used (backward compatible).
+
+    Layers (distinct semantics):
+    - catalog_dynamic: raw IOL-discovered instruments (bruto dinámico)
+    - universe_curated: manual MARKET_UNIVERSE_ASSETS config only
+    - universe: union of catalog_dynamic + universe_curated (análisis)
+    - main_allowed: holdings | whitelist (capa de seguridad para operable)
     """
     settings = get_settings()
 
     holdings = {p.get("symbol") for p in snapshot_positions if p.get("symbol")}
     whitelist = set(settings.whitelist_assets)
     watchlist = set(settings.watchlist_assets)
-    manual_universe = set(settings.market_universe_assets)
+    universe_curated = set(settings.market_universe_assets)
     catalog_dynamic = catalog_symbols or set()
 
-    # Universe = manual config + dynamic catalog
-    universe = manual_universe | catalog_dynamic
+    # Universe = manual curated + dynamic catalog (for analysis breadth)
+    universe = universe_curated | catalog_dynamic
 
     main_allowed = holdings | whitelist
     external_allowed = watchlist | universe
@@ -54,8 +60,9 @@ def build_allowed_assets(snapshot_positions: list[dict], catalog_symbols: set[st
         "holdings": holdings,
         "whitelist": whitelist,
         "watchlist": watchlist,
-        "universe": universe,
+        "universe_curated": universe_curated,
         "catalog_dynamic": catalog_dynamic,
+        "universe": universe,
         "main_allowed": main_allowed,
         "external_allowed": external_allowed,
         "all_known": all_known,

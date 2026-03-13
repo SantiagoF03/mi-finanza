@@ -7,6 +7,7 @@ from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.market.candidates import generate_external_candidates
+from app.market.assets import build_catalog_asset_type_map
 from app.market.discovery import get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.ingestion import get_engine_eligible_news, get_llm_eligible_news, run_ingestion
@@ -51,13 +52,19 @@ def _supersede_open_recommendations(db: Session, new_id: int) -> None:
             rec.superseded_at = datetime.utcnow()
 
 
-def _load_news_items(snapshot_positions: list[dict]) -> tuple[list[dict], str]:
-    """Legacy news loading — used only for NewsEvent persistence (backward compat)."""
+def _load_news_items(snapshot_positions: list[dict]) -> tuple[list[dict], str, bool]:
+    """Legacy news loading — used only for NewsEvent persistence (backward compat).
+
+    Returns (items, source_label, is_mock) where is_mock=True when MockNewsProvider
+    is the actual data source (whether directly or via fallback).
+    """
     provider = get_news_provider()
     symbols = [p.get("symbol") for p in snapshot_positions if p.get("symbol")]
 
     items = []
     source = provider.__class__.__name__
+    is_mock = isinstance(provider, MockNewsProvider)
+
     try:
         items = deduplicate_news_items(provider.get_recent_news(symbols))
     except Exception:
@@ -65,10 +72,11 @@ def _load_news_items(snapshot_positions: list[dict]) -> tuple[list[dict], str]:
 
     if not items and not isinstance(provider, MockNewsProvider):
         mock_provider = MockNewsProvider()
-        source = f"{provider.__class__.__name__}->MockNewsProvider"
+        source = f"{provider.__class__.__name__}->MockNewsProvider(fallback)"
         items = deduplicate_news_items(mock_provider.get_recent_news(symbols))
+        is_mock = True
 
-    return items, source
+    return items, source, is_mock
 
 
 def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int:
@@ -139,7 +147,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         db.add(PortfolioPosition(snapshot_id=snapshot.id, **p))
 
     # --- Legacy news persistence (backward compat for NewsEvent table) ---
-    news_items, news_source = _load_news_items(positions)
+    news_items, news_source, news_is_mock = _load_news_items(positions)
     inserted_news = _persist_news_without_duplicates(db, news_items)
 
     # --- Ingestion: ensure triage pipeline has run (best-effort) ---
@@ -207,6 +215,12 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     except Exception:
         catalog_symbols = set()
 
+    # Build catalog_map for asset_type classification priority
+    try:
+        catalog_map = build_catalog_asset_type_map(db)
+    except Exception:
+        catalog_map = {}
+
     allowed_assets = build_allowed_assets(positions, catalog_symbols=catalog_symbols)
     rec = generate_recommendation(snapshot_dict, analysis, engine_news, settings.max_movement_per_cycle)
 
@@ -215,6 +229,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         news_opportunities=rec.get("external_opportunities", []),
         allowed_assets=allowed_assets,
         positions=positions,
+        catalog_map=catalog_map,
     )
 
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
@@ -270,6 +285,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "source": source,
             "broker_mode": broker_mode,
             "news_source": news_source,
+            "news_is_mock": news_is_mock,
             "news_inserted": inserted_news,
             "news_used_engine": len(engine_news),
             "news_used_llm": len(llm_news_items),
@@ -279,8 +295,10 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
                 "holdings": sorted(allowed_assets["holdings"]),
                 "whitelist": sorted(allowed_assets["whitelist"]),
                 "watchlist": sorted(allowed_assets["watchlist"]),
-                "universe": sorted(list(allowed_assets["universe"])[:50]),  # cap for metadata size
+                "universe_curated": sorted(allowed_assets.get("universe_curated", set())),
+                "catalog_dynamic": sorted(list(allowed_assets.get("catalog_dynamic", set()))[:50]),
                 "catalog_dynamic_count": len(allowed_assets.get("catalog_dynamic", set())),
+                "universe": sorted(list(allowed_assets["universe"])[:50]),  # cap for metadata size
                 "main_allowed": sorted(allowed_assets["main_allowed"]),
             },
             "unchanged": unchanged,

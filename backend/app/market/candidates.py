@@ -25,11 +25,14 @@ def generate_external_candidates(
     news_opportunities: list[dict],
     allowed_assets: dict,
     positions: list[dict],
+    catalog_map: dict[str, str] | None = None,
 ) -> list[dict]:
     """Build the full set of external opportunity candidates.
 
     Merges news-based opportunities with watchlist/universe candidates.
     Deduplicates by symbol, keeping the highest-priority entry and merging sources.
+
+    catalog_map: symbol->asset_type from InstrumentCatalog (for classification priority).
     """
     held_symbols = {p.get("symbol") for p in positions if p.get("symbol")}
     main_allowed = allowed_assets.get("main_allowed", set())
@@ -81,7 +84,7 @@ def generate_external_candidates(
     results = []
     for sym, c in candidates.items():
         tracking = classify_opportunity_status(sym, allowed_assets)
-        asset_type, asset_type_status = resolve_asset_type(sym, positions=positions)
+        asset_type, asset_type_status = resolve_asset_type(sym, positions=positions, catalog_map=catalog_map)
         in_main = sym in main_allowed
 
         # --- Priority scoring (dynamic, reflects combined sources/signals) ---
