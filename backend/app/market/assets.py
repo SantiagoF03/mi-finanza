@@ -125,9 +125,10 @@ KNOWN_ASSET_TYPES: dict[str, str] = {
 }
 
 # Heuristic patterns: suffix/prefix -> asset_type
+# NOTE: ("D", "CEDEAR") was removed — too aggressive, catches letras like XN6D, DF6D.
+# Real CEDEARs are covered by KNOWN_ASSET_TYPES or InstrumentCatalog.
 _SUFFIX_RULES: list[tuple[str, str]] = [
     ("O", "ON"),        # ONs typically end in O
-    ("D", "CEDEAR"),    # Some CEDEARs end in D
 ]
 
 

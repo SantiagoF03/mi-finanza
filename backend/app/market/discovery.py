@@ -62,18 +62,23 @@ def refresh_instrument_catalog(db: Session, force_seed: bool = False) -> dict:
     now = datetime.now(timezone.utc)
 
     instruments_found: list[dict] = []
+    panel_results: list[dict] = []
 
     # Try IOL real discovery if credentials are available
     if settings.broker_mode == "real" and settings.iol_username and not force_seed:
         try:
-            instruments_found = _discover_from_iol()
+            instruments_found, panel_results = _discover_from_iol()
         except Exception as exc:
             logger.warning("IOL discovery failed, falling back to static seed: %s", exc)
             instruments_found = []
+            panel_results = [{"panel": "all", "status": "error", "error": str(exc)[:200]}]
 
     # Fallback or supplement: static seed from KNOWN_ASSET_TYPES
     if not instruments_found or force_seed:
         instruments_found = _seed_from_static()
+        if not panel_results:
+            panel_results = [{"panel": "static_seed", "status": "ok",
+                              "instruments_found": len(instruments_found)}]
 
     # Upsert into DB
     created = 0
@@ -158,15 +163,28 @@ def refresh_instrument_catalog(db: Session, force_seed: bool = False) -> dict:
         "deactivated": deactivated,
         "total_active": total,
         "symbols_found": len(seen_symbols),
+        "panel_results": panel_results,
     }
 
 
-def _discover_from_iol() -> list[dict]:
-    """Query IOL cotizaciones panels to discover instruments."""
+def _discover_from_iol() -> tuple[list[dict], list[dict]]:
+    """Query IOL cotizaciones panels to discover instruments.
+
+    Returns (instruments, panel_results) where panel_results is a list of
+    per-panel metadata dicts for observability.
+    """
     client = IolBrokerClient()
     instruments = []
+    panel_results = []
 
     for panel_path, our_type in _IOL_PANELS:
+        panel_meta = {
+            "panel": panel_path,
+            "asset_type": our_type,
+            "status": "pending",
+            "instruments_found": 0,
+            "error": None,
+        }
         try:
             resp = client._authorized_get(f"/api/v2/{panel_path}")
             data = resp.json()
@@ -178,6 +196,7 @@ def _discover_from_iol() -> list[dict]:
             elif isinstance(data, dict):
                 items = data.get("titulos", [])
 
+            panel_count = 0
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -200,11 +219,18 @@ def _discover_from_iol() -> list[dict]:
                         "variacion": item.get("variacionPorcentual"),
                     },
                 })
-        except Exception as exc:
-            logger.warning("Failed to fetch IOL panel %s: %s", panel_path, exc)
-            continue
+                panel_count += 1
 
-    return instruments
+            panel_meta["status"] = "ok" if panel_count > 0 else "empty"
+            panel_meta["instruments_found"] = panel_count
+        except Exception as exc:
+            panel_meta["status"] = "error"
+            panel_meta["error"] = str(exc)[:200]
+            logger.warning("Failed to fetch IOL panel %s: %s", panel_path, exc)
+
+        panel_results.append(panel_meta)
+
+    return instruments, panel_results
 
 
 def _seed_from_static() -> list[dict]:
