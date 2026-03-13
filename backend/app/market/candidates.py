@@ -1,9 +1,10 @@
 """Candidate sourcing for external opportunities.
 
-Generates external opportunity candidates from three sources:
-1. News (existing: news.related_assets for non-held symbols)
-2. Watchlist (WATCHLIST_ASSETS config)
-3. Market universe (MARKET_UNIVERSE_ASSETS config)
+Generates external opportunity candidates from four sources (priority order):
+1. Instrument catalog (dynamic discovery from IOL — PRIMARY source)
+2. News (existing: news.related_assets for non-held symbols)
+3. Watchlist (WATCHLIST_ASSETS config)
+4. Market universe (MARKET_UNIVERSE_ASSETS config — manual fallback)
 
 Each candidate gets a consistent set of fields:
 - symbol, source_types, tracking_status
@@ -52,7 +53,15 @@ def generate_external_candidates(
             "impact": op.get("impact", "neutro"),
         })
 
-    # 2. Watchlist candidates
+    # 2. Catalog candidates (PRIMARY external source — dynamic from IOL discovery)
+    for sym in allowed_assets.get("catalog_dynamic", set()):
+        if sym in held_symbols:
+            continue
+        if sym not in candidates:
+            candidates[sym] = _empty_candidate(sym)
+        candidates[sym]["source_types"].add("catalog")
+
+    # 3. Watchlist candidates
     for sym in allowed_assets.get("watchlist", set()):
         if sym in held_symbols:
             continue
@@ -60,7 +69,7 @@ def generate_external_candidates(
             candidates[sym] = _empty_candidate(sym)
         candidates[sym]["source_types"].add("watchlist")
 
-    # 3. Universe candidates
+    # 4. Universe candidates (includes catalog + manual)
     for sym in allowed_assets.get("universe", set()):
         if sym in held_symbols:
             continue
@@ -83,6 +92,8 @@ def generate_external_candidates(
             score += 0.4
             best_conf = max((s["confidence"] for s in c["news_signals"]), default=0.5)
             score += best_conf * 0.3
+        if "catalog" in c["source_types"]:
+            score += 0.25  # catalog is primary dynamic source
         if "watchlist" in c["source_types"]:
             score += 0.2
         if "universe" in c["source_types"]:
@@ -103,7 +114,7 @@ def generate_external_candidates(
         # --- Actionable semantics ---
         # actionable_external: is this worth tracking as an external opportunity?
         #   True if in watchlist/universe AND type is not unsupported
-        actionable = tracking in ("watchlist", "in_universe")
+        actionable = tracking in ("catalog", "watchlist", "in_universe")
         if asset_type_status == "unsupported":
             actionable = False
 
@@ -161,6 +172,7 @@ def _build_actionable_reason(
 
     # Where is it tracked?
     tracking_label = {
+        "catalog": "En catálogo IOL (descubierto)",
         "watchlist": "En watchlist",
         "in_universe": "En universo de mercado",
         "in_holdings": "En cartera (holding)",

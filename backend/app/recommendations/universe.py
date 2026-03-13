@@ -72,12 +72,15 @@ def classify_opportunity_status(symbol: str, allowed_assets: dict) -> str:
 
     Returns:
     - "in_holdings": already held, should be in main actions not external
+    - "catalog": discovered via IOL instrument catalog (PRIMARY external source)
     - "watchlist": in watchlist, tracked for opportunities
     - "in_universe": in broader universe, eligible for opportunity
     - "untracked": not in any configured set
     """
     if symbol in allowed_assets.get("holdings", set()):
         return "in_holdings"
+    if symbol in allowed_assets.get("catalog_dynamic", set()):
+        return "catalog"
     if symbol in allowed_assets.get("watchlist", set()):
         return "watchlist"
     if symbol in allowed_assets.get("universe", set()):

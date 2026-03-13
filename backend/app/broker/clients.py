@@ -362,42 +362,66 @@ class IolBrokerClient(BrokerClient):
         resp.raise_for_status()
         return resp
 
-    def place_order(self, symbol: str, side: str, quantity: float, price: float | None = None) -> dict:
-        """Place an order via IOL API.
+    # Mapping from internal side to IOL-specific endpoint
+    _IOL_SIDE_ENDPOINTS: dict[str, str] = {
+        "sell": "/api/v2/operar/Vender",
+        "buy": "/api/v2/operar/Comprar",
+    }
 
-        Returns dict with at least: order_id, status, raw_response.
-        side: 'buy' or 'sell' (mapped to IOL compra/venta).
+    def place_order(self, symbol: str, side: str, quantity: float, price: float | None = None) -> dict:
+        """Place an order via IOL API using the correct side-specific endpoint.
+
+        - sell → POST /api/v2/operar/Vender
+        - buy  → POST /api/v2/operar/Comprar
+
+        Returns dict with at least: order_id, status, endpoint_used, raw_response.
         """
-        iol_side = "compra" if side == "buy" else "venta"
-        # IOL V2 endpoint for placing orders
+        endpoint = self._IOL_SIDE_ENDPOINTS.get(side)
+        if not endpoint:
+            return {
+                "order_id": "",
+                "status": "error",
+                "error": f"Side '{side}' no soportado. Válidos: sell, buy",
+                "endpoint_used": "",
+                "raw_response": {},
+            }
+
         body = {
             "mercado": "bCBA",
             "simbolo": symbol,
             "cantidad": int(quantity),
             "precio": price or 0,
             "plazo": "t2",
-            "operacion": iol_side,
+            "tipoOrden": "precioLimite" if price else "precioMercado",
         }
         try:
-            resp = self._authorized_post("/api/v2/operar", json_body=body)
+            resp = self._authorized_post(endpoint, json_body=body)
             data = resp.json()
             return {
                 "order_id": str(data.get("numeroOperacion", "")),
                 "status": "sent",
+                "endpoint_used": endpoint,
                 "raw_response": data,
             }
         except httpx.HTTPStatusError as exc:
+            raw = {}
+            try:
+                raw = exc.response.json() if exc.response else {}
+            except Exception:
+                raw = {"status_code": exc.response.status_code if exc.response else None}
             return {
                 "order_id": "",
                 "status": "rejected",
                 "error": str(exc),
-                "raw_response": exc.response.json() if exc.response else {},
+                "endpoint_used": endpoint,
+                "raw_response": raw,
             }
         except Exception as exc:
             return {
                 "order_id": "",
                 "status": "error",
                 "error": str(exc),
+                "endpoint_used": endpoint,
                 "raw_response": {},
             }
 
@@ -466,6 +490,7 @@ class MockBrokerClient(BrokerClient):
     def place_order(self, symbol: str, side: str, quantity: float, price: float | None = None) -> dict:
         """Mock order placement — always succeeds."""
         import uuid
+        endpoint = f"/api/v2/operar/{'Vender' if side == 'sell' else 'Comprar'}"
         order_id = f"MOCK-{uuid.uuid4().hex[:8].upper()}"
         order = {
             "order_id": order_id,
@@ -474,6 +499,7 @@ class MockBrokerClient(BrokerClient):
             "side": side,
             "quantity": quantity,
             "price": price or 100.0,
+            "endpoint_used": endpoint,
             "raw_response": {"mock": True, "numeroOperacion": order_id},
         }
         self._mock_orders.append(order)
