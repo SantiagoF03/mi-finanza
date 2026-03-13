@@ -18,47 +18,47 @@ from app.portfolio.profiles import PROFILE_PRESETS, build_target_weights
 def test_resolve_from_positions():
     """Position-based lookup takes priority."""
     positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"}]
-    at, status = resolve_asset_type("AAPL", positions=positions)
+    at, status, *_ = resolve_asset_type("AAPL", positions=positions)
     assert at == "CEDEAR"
     assert status == "known_valid"
 
 
 def test_resolve_from_known_map():
     """Static KNOWN_ASSET_TYPES map resolves symbols not in positions."""
-    at, status = resolve_asset_type("TSLA", positions=[])
+    at, status, *_ = resolve_asset_type("TSLA", positions=[])
     assert at == "CEDEAR"
     assert status == "known_valid"
 
 
 def test_resolve_etf_from_known_map():
-    at, status = resolve_asset_type("SPY", positions=[])
+    at, status, *_ = resolve_asset_type("SPY", positions=[])
     assert at == "ETF"
     assert status == "known_valid"
 
 
 def test_resolve_bono_from_known_map():
-    at, status = resolve_asset_type("AL30", positions=[])
+    at, status, *_ = resolve_asset_type("AL30", positions=[])
     assert at == "BONO"
     assert status == "known_valid"
 
 
 def test_resolve_unknown_symbol():
     """Completely unknown symbol returns DESCONOCIDO / unknown."""
-    at, status = resolve_asset_type("XYZABC123", positions=[])
+    at, status, *_ = resolve_asset_type("XYZABC123", positions=[])
     assert at == "DESCONOCIDO"
     assert status == "unknown"
 
 
 def test_resolve_with_extra_map():
     """Caller-provided extra_map overrides for symbols not in positions."""
-    at, status = resolve_asset_type("CUSTOM", extra_map={"CUSTOM": "CEDEAR"})
+    at, status, *_ = resolve_asset_type("CUSTOM", extra_map={"CUSTOM": "CEDEAR"})
     assert at == "CEDEAR"
     assert status == "known_valid"
 
 
 def test_resolve_extra_map_unsupported():
     """Extra map with an unsupported type returns unsupported status."""
-    at, status = resolve_asset_type("CRYPTO", extra_map={"CRYPTO": "CRYPTOCURRENCY"})
+    at, status, *_ = resolve_asset_type("CRYPTO", extra_map={"CRYPTO": "CRYPTOCURRENCY"})
     assert at == "CRYPTOCURRENCY"
     assert status == "unsupported"
 
@@ -66,13 +66,13 @@ def test_resolve_extra_map_unsupported():
 def test_resolve_positions_take_priority_over_known_map():
     """If positions say something different, positions win."""
     positions = [{"symbol": "SPY", "asset_type": "ACCIONES"}]
-    at, status = resolve_asset_type("SPY", positions=positions)
+    at, status, *_ = resolve_asset_type("SPY", positions=positions)
     assert at == "ACCIONES"
     assert status == "known_valid"
 
 
 def test_resolve_empty_symbol():
-    at, status = resolve_asset_type("")
+    at, status, *_ = resolve_asset_type("")
     assert at == "DESCONOCIDO"
     assert status == "unknown"
 
@@ -81,8 +81,8 @@ def test_build_asset_type_map():
     """build_asset_type_map combines positions and extra symbols."""
     positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"}]
     result = build_asset_type_map(positions, extra_symbols={"TSLA", "XYZUNK"})
-    assert result["AAPL"] == ("CEDEAR", "known_valid")
-    assert result["TSLA"] == ("CEDEAR", "known_valid")
+    assert result["AAPL"][:2] == ("CEDEAR", "known_valid")
+    assert result["TSLA"][:2] == ("CEDEAR", "known_valid")
     assert result["XYZUNK"][1] == "unknown"
 
 

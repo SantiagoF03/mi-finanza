@@ -33,17 +33,23 @@ from app.recommendations.universe import VALID_ASSET_TYPES
 logger = logging.getLogger(__name__)
 
 # IOL cotizaciones panels to query per instrument type.
-# Format: (instrument_type_path, pais, panel, our_asset_type)
-# Assumption: IOL exposes GET /api/v2/{Cotizaciones}/{tipo}/{pais}/{panel}
-_IOL_PANELS = [
-    ("Cotizaciones/acciones/argentina/Merval", "ACCIONES"),
-    ("Cotizaciones/acciones/argentina/Panel%20General", "ACCIONES"),
-    ("Cotizaciones/cedears/argentina/CEDEARs", "CEDEAR"),
-    ("Cotizaciones/bonos/argentina/Todos", "BONO"),
-    ("Cotizaciones/letras/argentina/Todos", "TitulosPublicos"),
-    ("Cotizaciones/obligaciones_negociables/argentina/Todos", "ON"),
-    ("Cotizaciones/etf/argentina/Todos", "ETF"),
-    ("Cotizaciones/fci/argentina/Todos", "FondoComundeInversion"),
+# Format: (list_of_path_variants, our_asset_type)
+# IOL panel names vary — we try multiple variants per category.
+# The first path that returns a 2xx response is used; others are skipped.
+_IOL_PANELS: list[tuple[list[str], str]] = [
+    (["Cotizaciones/acciones/argentina/Todos",
+      "Cotizaciones/acciones/argentina/Merval",
+      "Cotizaciones/acciones/argentina/Panel%20General"], "ACCIONES"),
+    (["Cotizaciones/cedears/argentina/Todos",
+      "Cotizaciones/cedears/argentina/CEDEARs"], "CEDEAR"),
+    (["Cotizaciones/bonos/argentina/Todos"], "BONO"),
+    (["Cotizaciones/letras/argentina/Todos"], "TitulosPublicos"),
+    (["Cotizaciones/obligacionesNegociables/argentina/Todos",
+      "Cotizaciones/obligaciones_negociables/argentina/Todos"], "ON"),
+    (["Cotizaciones/etf/argentina/Todos",
+      "Cotizaciones/ETFs/argentina/Todos"], "ETF"),
+    (["Cotizaciones/fci/argentina/Todos",
+      "Cotizaciones/FCI/argentina/Todos"], "FondoComundeInversion"),
 ]
 
 # Asset types allowed for the catalog
@@ -210,6 +216,9 @@ def refresh_instrument_catalog(db: Session, force_seed: bool = False) -> dict:
 def _discover_from_iol() -> tuple[list[dict], list[dict]]:
     """Query IOL cotizaciones panels to discover instruments.
 
+    For each asset type category, tries multiple panel path variants until
+    one succeeds (returns 2xx with data). This handles IOL's varying naming.
+
     Returns (instruments, panel_results) where panel_results is a list of
     per-panel metadata dicts for observability.
     """
@@ -217,56 +226,81 @@ def _discover_from_iol() -> tuple[list[dict], list[dict]]:
     instruments = []
     panel_results = []
 
-    for panel_path, our_type in _IOL_PANELS:
+    for path_variants, our_type in _IOL_PANELS:
         panel_meta = {
-            "panel": panel_path,
             "asset_type": our_type,
-            "status": "pending",
+            "status": "no_valid_panel",
             "instruments_found": 0,
             "error": None,
+            "panel_used": None,
+            "variants_tried": [],
         }
-        try:
-            resp = client._authorized_get(f"/api/v2/{panel_path}")
-            data = resp.json()
 
-            # IOL returns either a dict with "titulos" or a list directly
-            items = []
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = data.get("titulos", [])
+        for panel_path in path_variants:
+            variant_result = {"path": panel_path, "status": "pending", "error": None}
+            try:
+                resp = client._authorized_get(f"/api/v2/{panel_path}")
+                data = resp.json()
 
-            panel_count = 0
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                symbol = (item.get("simbolo") or item.get("symbol") or "").strip()
-                if not symbol:
-                    continue
+                # IOL returns either a dict with "titulos" or a list directly
+                items = []
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    items = data.get("titulos", [])
 
-                instruments.append({
-                    "symbol": symbol,
-                    "name": item.get("descripcion", ""),
-                    "asset_type": our_type,
-                    "currency": _map_currency(item.get("moneda")),
-                    "last_price": _safe_float(item.get("ultimoPrecio")),
-                    "avg_volume": _safe_float(item.get("volumen")),
-                    "source": "iol_cotizaciones",
-                    "source_category": panel_path.split("/")[-1] if "/" in panel_path else "",
-                    "market": "BCBA",
-                    "metadata": {
-                        "panel": panel_path,
-                        "variacion": item.get("variacionPorcentual"),
-                    },
-                })
-                panel_count += 1
+                panel_count = 0
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    symbol = (item.get("simbolo") or item.get("symbol") or "").strip()
+                    if not symbol:
+                        continue
 
-            panel_meta["status"] = "ok" if panel_count > 0 else "empty"
-            panel_meta["instruments_found"] = panel_count
-        except Exception as exc:
-            panel_meta["status"] = "error"
-            panel_meta["error"] = str(exc)[:200]
-            logger.warning("Failed to fetch IOL panel %s: %s", panel_path, exc)
+                    instruments.append({
+                        "symbol": symbol,
+                        "name": item.get("descripcion", ""),
+                        "asset_type": our_type,
+                        "currency": _map_currency(item.get("moneda")),
+                        "last_price": _safe_float(item.get("ultimoPrecio")),
+                        "avg_volume": _safe_float(item.get("volumen")),
+                        "source": "iol_cotizaciones",
+                        "source_category": panel_path.split("/")[-1] if "/" in panel_path else "",
+                        "market": "BCBA",
+                        "metadata": {
+                            "panel": panel_path,
+                            "variacion": item.get("variacionPorcentual"),
+                        },
+                    })
+                    panel_count += 1
+
+                variant_result["status"] = "ok" if panel_count > 0 else "empty"
+                variant_result["instruments_found"] = panel_count
+                panel_meta["variants_tried"].append(variant_result)
+
+                if panel_count > 0:
+                    # This variant worked — use it
+                    panel_meta["status"] = "ok"
+                    panel_meta["instruments_found"] = panel_count
+                    panel_meta["panel_used"] = panel_path
+                    break  # stop trying variants for this type
+
+            except Exception as exc:
+                variant_result["status"] = "error"
+                variant_result["error"] = str(exc)[:200]
+                panel_meta["variants_tried"].append(variant_result)
+                logger.warning("Failed to fetch IOL panel %s: %s", panel_path, exc)
+                continue
+
+        # If no variant succeeded, summarize
+        if panel_meta["status"] == "no_valid_panel":
+            errors = [v.get("error", "") for v in panel_meta["variants_tried"] if v.get("error")]
+            if errors:
+                panel_meta["status"] = "error"
+                panel_meta["error"] = f"All {len(path_variants)} variants failed. Last: {errors[-1][:150]}"
+            else:
+                panel_meta["status"] = "empty"
+                panel_meta["error"] = f"All {len(path_variants)} variants returned empty"
 
         panel_results.append(panel_meta)
 
