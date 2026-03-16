@@ -11,7 +11,7 @@ from app.market.assets import build_catalog_asset_type_map
 from app.market.discovery import get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.ingestion import get_engine_eligible_news, get_llm_eligible_news, run_ingestion
-from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider
+from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider, get_provider_info
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
 from app.recommendations.unchanged import detect_unchanged
@@ -149,6 +149,12 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     # --- Legacy news persistence (backward compat for NewsEvent table) ---
     news_items, news_source, news_is_mock = _load_news_items(positions)
     inserted_news = _persist_news_without_duplicates(db, news_items)
+
+    # Provider observability
+    try:
+        news_provider_info = get_provider_info(get_news_provider())
+    except Exception:
+        news_provider_info = {"provider_class": "unknown", "is_mock": True}
 
     # --- Ingestion: ensure triage pipeline has run (best-effort) ---
     ingestion_meta = {}
@@ -289,6 +295,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_inserted": inserted_news,
             "news_used_engine": len(engine_news),
             "news_used_llm": len(llm_news_items),
+            "news_provider_info": news_provider_info,
             "ingestion": ingestion_meta,
             "external_opportunities": rec.get("external_opportunities", []),
             "allowed_assets": {

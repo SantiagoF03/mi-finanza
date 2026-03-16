@@ -69,23 +69,72 @@ class MockNewsProvider(NewsProvider):
 
 
 class RssNewsProvider(NewsProvider):
+    """Real RSS news provider with recency filtering.
+
+    Applies hard recency windows: hard news ≤24h, macro/sectorial ≤48h.
+    Tracks per-feed fetch status for observability.
+    """
+
+    # Recency windows by event type (hours)
+    _RECENCY_LIMITS: dict[str, float] = {
+        "earnings": 24, "guidance": 24, "tasas": 24,
+        "geopolítico": 24, "regulatorio": 48, "inflación": 48,
+        "sectorial": 48, "ia": 48, "otro": 24,
+    }
+
     def __init__(self, urls: list[str], timeout_seconds: int, max_items: int) -> None:
         self.urls = urls
         self.timeout_seconds = timeout_seconds
         self.max_items = max_items
+        self.last_fetch_stats: dict = {}
 
     def get_recent_news(self, portfolio_symbols: list[str]) -> list[dict]:
         items: list[dict] = []
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        feed_stats: list[dict] = []
+
         with httpx.Client(timeout=self.timeout_seconds) as client:
             for url in self.urls:
                 try:
                     resp = client.get(url)
                     resp.raise_for_status()
-                    items.extend(parse_rss_items(resp.text, portfolio_symbols))
-                except Exception:
+                    feed_items = parse_rss_items(resp.text, portfolio_symbols)
+                    # Tag source from feed URL domain
+                    domain = url.split("//")[-1].split("/")[0].replace("www.", "")
+                    for fi in feed_items:
+                        fi["source"] = fi.get("source") or domain
+                    items.extend(feed_items)
+                    feed_stats.append({"url": url, "status": "ok", "items": len(feed_items)})
+                except Exception as exc:
+                    feed_stats.append({"url": url, "status": "error", "error": str(exc)[:100]})
                     continue
-        items.sort(key=lambda x: x["created_at"], reverse=True)
-        return deduplicate_news_items(items)[: self.max_items]
+
+        # Recency filter: drop items older than their event_type window
+        filtered = []
+        for item in items:
+            created = item.get("created_at")
+            if created:
+                age_hours = max(0.0, (now - created).total_seconds() / 3600)
+                event_type = item.get("event_type", "otro")
+                max_age = self._RECENCY_LIMITS.get(event_type, 24)
+                if age_hours > max_age:
+                    continue
+            filtered.append(item)
+
+        filtered.sort(key=lambda x: x.get("created_at") or now, reverse=True)
+        deduped = deduplicate_news_items(filtered)
+
+        self.last_fetch_stats = {
+            "feeds_attempted": len(self.urls),
+            "feeds_ok": sum(1 for f in feed_stats if f["status"] == "ok"),
+            "total_raw": len(items),
+            "after_recency_filter": len(filtered),
+            "after_dedup": len(deduped),
+            "returned": min(len(deduped), self.max_items),
+            "feed_details": feed_stats,
+        }
+
+        return deduped[: self.max_items]
 
 
 def extract_market_symbols(text: str) -> list[str]:
@@ -185,13 +234,33 @@ def parse_rss_items(xml_text: str, portfolio_symbols: list[str]) -> list[dict]:
 
 
 def deduplicate_news_items(items: Iterable[dict]) -> list[dict]:
+    """Deduplicate news items by title+summary AND by URL.
+
+    Uses three dedup keys:
+    1. Normalized title (lowercase, stripped)
+    2. URL (if present, canonicalized)
+    3. Title+summary combination (original)
+    """
     deduped = []
-    seen: set[str] = set()
+    seen_titles: set[str] = set()
+    seen_urls: set[str] = set()
     for item in items:
-        key = f"{item.get('title','').strip().lower()}|{item.get('summary','').strip().lower()}"
-        if key in seen:
+        title_norm = (item.get("title") or "").strip().lower()
+        summary_norm = (item.get("summary") or "").strip().lower()
+        url_raw = (item.get("url") or item.get("link") or "").strip().lower()
+
+        # Title-based dedup
+        title_key = f"{title_norm}|{summary_norm}"
+        if title_key in seen_titles:
             continue
-        seen.add(key)
+
+        # URL-based dedup (skip empty/generic URLs)
+        if url_raw and url_raw not in ("http://", "https://", ""):
+            if url_raw in seen_urls:
+                continue
+            seen_urls.add(url_raw)
+
+        seen_titles.add(title_key)
         deduped.append(item)
     return deduped
 
@@ -201,3 +270,18 @@ def get_news_provider() -> NewsProvider:
     if settings.news_provider == "rss":
         return RssNewsProvider(settings.news_rss_urls, settings.news_timeout_seconds, settings.news_max_items)
     return MockNewsProvider()
+
+
+def get_provider_info(provider: NewsProvider) -> dict:
+    """Return observability info about the news provider being used."""
+    is_mock = isinstance(provider, MockNewsProvider)
+    info: dict = {
+        "provider_class": provider.__class__.__name__,
+        "is_mock": is_mock,
+    }
+    if isinstance(provider, RssNewsProvider):
+        info["feeds_configured"] = len(provider.urls)
+        info["max_items"] = provider.max_items
+        if provider.last_fetch_stats:
+            info["last_fetch_stats"] = provider.last_fetch_stats
+    return info
