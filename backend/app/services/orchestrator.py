@@ -79,6 +79,13 @@ def _load_news_items(snapshot_positions: list[dict]) -> tuple[list[dict], str, b
     return items, source, is_mock
 
 
+# Fields accepted by NewsEvent constructor (must match model columns)
+_NEWS_EVENT_FIELDS = {
+    "title", "event_type", "impact", "confidence", "related_assets",
+    "summary", "source", "url", "published_at", "created_at",
+}
+
+
 def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int:
     inserted = 0
     for n in news_items:
@@ -86,16 +93,34 @@ def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int
         summary = (n.get("summary") or "").strip()
         if not title:
             continue
+
+        # Dedup: check by title+summary, and by URL if present
+        url_val = (n.get("url") or "").strip()
         exists = (
             db.query(NewsEvent)
             .filter(NewsEvent.title == title)
             .filter(NewsEvent.summary == summary)
             .first()
         )
+        if not exists and url_val:
+            exists = (
+                db.query(NewsEvent)
+                .filter(NewsEvent.url == url_val)
+                .first()
+            )
         if exists:
             continue
-        db.add(NewsEvent(**n))
-        inserted += 1
+
+        # Sanitize: only pass known NewsEvent fields (P1 fix)
+        safe_payload = {k: v for k, v in n.items() if k in _NEWS_EVENT_FIELDS}
+
+        try:
+            db.add(NewsEvent(**safe_payload))
+            inserted += 1
+        except Exception:
+            # P3: skip malformed item, don't crash the whole cycle
+            db.rollback()
+            continue
     return inserted
 
 
