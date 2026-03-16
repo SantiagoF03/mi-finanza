@@ -244,13 +244,31 @@ def generate_reallocation_plan(
     # Step 5: Build final plan
     # -----------------------------------------------------------------------
     plan_status = "empty"
+    planner_reason = ""
+
     if sells_proposed or buys_proposed:
         plan_status = "proposed"
+        parts = []
+        if sells_proposed:
+            parts.append(f"{len(sells_proposed)} venta(s) propuesta(s) por sobreconcentración")
+        if buys_proposed:
+            parts.append(f"{len(buys_proposed)} compra(s) propuesta(s) con oportunidades externas")
+        planner_reason = "; ".join(parts)
     elif not external_opportunities:
         plan_status = "no_opportunities"
+        planner_reason = "Sin oportunidades externas detectadas para evaluar"
+    elif not buy_candidates and external_opportunities:
+        plan_status = "no_eligible_candidates"
+        planner_reason = "Oportunidades evaluadas pero ninguna cumple criterios (asset_type/whitelist/confidence)"
+    elif total_funding <= 0 and not overweighted:
+        plan_status = "no_funding"
+        planner_reason = "Sin cash disponible ni holdings sobreponderados para financiar compras"
+    else:
+        planner_reason = "Sin propuestas concretas (condiciones no alcanzadas)"
 
     return {
-        "status": plan_status,
+        "planner_status": plan_status,
+        "planner_reason": planner_reason,
         "dry_run": True,  # Always true — NEVER auto-executed
         "profile": profile_label,
         "profile_canonical": canonical_profile,

@@ -267,7 +267,7 @@ def test_overweighted_plus_opportunity_sell_buy():
             allowed_assets=allowed_assets,
         )
 
-    assert plan["status"] == "proposed"
+    assert plan["planner_status"] == "proposed"
     assert plan["dry_run"] is True
 
     # AAPL should be in sells (overweighted: 55% > 40% max)

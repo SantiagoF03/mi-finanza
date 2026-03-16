@@ -18,6 +18,7 @@ from app.recommendations.unchanged import detect_unchanged
 from app.recommendations.universe import build_allowed_assets
 from app.rules.engine import enforce_rules
 from app.services.logs import app_log
+from app.services.planner import generate_reallocation_plan
 
 _broker_singletons: dict[str, object] = {}
 
@@ -265,6 +266,25 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
 
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
 
+    # --- Planner: funded reallocation dry-run ---
+    proposed_reallocation_plan = {}
+    try:
+        proposed_reallocation_plan = generate_reallocation_plan(
+            snapshot=snapshot_dict,
+            analysis=analysis,
+            external_opportunities=rec.get("external_opportunities", []),
+            allowed_assets=allowed_assets,
+            catalog_map=catalog_map,
+        )
+    except Exception as exc:
+        proposed_reallocation_plan = {
+            "planner_status": "error",
+            "planner_reason": f"Planner falló: {str(exc)[:200]}",
+            "dry_run": True,
+            "sells_proposed": [],
+            "buys_proposed": [],
+        }
+
     # --- Unchanged detection ---
     prev_rec = (
         db.query(Recommendation)
@@ -337,6 +357,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "unchanged_reason": unchanged_reason,
             "news_summary": news_summary,
             "recommendation_explanation_llm": recommendation_explanation_llm,
+            "proposed_reallocation_plan": proposed_reallocation_plan,
             "rebalance_observability": rec.get("rebalance_observability", {}),
             "rationale_reasons": rec.get("rationale_reasons", []),
             "profile_applied": rec.get("profile_applied"),
