@@ -43,6 +43,9 @@ class NewsEvent(Base):
     confidence: Mapped[float] = mapped_column(Float)
     related_assets: Mapped[list[str]] = mapped_column(JSON)
     summary: Mapped[str] = mapped_column(Text)
+    source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
