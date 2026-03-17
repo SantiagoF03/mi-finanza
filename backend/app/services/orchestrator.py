@@ -53,13 +53,17 @@ def _supersede_open_recommendations(db: Session, new_id: int) -> None:
             rec.superseded_at = datetime.utcnow()
 
 
-def _load_news_items(snapshot_positions: list[dict]) -> tuple[list[dict], str, bool]:
-    """Legacy news loading — used only for NewsEvent persistence (backward compat).
+def _load_news_items(
+    snapshot_positions: list[dict],
+    provider: "NewsProvider | None" = None,
+) -> tuple[list[dict], str, bool, "NewsProvider"]:
+    """News loading — returns (items, source_label, is_mock, provider_used).
 
-    Returns (items, source_label, is_mock) where is_mock=True when MockNewsProvider
-    is the actual data source (whether directly or via fallback).
+    Accepts an optional pre-built provider to ensure the same instance
+    is reused for metadata/observability (last_fetch_stats).
     """
-    provider = get_news_provider()
+    if provider is None:
+        provider = get_news_provider()
     symbols = [p.get("symbol") for p in snapshot_positions if p.get("symbol")]
 
     items = []
@@ -77,7 +81,7 @@ def _load_news_items(snapshot_positions: list[dict]) -> tuple[list[dict], str, b
         items = deduplicate_news_items(mock_provider.get_recent_news(symbols))
         is_mock = True
 
-    return items, source, is_mock
+    return items, source, is_mock, provider
 
 
 # Fields accepted by NewsEvent constructor (must match model columns)
@@ -172,13 +176,16 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     for p in positions:
         db.add(PortfolioPosition(snapshot_id=snapshot.id, **p))
 
-    # --- Legacy news persistence (backward compat for NewsEvent table) ---
-    news_items, news_source, news_is_mock = _load_news_items(positions)
+    # --- News persistence + observability (same provider instance) ---
+    news_provider_instance = get_news_provider()
+    news_items, news_source, news_is_mock, news_provider_instance = _load_news_items(
+        positions, provider=news_provider_instance,
+    )
     inserted_news = _persist_news_without_duplicates(db, news_items)
 
-    # Provider observability
+    # Provider observability — uses the SAME instance that did the actual fetch
     try:
-        news_provider_info = get_provider_info(get_news_provider())
+        news_provider_info = get_provider_info(news_provider_instance)
     except Exception:
         news_provider_info = {"provider_class": "unknown", "is_mock": True}
 

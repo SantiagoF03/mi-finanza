@@ -101,6 +101,9 @@ def current_recommendation(db: Session = Depends(get_db)):
         "created_at": rec.created_at,
         "rules_applied": meta.get("rules", []),
         "broker_mode": meta.get("broker_mode", "unknown"),
+        "news_source": meta.get("news_source"),
+        "news_is_mock": meta.get("news_is_mock"),
+        "news_provider_info": meta.get("news_provider_info", {}),
         "external_opportunities": meta.get("external_opportunities", []),
         "allowed_assets": meta.get("allowed_assets", {}),
         "unchanged": meta.get("unchanged", False),
@@ -136,19 +139,26 @@ def history(db: Session = Depends(get_db)):
 
 @router.post("/recommendations/{recommendation_id}/decision")
 def recommendation_decision(recommendation_id: int, payload: DecisionIn, db: Session = Depends(get_db)):
-    rec = db.query(Recommendation).filter(Recommendation.id == recommendation_id).first()
-    if not rec:
-        raise HTTPException(404, "Recommendation not found")
-    if rec.status not in {"pending", "blocked"}:
-        raise HTTPException(400, "Recommendation cerrada")
+    """Unified decision endpoint — delegates to approve_and_execute or reject_recommendation.
+
+    This ensures there is exactly ONE semantic path for each decision type:
+    - approved → delegates to approve_and_execute (triggers real execution)
+    - rejected → delegates to reject_recommendation (no execution)
+    """
     if payload.decision not in {"approved", "rejected"}:
         raise HTTPException(400, "Decision debe ser approved o rejected")
 
-    rec.status = payload.decision
-    decision = UserDecision(recommendation_id=recommendation_id, decision=payload.decision, note=payload.note)
-    db.add(decision)
-    db.commit()
-    return {"status": "ok", "decision_id": decision.id, "recommendation_status": rec.status}
+    if payload.decision == "approved":
+        result = approve_and_execute(db, recommendation_id, note=payload.note or "")
+        if "error" in result:
+            raise HTTPException(result.get("status_code", 400), result["error"])
+        return result
+
+    # rejected
+    result = reject_recommendation(db, recommendation_id, note=payload.note or "")
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -25,9 +25,7 @@ from __future__ import annotations
 import math
 
 from app.core.config import get_settings
-from app.market.assets import resolve_asset_type
 from app.portfolio.profiles import (
-    ASSET_TYPE_TO_BUCKET,
     get_profile_label,
     get_profile_thresholds,
     resolve_profile,
@@ -73,8 +71,12 @@ def generate_reallocation_plan(
     total_value = snapshot.get("total_value", 0)
     available_cash = snapshot.get("cash", 0)
     main_allowed = allowed_assets.get("main_allowed", set())
-    max_single = thresholds.get("max_single_asset_weight", 0.40)
+    # Settings override takes precedence over profile preset (0 = use profile default)
+    _raw_override = settings.max_single_asset_weight
+    settings_override = _raw_override if isinstance(_raw_override, (int, float)) and _raw_override > 0 else 0.0
+    max_single = settings_override if settings_override > 0 else thresholds.get("max_single_asset_weight", 0.40)
     max_move = settings.max_movement_per_cycle
+    _catalog_map = catalog_map or {}
 
     constraints_applied = []
     why_selected = []
@@ -172,6 +174,13 @@ def generate_reallocation_plan(
         at = opp.get("asset_type", "DESCONOCIDO")
         at_status = opp.get("asset_type_status", "unknown")
 
+        # If asset_type is missing/unknown, try catalog_map as fallback
+        if at_status != "known_valid" and sym in _catalog_map:
+            catalog_at = _catalog_map[sym]
+            if catalog_at in VALID_ASSET_TYPES:
+                at = catalog_at
+                at_status = "known_valid"
+
         if at_status != "known_valid":
             why_rejected.append(f"{sym}: asset_type '{at}' status='{at_status}' (no válido)")
             continue
@@ -204,6 +213,7 @@ def generate_reallocation_plan(
     # Step 4: Allocate funding to buy candidates (cash first, then sells)
     # -----------------------------------------------------------------------
     remaining_funding = total_funding
+    cash_remaining = available_cash  # tracks how much cash is left before needing sell proceeds
     # Cap per-buy: don't put more than max_single of total_value in any new position
     max_per_buy = max_single * total_value if total_value > 0 else 0
     # Also cap by max_move per cycle
@@ -218,10 +228,16 @@ def generate_reallocation_plan(
             )
             continue
 
-        # Allocate proportionally to priority_score, capped
         alloc_value = min(remaining_funding, max_per_buy)
 
-        # For now: propose value-based (quantity requires live pricing)
+        # Determine funding source based on actual cash_remaining
+        if cash_remaining >= alloc_value:
+            funding_source = "cash"
+        elif cash_remaining > 0:
+            funding_source = "mixed"
+        else:
+            funding_source = "sells"
+
         buys_proposed.append({
             "symbol": candidate["symbol"],
             "side": "buy",
@@ -230,12 +246,13 @@ def generate_reallocation_plan(
             "priority_score": candidate["priority_score"],
             "source_types": candidate["source_types"],
             "reason": candidate["reason"],
-            "funding_source": "cash" if available_cash >= alloc_value else "mixed",
+            "funding_source": funding_source,
         })
         why_selected.append(
             f"BUY {candidate['symbol']}: score {candidate['priority_score']:.2f}, "
-            f"tipo {candidate['asset_type']}, ~${alloc_value:.0f}"
+            f"tipo {candidate['asset_type']}, ~${alloc_value:.0f} ({funding_source})"
         )
+        cash_remaining -= alloc_value  # can go negative (means sells cover the rest)
         remaining_funding -= alloc_value
 
     residual_cash = round(remaining_funding, 2)

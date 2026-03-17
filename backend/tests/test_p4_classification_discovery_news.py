@@ -192,7 +192,7 @@ def test_mock_news_explicit_in_real_mode():
 
     # _load_news_items uses get_news_provider() which returns MockNewsProvider
     # unless a real provider is configured
-    items, source, is_mock = _load_news_items([{"symbol": "AAPL"}])
+    items, source, is_mock, *_ = _load_news_items([{"symbol": "AAPL"}])
 
     # In test environment, provider is MockNewsProvider
     assert is_mock is True, "is_mock must be True when MockNewsProvider is the source"
