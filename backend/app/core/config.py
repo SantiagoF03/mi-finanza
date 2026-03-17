@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     vapid_private_key: str = ""
     vapid_contact_email: str = ""
 
+    # Cluster-aware decision pipeline (additive — legacy flow unchanged when False)
+    use_clusters: bool = False
+
     whitelist_assets: List[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "AL30", "BND", "CASH"]
     )

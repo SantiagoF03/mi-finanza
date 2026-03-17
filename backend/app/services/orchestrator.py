@@ -10,7 +10,13 @@ from app.market.candidates import generate_external_candidates
 from app.market.assets import build_catalog_asset_type_map
 from app.market.discovery import get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
-from app.news.ingestion import get_engine_eligible_news, get_llm_eligible_news, run_ingestion
+from app.news.ingestion import (
+    get_engine_eligible_clusters,
+    get_engine_eligible_news,
+    get_llm_eligible_clusters,
+    get_llm_eligible_news,
+    run_ingestion,
+)
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider, get_provider_info
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
@@ -132,6 +138,31 @@ def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int
     return inserted
 
 
+def _extract_cluster_traceability(news_items: list[dict]) -> list[dict]:
+    """Extract cluster traceability from cluster-sourced news dicts.
+
+    Only includes items that have cluster_id (from _cluster_to_news_dict).
+    """
+    result = []
+    for item in news_items:
+        cid = item.get("cluster_id")
+        if cid is not None:
+            result.append({
+                "cluster_id": cid,
+                "cluster_key": item.get("cluster_key"),
+                "item_count": item.get("item_count"),
+                "source_count": item.get("source_count"),
+                "sources_list": item.get("sources_list", []),
+                "relevance_score": item.get("relevance_score"),
+                "llm_candidate": item.get("llm_candidate"),
+                "external_opportunity_candidate": item.get("external_opportunity_candidate"),
+                "affects_holdings": item.get("affects_holdings"),
+                "affects_watchlist": item.get("affects_watchlist"),
+                "affected_sectors": item.get("affected_sectors", []),
+            })
+    return result
+
+
 def run_cycle(db: Session, source: str = "manual") -> dict:
     settings = get_settings()
 
@@ -207,7 +238,15 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         ingestion_meta = {"ingestion_status": "failed", "ingestion_error": str(exc)[:200]}
 
     # --- Main engine uses triaged news (observe + send_to_llm + trigger_recalc) ---
-    engine_news = get_engine_eligible_news(db)
+    # When use_clusters=True, prefer cluster-level deduplication over raw items
+    news_mode = "clusters" if settings.use_clusters else "individual"
+    if settings.use_clusters:
+        engine_news = get_engine_eligible_clusters(db)
+        if not engine_news:
+            engine_news = get_engine_eligible_news(db)
+            news_mode = "individual_fallback"
+    else:
+        engine_news = get_engine_eligible_news(db)
 
     snapshot_dict = {
         "total_value": total,
@@ -314,7 +353,12 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
 
     # --- LLM explanation layer (best-effort, never breaks cycle) ---
     # LLM only receives send_to_llm + trigger_recalc (stricter than engine)
-    llm_news_items = get_llm_eligible_news(db)
+    if settings.use_clusters:
+        llm_news_items = get_llm_eligible_clusters(db)
+        if not llm_news_items:
+            llm_news_items = get_llm_eligible_news(db)
+    else:
+        llm_news_items = get_llm_eligible_news(db)
 
     news_summary = None
     recommendation_explanation_llm = None
@@ -372,6 +416,8 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "rationale_reasons": rec.get("rationale_reasons", []),
             "profile_applied": rec.get("profile_applied"),
             "profile_label": rec.get("profile_label"),
+            "news_mode": news_mode,
+            "cluster_traceability": _extract_cluster_traceability(engine_news) if news_mode != "individual" else None,
         },
     )
     db.add(rec_model)

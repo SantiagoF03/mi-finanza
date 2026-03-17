@@ -499,6 +499,95 @@ def get_llm_eligible_news(db: Session, hours_back: int = 72) -> list[dict]:
     return _news_rows_to_dicts(rows)
 
 
+# ---------------------------------------------------------------------------
+# Cluster-aware eligible news — same dict format, deduped by cluster
+# ---------------------------------------------------------------------------
+
+def _cluster_to_news_dict(cluster: "EventCluster") -> dict:
+    """Convert an EventCluster to the same dict format as _news_rows_to_dicts.
+
+    This allows generate_recommendation(), llm_summarize(), and llm_explain()
+    to consume clusters without any signature changes.
+    """
+    return {
+        "title": cluster.canonical_title,
+        "summary": cluster.consolidated_summary,
+        "event_type": cluster.event_type,
+        "impact": _cluster_impact(cluster),
+        "confidence": cluster.relevance_score,
+        "related_assets": cluster.affected_symbols or [],
+        "created_at": cluster.latest_published_at or cluster.updated_at,
+        "source": ", ".join(cluster.sources_list or []),
+        "pre_score": cluster.relevance_score,
+        "triage_level": cluster.triage_max,
+        "multi_source_count": cluster.source_count,
+        # Cluster traceability fields (extra — ignored by legacy consumers)
+        "cluster_id": cluster.id,
+        "cluster_key": cluster.cluster_key,
+        "item_count": cluster.item_count,
+        "source_count": cluster.source_count,
+        "sources_list": cluster.sources_list or [],
+        "relevance_score": cluster.relevance_score,
+        "llm_candidate": cluster.llm_candidate,
+        "external_opportunity_candidate": cluster.external_opportunity_candidate,
+        "affects_holdings": cluster.affects_holdings,
+        "affects_watchlist": cluster.affects_watchlist,
+        "affected_sectors": cluster.affected_sectors or [],
+    }
+
+
+def _cluster_impact(cluster: "EventCluster") -> str:
+    """Derive impact label from cluster event_type heuristic.
+
+    Uses same logic as the classify pipeline but at cluster level.
+    """
+    negative_types = {"crisis", "regulación", "downgrade", "recesión", "default", "sell-off"}
+    positive_types = {"upgrade", "ipo", "earnings_beat", "expansion", "deal"}
+    et = (cluster.event_type or "").lower()
+    if et in negative_types:
+        return "negativo"
+    if et in positive_types:
+        return "positivo"
+    return "neutro"
+
+
+def get_engine_eligible_clusters(db: Session, hours_back: int = 72, limit: int = 30) -> list[dict]:
+    """Return top clusters eligible for the recommendation engine.
+
+    Clusters with triage_max in (observe, send_to_llm, trigger_recalc).
+    Returns the same dict format as get_engine_eligible_news() for backward compat.
+    Each cluster replaces N individual items → deduplication by event.
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=hours_back)
+    clusters = (
+        db.query(EventCluster)
+        .filter(EventCluster.triage_max.in_(["observe", "send_to_llm", "trigger_recalc"]))
+        .filter(EventCluster.updated_at >= cutoff)
+        .order_by(desc(EventCluster.relevance_score))
+        .limit(limit)
+        .all()
+    )
+    return [_cluster_to_news_dict(c) for c in clusters]
+
+
+def get_llm_eligible_clusters(db: Session, hours_back: int = 72, limit: int = 20) -> list[dict]:
+    """Return top clusters eligible for LLM analysis.
+
+    Only clusters with llm_candidate=True (triage_max in send_to_llm/trigger_recalc).
+    Returns same dict format as get_llm_eligible_news().
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=hours_back)
+    clusters = (
+        db.query(EventCluster)
+        .filter(EventCluster.llm_candidate == True)  # noqa: E712
+        .filter(EventCluster.updated_at >= cutoff)
+        .order_by(desc(EventCluster.relevance_score))
+        .limit(limit)
+        .all()
+    )
+    return [_cluster_to_news_dict(c) for c in clusters]
+
+
 def has_llm_eligible_news(db: Session, hours_back: int = 72) -> bool:
     """Check if there are any LLM-eligible news items without loading them all."""
     cutoff = datetime.utcnow() - timedelta(hours=hours_back)
