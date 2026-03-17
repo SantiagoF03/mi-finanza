@@ -21,6 +21,8 @@ from app.news.ingestion import (
     _compute_time_bucket,
     _make_cluster_key,
     build_or_update_clusters,
+    get_engine_eligible_clusters,
+    get_llm_eligible_clusters,
     get_recent_clusters,
     run_ingestion,
 )
@@ -420,3 +422,213 @@ def test_items_have_event_cluster_id_set():
     assert n1.event_cluster_id is not None
     assert n2.event_cluster_id is not None
     assert n1.event_cluster_id == n2.event_cluster_id
+
+
+# ---------------------------------------------------------------------------
+# Cluster-aware eligible functions
+# ---------------------------------------------------------------------------
+
+
+def test_get_engine_eligible_clusters_returns_correct_format():
+    """Cluster-sourced dicts must have same keys as _news_rows_to_dicts + traceability."""
+    db, _ = make_db()
+    now = datetime.utcnow()
+
+    _insert_normalized(db, title="Engine cluster A", topic_hash="eng01",
+                       published_at=now, pre_score=0.6, triage_level="observe",
+                       related_assets=["GGAL"])
+    _insert_normalized(db, title="Engine cluster A dup", topic_hash="eng01",
+                       published_at=now + timedelta(hours=1), pre_score=0.4,
+                       triage_level="observe", source="other", related_assets=["GGAL"])
+    db.commit()
+    build_or_update_clusters(db)
+    db.commit()
+
+    results = get_engine_eligible_clusters(db)
+    assert len(results) == 1
+
+    item = results[0]
+    # Standard fields (backward compat with generate_recommendation)
+    assert "title" in item
+    assert "summary" in item
+    assert "event_type" in item
+    assert "impact" in item
+    assert "confidence" in item
+    assert "related_assets" in item
+    assert "created_at" in item
+    assert "source" in item
+    assert "pre_score" in item
+    assert "triage_level" in item
+    assert "multi_source_count" in item
+
+    # Traceability fields
+    assert "cluster_id" in item
+    assert "cluster_key" in item
+    assert "item_count" in item
+    assert item["item_count"] == 2
+    assert "source_count" in item
+    assert "relevance_score" in item
+    assert "llm_candidate" in item
+    assert "external_opportunity_candidate" in item
+    assert "affects_holdings" in item
+    assert "affects_watchlist" in item
+    assert "affected_sectors" in item
+    assert "GGAL" in item["related_assets"]
+
+
+def test_get_engine_eligible_clusters_excludes_store_only():
+    """Clusters with triage_max=store_only must not appear in engine results."""
+    db, _ = make_db()
+    _insert_normalized(db, title="Low triage", topic_hash="low01",
+                       pre_score=0.1, triage_level="store_only")
+    db.commit()
+    build_or_update_clusters(db)
+    db.commit()
+
+    results = get_engine_eligible_clusters(db)
+    assert len(results) == 0
+
+
+def test_get_llm_eligible_clusters_only_llm_candidates():
+    """LLM clusters must only include llm_candidate=True clusters."""
+    db, _ = make_db()
+    now = datetime.utcnow()
+
+    # observe-only cluster (not llm candidate)
+    _insert_normalized(db, title="Observe only", topic_hash="obs01",
+                       published_at=now, pre_score=0.3, triage_level="observe")
+    # send_to_llm cluster (llm candidate)
+    _insert_normalized(db, title="LLM worthy", topic_hash="llm01",
+                       published_at=now, pre_score=0.8, triage_level="send_to_llm",
+                       related_assets=["SPY"])
+    db.commit()
+    build_or_update_clusters(db)
+    db.commit()
+
+    llm_results = get_llm_eligible_clusters(db)
+    engine_results = get_engine_eligible_clusters(db)
+
+    assert len(llm_results) == 1
+    assert llm_results[0]["title"] == "LLM worthy"
+    assert llm_results[0]["llm_candidate"] is True
+
+    # Engine should see both
+    assert len(engine_results) == 2
+
+
+def test_cluster_deduplication_over_individual_items():
+    """5 items about the same event should become 1 cluster entry, not 5."""
+    db, _ = make_db()
+    now = datetime.utcnow()
+
+    for i in range(5):
+        _insert_normalized(
+            db, title=f"Fed meeting impact {i}", topic_hash="fed_meet",
+            published_at=now + timedelta(minutes=i * 30),
+            pre_score=0.5 + i * 0.05, triage_level="observe",
+            source=f"source_{i}", related_assets=["SPY"],
+        )
+    db.commit()
+    build_or_update_clusters(db)
+    db.commit()
+
+    clusters = get_engine_eligible_clusters(db)
+    assert len(clusters) == 1
+    assert clusters[0]["item_count"] == 5
+    assert clusters[0]["source_count"] == 5
+
+
+def test_orchestrator_cluster_traceability_in_metadata():
+    """With use_clusters=True, recommendation metadata must include cluster_traceability."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db, _ = make_db()
+    settings = get_settings()
+
+    # Enable cluster mode
+    original = settings.use_clusters
+    settings.use_clusters = True
+
+    # Insert clusterable items
+    now = datetime.utcnow()
+    _insert_normalized(db, title="Cluster trace test", topic_hash="trace01",
+                       published_at=now, pre_score=0.7, triage_level="send_to_llm",
+                       related_assets=["SPY"])
+    db.commit()
+    build_or_update_clusters(db)
+    db.commit()
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.use_clusters = original
+
+    assert "recommendation_id" in result
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    assert meta.get("news_mode") in ("clusters", "individual_fallback")
+    if meta["news_mode"] == "clusters":
+        trace = meta.get("cluster_traceability")
+        assert trace is not None
+        assert isinstance(trace, list)
+        if trace:
+            assert "cluster_id" in trace[0]
+            assert "source_count" in trace[0]
+            assert "relevance_score" in trace[0]
+
+
+def test_orchestrator_individual_mode_no_cluster_traceability():
+    """With use_clusters=False (default), metadata should have news_mode=individual."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db, _ = make_db()
+    settings = get_settings()
+
+    original = settings.use_clusters
+    settings.use_clusters = False
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.use_clusters = original
+
+    assert "recommendation_id" in result
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    assert meta.get("news_mode") == "individual"
+    assert meta.get("cluster_traceability") is None
+
+
+def test_cluster_fallback_when_no_clusters_exist():
+    """When use_clusters=True but no clusters exist, should fallback to individual news."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db, _ = make_db()
+    settings = get_settings()
+
+    original = settings.use_clusters
+    settings.use_clusters = True
+
+    # Don't insert any news or clusters — force fallback
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.use_clusters = original
+
+    assert "recommendation_id" in result
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    # Should have fallen back to individual
+    assert meta.get("news_mode") in ("individual_fallback", "clusters")
