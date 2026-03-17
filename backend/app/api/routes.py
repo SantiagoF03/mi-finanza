@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.db.session import get_db
 from app.market.discovery import get_catalog_instruments, get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import MarketEvent, NewsEvent, PortfolioSnapshot, PushSubscription, Recommendation, UserDecision, UserSettings
-from app.news.ingestion import get_active_alerts, get_recent_events, run_ingestion
+from app.news.ingestion import get_active_alerts, get_recent_clusters, get_recent_events, run_ingestion
 from app.portfolio.profiles import PROFILE_PRESETS, get_profile_label, get_profile_thresholds, resolve_profile
 from app.schemas.schemas import DecisionIn
 from app.services.execution import (
@@ -179,6 +179,19 @@ def current_alerts(db: Session = Depends(get_db)):
 @router.post("/events/run-ingestion")
 def manual_ingestion(db: Session = Depends(get_db)):
     return run_ingestion(db, source_label="manual")
+
+
+@router.get("/events/clusters/recent")
+def recent_event_clusters(
+    limit: int = 20,
+    include_items: bool = False,
+    db: Session = Depends(get_db),
+):
+    """Return recent EventClusters — grouped market events with consolidated metadata.
+
+    Use ?include_items=true to include the individual NewsNormalized items per cluster.
+    """
+    return get_recent_clusters(db, limit=limit, include_items=include_items)
 
 
 @router.post("/alerts/{alert_id}/acknowledge")
