@@ -116,7 +116,7 @@ def test_run_cycle_with_rss_provider_no_crash(db):
         mock_gpi.return_value = {"provider_class": "RssNewsProvider", "is_mock": False}
 
         with patch("app.services.orchestrator._load_news_items") as mock_load:
-            mock_load.return_value = (fake_rss_items, "RssNewsProvider", False)
+            mock_load.return_value = (fake_rss_items, "RssNewsProvider", False, provider)
 
             result = run_cycle(db, source="test")
 
