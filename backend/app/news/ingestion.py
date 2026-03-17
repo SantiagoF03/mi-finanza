@@ -783,8 +783,8 @@ def build_or_update_clusters(db: Session, hours_back: int = 72) -> dict:
         "status": "completed",
         "clusters_created": created,
         "clusters_updated": updated,
-        "total_items_processed": len(items),
-        "total_clusters": created + updated,
+        "clusters_touched": created + updated,
+        "items_clustered": len(items),
     }
 
 
