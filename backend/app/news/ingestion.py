@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models.models import (
+    EventCluster,
     IngestionRun,
     MarketEvent,
     NewsNormalized,
@@ -413,6 +414,18 @@ def run_ingestion(db: Session, source_label: str = "manual") -> dict:
         db.commit()
         return {"status": "failed", "error": str(exc)[:500], "run_id": run.id}
 
+    # --- Post-ingestion clustering (best-effort, never breaks ingestion) ---
+    clustering_meta = {}
+    try:
+        clustering_meta = build_or_update_clusters(db)
+        db.commit()
+    except Exception as exc:
+        clustering_meta = {"status": "failed", "error": str(exc)[:200]}
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
     return {
         "status": "completed",
         "run_id": run.id,
@@ -422,6 +435,7 @@ def run_ingestion(db: Session, source_label: str = "manual") -> dict:
         "events_created": run.events_created,
         "holdings_source": holdings_source,
         "triage_counts": triage_counts,
+        "clustering": clustering_meta,
     }
 
 
@@ -550,3 +564,289 @@ def get_active_alerts(db: Session) -> list[dict]:
         }
         for e in events
     ]
+
+
+# ---------------------------------------------------------------------------
+# Event clustering — groups NewsNormalized into canonical MarketEvent clusters
+# ---------------------------------------------------------------------------
+
+_TRIAGE_RANK = {"store_only": 0, "observe": 1, "send_to_llm": 2, "trigger_recalc": 3}
+
+_SECTOR_KEYWORDS: dict[str, str] = {
+    "energia": "energía", "energy": "energía", "oil": "energía", "petrol": "energía",
+    "tech": "tecnología", "tecnolog": "tecnología", "software": "tecnología", "ia": "tecnología",
+    "financ": "financiero", "banco": "financiero", "bank": "financiero",
+    "salud": "salud", "health": "salud", "pharma": "salud",
+    "consumo": "consumo", "retail": "consumo",
+    "agro": "agro", "agri": "agro", "soja": "agro", "trigo": "agro",
+    "mining": "minería", "miner": "minería", "litio": "minería",
+    "real estate": "inmobiliario", "inmobil": "inmobiliario",
+}
+
+
+def _compute_time_bucket(dt: datetime | None) -> str:
+    """Compute a 12-hour time bucket string from a datetime.
+
+    Format: YYYY-MM-DD_H0 or YYYY-MM-DD_H1 (first/second half of day).
+    This ensures that news about the same topic separated by >12h
+    land in different clusters, preventing eternal cluster growth.
+    """
+    if not dt:
+        dt = datetime.utcnow()
+    half = "H0" if dt.hour < 12 else "H1"
+    return f"{dt.strftime('%Y-%m-%d')}_{half}"
+
+
+def _make_cluster_key(topic_hash: str, time_bucket: str) -> str:
+    """Deterministic cluster key: topic_hash + time_bucket."""
+    return f"{topic_hash}_{time_bucket}"
+
+
+def _infer_sectors(title: str, summary: str) -> list[str]:
+    """Infer affected sectors from text using keyword matching."""
+    text = f"{title} {summary}".lower()
+    sectors = set()
+    for keyword, sector in _SECTOR_KEYWORDS.items():
+        if keyword in text:
+            sectors.add(sector)
+    return sorted(sectors)
+
+
+def build_or_update_clusters(db: Session, hours_back: int = 72) -> dict:
+    """Group recent NewsNormalized items into EventClusters.
+
+    Clustering key: topic_hash + time_bucket (12h window).
+    Creates new clusters or updates existing ones.
+    Assigns event_cluster_id FK on each NewsNormalized item.
+
+    Returns summary stats for observability.
+    """
+    settings = get_settings()
+    held_symbols, _ = _load_real_holdings(db)
+    watchlist_set = set(settings.watchlist_assets)
+
+    cutoff = datetime.utcnow() - timedelta(hours=hours_back)
+
+    # Fetch all recent NewsNormalized that have a topic_hash
+    items = (
+        db.query(NewsNormalized)
+        .filter(NewsNormalized.created_at >= cutoff)
+        .filter(NewsNormalized.topic_hash != "")
+        .order_by(NewsNormalized.created_at)
+        .all()
+    )
+
+    if not items:
+        return {"status": "no_items", "clusters_created": 0, "clusters_updated": 0}
+
+    # Group by cluster_key
+    groups: dict[str, list[NewsNormalized]] = {}
+    for item in items:
+        pub_dt = item.published_at or item.created_at
+        tb = _compute_time_bucket(pub_dt)
+        ck = _make_cluster_key(item.topic_hash, tb)
+        groups.setdefault(ck, []).append(item)
+
+    created = 0
+    updated = 0
+
+    for cluster_key, group_items in groups.items():
+        # Determine topic_hash and time_bucket from key
+        parts = cluster_key.rsplit("_", 2)  # topic_hash _ YYYY-MM-DD _ H0/H1
+        topic_hash = parts[0] if len(parts) >= 3 else cluster_key.split("_")[0]
+        time_bucket = "_".join(parts[-2:]) if len(parts) >= 3 else _compute_time_bucket(None)
+
+        existing = db.query(EventCluster).filter(EventCluster.cluster_key == cluster_key).first()
+
+        # Compute aggregates from group
+        all_symbols: list[str] = []
+        all_sources: set[str] = set()
+        all_sectors: set[str] = set()
+        max_score = 0.0
+        max_triage = "store_only"
+        best_item: NewsNormalized = group_items[0]
+        pub_dates: list[datetime] = []
+        has_holding_mention = False
+        has_watchlist_mention = False
+        has_llm = False
+        has_external = False
+
+        for item in group_items:
+            # Symbols
+            for s in (item.related_assets or []):
+                if s not in all_symbols:
+                    all_symbols.append(s)
+
+            # Sources
+            if item.source:
+                all_sources.add(item.source)
+
+            # Sectors
+            for sec in _infer_sectors(item.title, item.summary):
+                all_sectors.add(sec)
+
+            # Published dates
+            pub = item.published_at or item.created_at
+            if pub:
+                pub_dates.append(pub)
+
+            # Best item by pre_score (for canonical title)
+            if item.pre_score > best_item.pre_score:
+                best_item = item
+
+            # Scores and triage
+            if item.pre_score > max_score:
+                max_score = item.pre_score
+            if _TRIAGE_RANK.get(item.triage_level, 0) > _TRIAGE_RANK.get(max_triage, 0):
+                max_triage = item.triage_level
+
+            # Flags
+            item_symbols = set(item.related_assets or [])
+            if item_symbols & held_symbols:
+                has_holding_mention = True
+            if item_symbols & watchlist_set:
+                has_watchlist_mention = True
+            if item.triage_level in ("send_to_llm", "trigger_recalc"):
+                has_llm = True
+            if item_symbols and not (item_symbols & held_symbols):
+                has_external = True
+
+        # Consolidated summary: unique summaries from top-scored items (max 3)
+        sorted_items = sorted(group_items, key=lambda x: x.pre_score, reverse=True)
+        seen_summaries: set[str] = set()
+        summary_parts: list[str] = []
+        for si in sorted_items[:3]:
+            s_norm = (si.summary or "").strip()
+            if s_norm and s_norm.lower() not in seen_summaries:
+                seen_summaries.add(s_norm.lower())
+                summary_parts.append(s_norm)
+        consolidated_summary = " | ".join(summary_parts)[:2000]
+
+        first_pub = min(pub_dates) if pub_dates else None
+        latest_pub = max(pub_dates) if pub_dates else None
+        sources_sorted = sorted(all_sources)
+
+        if existing:
+            existing.canonical_title = best_item.title
+            existing.consolidated_summary = consolidated_summary
+            existing.event_type = best_item.event_type
+            existing.item_count = len(group_items)
+            existing.source_count = len(all_sources)
+            existing.sources_list = sources_sorted
+            existing.first_published_at = first_pub
+            existing.latest_published_at = latest_pub
+            existing.affected_symbols = all_symbols
+            existing.affected_sectors = sorted(all_sectors)
+            existing.relevance_score = round(max_score, 3)
+            existing.triage_max = max_triage
+            existing.affects_holdings = has_holding_mention
+            existing.affects_watchlist = has_watchlist_mention
+            existing.llm_candidate = has_llm
+            existing.external_opportunity_candidate = has_external
+            existing.updated_at = datetime.utcnow()
+            cluster_id = existing.id
+            updated += 1
+        else:
+            cluster = EventCluster(
+                cluster_key=cluster_key,
+                topic_hash=topic_hash,
+                time_bucket=time_bucket,
+                canonical_title=best_item.title,
+                consolidated_summary=consolidated_summary,
+                event_type=best_item.event_type,
+                item_count=len(group_items),
+                source_count=len(all_sources),
+                sources_list=sources_sorted,
+                first_published_at=first_pub,
+                latest_published_at=latest_pub,
+                affected_symbols=all_symbols,
+                affected_sectors=sorted(all_sectors),
+                relevance_score=round(max_score, 3),
+                triage_max=max_triage,
+                affects_holdings=has_holding_mention,
+                affects_watchlist=has_watchlist_mention,
+                llm_candidate=has_llm,
+                external_opportunity_candidate=has_external,
+            )
+            db.add(cluster)
+            db.flush()
+            cluster_id = cluster.id
+            created += 1
+
+        # Assign FK on all items in this group
+        for item in group_items:
+            if item.event_cluster_id != cluster_id:
+                item.event_cluster_id = cluster_id
+
+    db.flush()
+    return {
+        "status": "completed",
+        "clusters_created": created,
+        "clusters_updated": updated,
+        "total_items_processed": len(items),
+        "total_clusters": created + updated,
+    }
+
+
+def get_recent_clusters(db: Session, limit: int = 20, include_items: bool = False) -> list[dict]:
+    """Return recent EventClusters for API consumption."""
+    clusters = (
+        db.query(EventCluster)
+        .order_by(desc(EventCluster.updated_at))
+        .limit(limit)
+        .all()
+    )
+
+    result = []
+    for c in clusters:
+        entry = {
+            "id": c.id,
+            "cluster_key": c.cluster_key,
+            "topic_hash": c.topic_hash,
+            "time_bucket": c.time_bucket,
+            "canonical_title": c.canonical_title,
+            "consolidated_summary": c.consolidated_summary,
+            "event_type": c.event_type,
+            "item_count": c.item_count,
+            "source_count": c.source_count,
+            "sources_list": c.sources_list,
+            "first_published_at": c.first_published_at.isoformat() if c.first_published_at else None,
+            "latest_published_at": c.latest_published_at.isoformat() if c.latest_published_at else None,
+            "affected_symbols": c.affected_symbols,
+            "affected_sectors": c.affected_sectors,
+            "relevance_score": c.relevance_score,
+            "triage_max": c.triage_max,
+            "affects_holdings": c.affects_holdings,
+            "affects_watchlist": c.affects_watchlist,
+            "llm_candidate": c.llm_candidate,
+            "external_opportunity_candidate": c.external_opportunity_candidate,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+        }
+        if include_items:
+            items = (
+                db.query(NewsNormalized)
+                .filter(NewsNormalized.event_cluster_id == c.id)
+                .order_by(desc(NewsNormalized.pre_score))
+                .all()
+            )
+            entry["items"] = [
+                {
+                    "id": i.id,
+                    "title": i.title,
+                    "summary": i.summary,
+                    "source": i.source,
+                    "url": i.url,
+                    "event_type": i.event_type,
+                    "impact": i.impact,
+                    "confidence": i.confidence,
+                    "related_assets": i.related_assets or [],
+                    "pre_score": i.pre_score,
+                    "triage_level": i.triage_level,
+                    "published_at": i.published_at.isoformat() if i.published_at else None,
+                }
+                for i in items
+            ]
+        result.append(entry)
+
+    return result

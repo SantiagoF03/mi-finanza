@@ -164,7 +164,39 @@ class NewsNormalized(Base):
     triage_level: Mapped[str] = mapped_column(String(20), default="store_only")
     topic_hash: Mapped[str] = mapped_column(String(32), default="", index=True)
     multi_source_count: Mapped[int] = mapped_column(Integer, default=1)
+    event_cluster_id: Mapped[int | None] = mapped_column(ForeignKey("event_clusters.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    event_cluster: Mapped["EventCluster | None"] = relationship(back_populates="items")
+
+
+class EventCluster(Base):
+    __tablename__ = "event_clusters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cluster_key: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    topic_hash: Mapped[str] = mapped_column(String(32), index=True)
+    time_bucket: Mapped[str] = mapped_column(String(20), index=True)
+    canonical_title: Mapped[str] = mapped_column(String(500))
+    consolidated_summary: Mapped[str] = mapped_column(Text, default="")
+    event_type: Mapped[str] = mapped_column(String(50))
+    item_count: Mapped[int] = mapped_column(Integer, default=1)
+    source_count: Mapped[int] = mapped_column(Integer, default=1)
+    sources_list: Mapped[list[str]] = mapped_column(JSON, default=list)
+    first_published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    latest_published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    affected_symbols: Mapped[list[str]] = mapped_column(JSON, default=list)
+    affected_sectors: Mapped[list[str]] = mapped_column(JSON, default=list)
+    relevance_score: Mapped[float] = mapped_column(Float, default=0.0)
+    triage_max: Mapped[str] = mapped_column(String(20), default="store_only")
+    affects_holdings: Mapped[bool] = mapped_column(Boolean, default=False)
+    affects_watchlist: Mapped[bool] = mapped_column(Boolean, default=False)
+    llm_candidate: Mapped[bool] = mapped_column(Boolean, default=False)
+    external_opportunity_candidate: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    items: Mapped[list["NewsNormalized"]] = relationship(back_populates="event_cluster")
 
 
 class MarketEvent(Base):
