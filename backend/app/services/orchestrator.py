@@ -57,10 +57,11 @@ def _load_news_items(
     snapshot_positions: list[dict],
     provider: "NewsProvider | None" = None,
 ) -> tuple[list[dict], str, bool, "NewsProvider"]:
-    """News loading — returns (items, source_label, is_mock, provider_used).
+    """News loading — returns (items, source_label, is_mock, effective_provider).
 
-    Accepts an optional pre-built provider to ensure the same instance
-    is reused for metadata/observability (last_fetch_stats).
+    The 4th value is the provider that actually produced the news items.
+    If the real provider fails or returns empty and we fall back to mock,
+    the returned provider is the MockNewsProvider instance (not the original).
     """
     if provider is None:
         provider = get_news_provider()
@@ -69,6 +70,7 @@ def _load_news_items(
     items = []
     source = provider.__class__.__name__
     is_mock = isinstance(provider, MockNewsProvider)
+    effective_provider = provider
 
     try:
         items = deduplicate_news_items(provider.get_recent_news(symbols))
@@ -80,8 +82,9 @@ def _load_news_items(
         source = f"{provider.__class__.__name__}->MockNewsProvider(fallback)"
         items = deduplicate_news_items(mock_provider.get_recent_news(symbols))
         is_mock = True
+        effective_provider = mock_provider
 
-    return items, source, is_mock, provider
+    return items, source, is_mock, effective_provider
 
 
 # Fields accepted by NewsEvent constructor (must match model columns)
