@@ -581,6 +581,7 @@ def refine_with_fresh_quotes(
     scored_news: list[dict],
     fresh_prices: dict,
     positions: list[dict],
+    catalog_dynamic: set | None = None,
 ) -> tuple[list[dict], dict]:
     """Re-evaluate market_confirmation for items whose symbols got fresh quotes.
 
@@ -588,16 +589,21 @@ def refine_with_fresh_quotes(
     current confirmation source is NOT 'holdings' (pnl_pct takes priority),
     recompute market_confirmation using the fresh variacion_pct.
 
-    Also recomputes effective_score and suppression flag for affected items.
+    Also recomputes effective_score, suppression flag, and promotion status
+    for affected items when catalog_dynamic is provided.
 
     Returns (updated_scored_news, refinement_meta).
     Items are returned in the same order, with affected items updated in-place copies.
     """
     fresh_symbols = set(fresh_prices.keys())
     if not fresh_symbols:
-        return scored_news, {"refined_count": 0, "symbols_used": []}
+        return scored_news, {"refined_count": 0, "symbols_used": [],
+                             "promotions": 0, "demotions": 0}
 
+    catalog_dynamic = catalog_dynamic or set()
     refined_count = 0
+    promotions = 0
+    demotions = 0
     symbols_actually_used: set[str] = set()
     result = []
 
@@ -644,6 +650,24 @@ def refine_with_fresh_quotes(
                     # Fresh data un-contradicted → un-suppress
                     updated.pop("suppressed_by_contradiction", None)
 
+                # Re-evaluate promotion with fresh data
+                if catalog_dynamic:
+                    prev_class = item.get("signal_class", "")
+                    prev_promoted = item.get("promoted_from_observed", False)
+
+                    # Can promote: observed_candidate with fresh strong evidence
+                    if prev_class == "observed_candidate" and not prev_promoted:
+                        if promote_catalog_candidate(updated, catalog_dynamic):
+                            updated["signal_class"] = "external_opportunity"
+                            updated["promoted_from_observed"] = True
+                            promotions += 1
+
+                    # Can demote: was promoted but now contradicted by fresh data
+                    if prev_promoted and conf_status == "contradicted":
+                        updated["signal_class"] = "observed_candidate"
+                        updated["promoted_from_observed"] = False
+                        demotions += 1
+
                 refined_count += 1
                 for sym in related & fresh_symbols:
                     symbols_actually_used.add(sym)
@@ -655,6 +679,8 @@ def refine_with_fresh_quotes(
     refinement_meta = {
         "refined_count": refined_count,
         "symbols_used": sorted(symbols_actually_used),
+        "promotions": promotions,
+        "demotions": demotions,
     }
 
     return result, refinement_meta

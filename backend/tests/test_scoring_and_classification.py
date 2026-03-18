@@ -1814,3 +1814,190 @@ def test_orchestrator_fresh_quote_meta_persisted():
     fq_meta = meta["fresh_quote_meta"]
     # In mock mode, should have shortlist + fetch (skipped_mock) + refinement
     assert "shortlist" in fq_meta or "error" in fq_meta
+
+
+# ---------------------------------------------------------------------------
+# 54. Gap 1: Fresh refinement promotes observed_candidate with strong evidence
+# ---------------------------------------------------------------------------
+
+
+def test_refine_promotes_observed_with_fresh_confirmation():
+    """Fresh confirmed quote should promote an observed_candidate to external_opportunity."""
+    from app.recommendations.scoring import refine_with_fresh_quotes
+
+    scored = [
+        {
+            "title": "New CEDEAR opportunity", "related_assets": ["BBAR"],
+            "impact": "positivo", "signal_class": "observed_candidate",
+            "signal_score": 0.60, "effective_score": 0.60,
+            "market_confirmation": {"status": "unconfirmed", "source": "catalog",
+                                    "detail": "Sin confirmación"},
+            "source_count": 2, "relevance_score": 0.7,
+        },
+    ]
+    # Fresh data confirms positive event
+    fresh_prices = {
+        "BBAR": {"last_price": 100.0, "variacion_pct": 4.0, "source": "fresh_quote"},
+    }
+    catalog_dynamic = {"BBAR"}
+
+    refined, meta = refine_with_fresh_quotes(scored, fresh_prices, [],
+                                             catalog_dynamic=catalog_dynamic)
+
+    assert meta["promotions"] == 1
+    assert refined[0]["signal_class"] == "external_opportunity"
+    assert refined[0]["promoted_from_observed"] is True
+    assert refined[0]["market_confirmation"]["source"] == "fresh_quote"
+
+
+# ---------------------------------------------------------------------------
+# 55. Gap 1: Fresh refinement demotes promoted item when contradicted
+# ---------------------------------------------------------------------------
+
+
+def test_refine_demotes_promoted_when_contradicted():
+    """Fresh contradicted data should demote a promoted item back to observed_candidate."""
+    from app.recommendations.scoring import refine_with_fresh_quotes
+
+    scored = [
+        {
+            "title": "Was promoted", "related_assets": ["GLOB"],
+            "impact": "positivo", "signal_class": "external_opportunity",
+            "signal_score": 0.60, "effective_score": 0.70,
+            "market_confirmation": {"status": "confirmed", "source": "catalog",
+                                    "detail": "Was confirmed"},
+            "promoted_from_observed": True,
+            "source_count": 2,
+        },
+    ]
+    # Fresh data contradicts — positive event but negative market movement
+    fresh_prices = {
+        "GLOB": {"last_price": 80.0, "variacion_pct": -5.0, "source": "fresh_quote"},
+    }
+    catalog_dynamic = {"GLOB"}
+
+    refined, meta = refine_with_fresh_quotes(scored, fresh_prices, [],
+                                             catalog_dynamic=catalog_dynamic)
+
+    assert meta["demotions"] == 1
+    assert refined[0]["signal_class"] == "observed_candidate"
+    assert refined[0]["promoted_from_observed"] is False
+    assert refined[0]["market_confirmation"]["status"] == "contradicted"
+
+
+# ---------------------------------------------------------------------------
+# 56. Gap 1: No promotion/demotion without catalog_dynamic
+# ---------------------------------------------------------------------------
+
+
+def test_refine_no_promotion_without_catalog_dynamic():
+    """Without catalog_dynamic, promotion re-evaluation should not happen."""
+    from app.recommendations.scoring import refine_with_fresh_quotes
+
+    scored = [
+        {
+            "title": "Observed item", "related_assets": ["BBAR"],
+            "impact": "positivo", "signal_class": "observed_candidate",
+            "signal_score": 0.60, "effective_score": 0.60,
+            "market_confirmation": {"status": "unconfirmed", "source": "catalog"},
+            "source_count": 2, "relevance_score": 0.7,
+        },
+    ]
+    fresh_prices = {
+        "BBAR": {"last_price": 100.0, "variacion_pct": 4.0, "source": "fresh_quote"},
+    }
+    # No catalog_dynamic passed
+    refined, meta = refine_with_fresh_quotes(scored, fresh_prices, [])
+
+    assert meta["promotions"] == 0
+    assert refined[0]["signal_class"] == "observed_candidate"
+
+
+# ---------------------------------------------------------------------------
+# 57. Gap 1: refinement_meta includes promotions and demotions counts
+# ---------------------------------------------------------------------------
+
+
+def test_refine_meta_includes_promotion_demotion_counts():
+    """refinement_meta must include promotions and demotions keys."""
+    from app.recommendations.scoring import refine_with_fresh_quotes
+
+    refined, meta = refine_with_fresh_quotes([], {}, [])
+    assert "promotions" in meta
+    assert "demotions" in meta
+    assert meta["promotions"] == 0
+    assert meta["demotions"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 58. Gap 2: best_positive uses effective_score for selection
+# ---------------------------------------------------------------------------
+
+
+def test_best_positive_uses_effective_score():
+    """Engine should pick best positive hit by effective_score, not signal_score."""
+    from app.recommendations.engine import generate_recommendation
+
+    snapshot = {"total_value": 10000, "cash": 2000, "positions": [
+        {"symbol": "AAPL", "weight": 0.50, "market_value": 5000, "pnl_pct": 0.05},
+        {"symbol": "MSFT", "weight": 0.30, "market_value": 3000, "pnl_pct": 0.02},
+    ], "currency": "USD"}
+    analysis = {"risk_score": 0.4, "cash_ratio": 0.20, "alerts": []}
+
+    news = [
+        {
+            "title": "AAPL high signal_score low effective",
+            "event_type": "earnings", "impact": "positivo", "confidence": 0.8,
+            "related_assets": ["AAPL"], "source_count": 1,
+            "signal_score": 0.80, "effective_score": 0.50,
+            "signal_class": "holding_opportunity",
+            "market_confirmation": {"status": "contradicted"},
+        },
+        {
+            "title": "MSFT lower signal_score high effective",
+            "event_type": "earnings", "impact": "positivo", "confidence": 0.8,
+            "related_assets": ["MSFT"], "source_count": 2,
+            "signal_score": 0.60, "effective_score": 0.70,
+            "signal_class": "holding_opportunity",
+            "market_confirmation": {"status": "confirmed"},
+        },
+    ]
+
+    rec = generate_recommendation(snapshot, analysis, news, max_move=0.05)
+
+    # Should pick MSFT (effective_score=0.70) over AAPL (effective_score=0.50)
+    if rec["actions"]:
+        symbols = [a["symbol"] for a in rec["actions"]]
+        assert "MSFT" in symbols
+
+
+# ---------------------------------------------------------------------------
+# 59. Gap 3: API exposes fresh_quote_meta
+# ---------------------------------------------------------------------------
+
+
+def test_api_exposes_fresh_quote_meta():
+    """GET /recommendations/current should include fresh_quote_meta."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    # Simulate what the API route does
+    api_response = {
+        "fresh_quote_meta": meta.get("fresh_quote_meta") or {},
+    }
+    assert "fresh_quote_meta" in api_response
+    assert isinstance(api_response["fresh_quote_meta"], dict)

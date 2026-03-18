@@ -393,9 +393,11 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         if fresh_prices:
             scored_news, refinement_meta = refine_with_fresh_quotes(
                 scored_news, fresh_prices, positions,
+                catalog_dynamic=allowed_assets.get("catalog_dynamic", set()),
             )
         else:
-            refinement_meta = {"refined_count": 0, "symbols_used": []}
+            refinement_meta = {"refined_count": 0, "symbols_used": [],
+                               "promotions": 0, "demotions": 0}
         fresh_quote_meta = {
             "shortlist": shortlist_meta,
             "fetch": fetch_meta,

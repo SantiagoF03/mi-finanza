@@ -202,8 +202,8 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             rationale = _build_rationale(rationale_reasons, profile_label)
 
     elif positive_hits:
-        # Pick the best positive hit by signal_score (not just the first)
-        best_positive = max(positive_hits, key=lambda n: n.get("signal_score", n.get("pre_score", 0)))
+        # Pick the best positive hit by effective_score (market-adjusted), fallback to signal_score
+        best_positive = max(positive_hits, key=lambda n: n.get("effective_score", n.get("signal_score", 0)))
         related_in_portfolio = [
             s for s in best_positive.get("related_assets", []) if s in held_set
         ]
