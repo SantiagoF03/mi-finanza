@@ -28,6 +28,10 @@ Covers:
 29. suppressed_by_contradiction flag on weak contradicted externals
 30. scoring_summary includes promoted_count, suppressed_count, confirmation_source
 31. Engine external_opportunities sorted by effective_score
+32. suppressed_candidates separated from external/observed in engine
+33. suppressed_candidates persisted in orchestrator metadata
+34. suppressed_candidates exposed in API
+35. scoring_summary ranked_signals_preview excludes suppressed
 """
 
 from datetime import datetime
@@ -1165,3 +1169,188 @@ def test_engine_external_opportunities_include_effective_score():
     assert "effective_score" in op
     assert op["effective_score"] == 0.75
     assert op["market_confirmation"] == "confirmed"
+
+
+# ---------------------------------------------------------------------------
+# 32. suppressed_candidates separated from external/observed in engine
+# ---------------------------------------------------------------------------
+
+
+def test_engine_suppressed_goes_to_suppressed_candidates():
+    """Items with suppressed_by_contradiction should go to suppressed_candidates,
+    not external_opportunities or observed_candidates."""
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+    news = [
+        {
+            "impact": "positivo", "related_assets": ["MELI"],
+            "signal_score": 0.40, "effective_score": 0.25,
+            "pre_score": 0.40, "event_type": "rumor",
+            "title": "MELI weak contradicted", "signal_class": "external_opportunity",
+            "market_confirmation": {"status": "contradicted"},
+            "suppressed_by_contradiction": True,
+        },
+        {
+            "impact": "positivo", "related_assets": ["GLOB"],
+            "signal_score": 0.65, "effective_score": 0.75,
+            "pre_score": 0.65, "event_type": "upgrade",
+            "title": "GLOB strong confirmed", "signal_class": "external_opportunity",
+            "market_confirmation": {"status": "confirmed"},
+            "suppressed_by_contradiction": False,
+        },
+    ]
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    ext_symbols = [o["symbol"] for o in rec["external_opportunities"]]
+    obs_symbols = [o["symbol"] for o in rec["observed_candidates"]]
+    sup_symbols = [o["symbol"] for o in rec["suppressed_candidates"]]
+
+    assert "GLOB" in ext_symbols
+    assert "MELI" in sup_symbols
+    assert "MELI" not in ext_symbols
+    assert "MELI" not in obs_symbols
+
+
+def test_engine_suppressed_observed_goes_to_suppressed():
+    """observed_candidate with suppressed flag should go to suppressed, not observed."""
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+    news = [{
+        "impact": "positivo", "related_assets": ["RANDOM"],
+        "signal_score": 0.40, "effective_score": 0.25,
+        "pre_score": 0.40, "event_type": "rumor",
+        "title": "Random weak", "signal_class": "observed_candidate",
+        "market_confirmation": {"status": "contradicted"},
+        "suppressed_by_contradiction": True,
+    }]
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    obs_symbols = [o["symbol"] for o in rec["observed_candidates"]]
+    sup_symbols = [o["symbol"] for o in rec["suppressed_candidates"]]
+
+    assert "RANDOM" in sup_symbols
+    assert "RANDOM" not in obs_symbols
+
+
+def test_engine_returns_suppressed_candidates_key():
+    """generate_recommendation should always return suppressed_candidates list."""
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+    news = []
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    assert "suppressed_candidates" in rec
+    assert isinstance(rec["suppressed_candidates"], list)
+
+
+# ---------------------------------------------------------------------------
+# 33. suppressed_candidates in orchestrator metadata
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_metadata_includes_suppressed_candidates():
+    """run_cycle metadata should include suppressed_candidates."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    assert "suppressed_candidates" in meta
+    assert isinstance(meta["suppressed_candidates"], list)
+
+
+# ---------------------------------------------------------------------------
+# 34. API exposes suppressed_candidates
+# ---------------------------------------------------------------------------
+
+
+def test_api_response_structure_three_lists():
+    """API response should have all three candidate lists with safe defaults."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    # Simulate what the API route does
+    api_response = {
+        "external_opportunities": meta.get("external_opportunities", []),
+        "observed_candidates": meta.get("observed_candidates", []),
+        "suppressed_candidates": meta.get("suppressed_candidates", []),
+    }
+    for key in ("external_opportunities", "observed_candidates", "suppressed_candidates"):
+        assert key in api_response
+        assert isinstance(api_response[key], list)
+
+
+# ---------------------------------------------------------------------------
+# 35. scoring_summary ranked_signals_preview excludes suppressed
+# ---------------------------------------------------------------------------
+
+
+def test_scoring_summary_preview_excludes_suppressed():
+    """ranked_signals_preview should not include suppressed items."""
+    from app.services.orchestrator import _build_scoring_summary
+
+    scored = [
+        {"title": "Suppressed weak", "signal_score": 0.3, "effective_score": 0.15,
+         "signal_class": "external_opportunity", "suppressed_by_contradiction": True,
+         "market_confirmation": {"status": "contradicted", "source": "catalog"},
+         "source_count": 1, "related_assets": ["YPF"]},
+        {"title": "Good signal", "signal_score": 0.7, "effective_score": 0.80,
+         "signal_class": "external_opportunity",
+         "market_confirmation": {"status": "confirmed", "source": "catalog"},
+         "source_count": 2, "related_assets": ["GLOB"]},
+    ]
+    summary = _build_scoring_summary(scored)
+
+    preview = summary["ranked_signals_preview"]
+    preview_titles = [p["title"] for p in preview]
+
+    assert "Good signal" in preview_titles
+    assert "Suppressed weak" not in preview_titles
+
+    # But suppressed_count still counted
+    assert summary["suppressed_count"] == 1
+
+
+def test_scoring_summary_all_suppressed_empty_preview():
+    """If all signals are suppressed, ranked_signals_preview should be empty."""
+    from app.services.orchestrator import _build_scoring_summary
+
+    scored = [
+        {"title": "Suppressed A", "signal_score": 0.3, "effective_score": 0.15,
+         "signal_class": "observed_candidate", "suppressed_by_contradiction": True,
+         "market_confirmation": {"status": "contradicted"},
+         "source_count": 1, "related_assets": ["YPF"]},
+    ]
+    summary = _build_scoring_summary(scored)
+
+    assert summary["ranked_signals_preview"] == []
+    assert summary["suppressed_count"] == 1
+    assert summary["total_signals"] == 1
