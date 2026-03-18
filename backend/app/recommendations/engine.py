@@ -1,6 +1,9 @@
 from app.core.config import get_settings
 from app.portfolio.profiles import get_profile_label, get_profile_thresholds, resolve_profile
 
+# Minimum signal_score to count as a meaningful hit (filters noise)
+_MIN_SIGNAL_SCORE = 0.35
+
 
 def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], max_move: float) -> dict:
     settings = get_settings()
@@ -10,8 +13,20 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
     thresholds = get_profile_thresholds(profile)
 
     alerts = analysis.get("alerts", [])
-    negative_hits = [n for n in news if n.get("impact") == "negativo"]
-    positive_hits = [n for n in news if n.get("impact") == "positivo"]
+
+    # --- Signal-aware hit classification ---
+    # When items come enriched with signal_score/signal_class (from scoring.py),
+    # use them for better filtering. When not present, fall back to legacy behavior.
+    negative_hits = []
+    positive_hits = []
+    for n in news:
+        score = n.get("signal_score", n.get("pre_score", 0.5))
+        if score < _MIN_SIGNAL_SCORE:
+            continue  # Filter weak/noisy signals
+        if n.get("impact") == "negativo":
+            negative_hits.append(n)
+        elif n.get("impact") == "positivo":
+            positive_hits.append(n)
 
     held_symbols = [p.get("symbol") for p in snapshot.get("positions", []) if p.get("symbol")]
     held_set = set(held_symbols)
@@ -27,7 +42,15 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
     confidence = 0.55
     rationale_reasons = []
 
+    # --- External opportunities with signal_class awareness ---
     for item in news:
+        signal_class = item.get("signal_class", "")
+        item_score = item.get("signal_score", item.get("pre_score", 0.5))
+
+        # Skip very weak signals for opportunity detection too
+        if item_score < _MIN_SIGNAL_SCORE:
+            continue
+
         for symbol in item.get("related_assets", []):
             if symbol not in held_set:
                 external_opportunities.append(
@@ -37,6 +60,9 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
                         "confidence": item.get("confidence", 0.5),
                         "event_type": item.get("event_type", "otro"),
                         "impact": item.get("impact", "neutro"),
+                        "signal_class": signal_class,
+                        "signal_score": item_score,
+                        "source_count": item.get("source_count", 1),
                     }
                 )
 
@@ -49,6 +75,9 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         seen.add(key)
         dedup_ops.append(op)
     external_opportunities = dedup_ops
+
+    # Sort external opportunities by signal_score (best first)
+    external_opportunities.sort(key=lambda x: x.get("signal_score", 0), reverse=True)
 
     if "Portfolio vacío o sin valor." in alerts:
         confidence = 0.3
@@ -86,6 +115,17 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             })
             rationale = _build_rationale(rationale_reasons, profile_label)
             confidence = 0.72
+
+            # Boost confidence if holding_risk signals confirm concentration concern
+            holding_risks = [n for n in news if n.get("signal_class") == "holding_risk"
+                            and symbol in (n.get("related_assets") or [])]
+            if holding_risks:
+                confidence = min(0.85, confidence + 0.08)
+                rationale_reasons.append({
+                    "type": "signal_confirmation_reason",
+                    "detail": f"Riesgo confirmado por {len(holding_risks)} señal(es) negativa(s) sobre {symbol}.",
+                })
+                rationale = _build_rationale(rationale_reasons, profile_label)
 
     elif any(abs(v) > 0.07 for v in analysis.get("rebalance_deviation", {}).values()):
         candidate_deviations = {
@@ -144,19 +184,26 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             rationale = _build_rationale(rationale_reasons, profile_label)
 
     elif positive_hits:
-        related_in_portfolio = []
-        for item in positive_hits:
-            for symbol in item.get("related_assets", []):
-                if symbol in held_set:
-                    related_in_portfolio.append(symbol)
+        # Pick the best positive hit by signal_score (not just the first)
+        best_positive = max(positive_hits, key=lambda n: n.get("signal_score", n.get("pre_score", 0)))
+        related_in_portfolio = [
+            s for s in best_positive.get("related_assets", []) if s in held_set
+        ]
         if related_in_portfolio:
             asset = related_in_portfolio[0]
             action = "aumentar posición"
             pct = min(max_move, 0.04)
             actions = [{"symbol": asset, "target_change_pct": pct, "reason": "Evento positivo consistente"}]
+
+            # Detail with signal quality
+            source_count = best_positive.get("source_count", 1)
+            detail = f"Catalizador positivo en {asset}"
+            if source_count >= 2:
+                detail += f" (confirmado por {source_count} fuentes)"
+            detail += " con impacto acotado."
             rationale_reasons.append({
                 "type": "return_expectation_reason",
-                "detail": f"Catalizador positivo en {asset} con impacto acotado.",
+                "detail": detail,
             })
             rationale_reasons.append({
                 "type": "target_profile_reason",
@@ -164,6 +211,19 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             })
             rationale = _build_rationale(rationale_reasons, profile_label)
             confidence = 0.58
+
+            # Boost if market-confirmed
+            mkt_conf = best_positive.get("market_confirmation", {})
+            if mkt_conf.get("status") == "confirmed":
+                confidence = min(0.75, confidence + 0.10)
+                rationale_reasons.append({
+                    "type": "signal_confirmation_reason",
+                    "detail": f"Confirmación de mercado: {mkt_conf.get('detail', '')}",
+                })
+                rationale = _build_rationale(rationale_reasons, profile_label)
+            elif mkt_conf.get("status") == "contradicted":
+                confidence = max(0.40, confidence - 0.10)
+                risks += f" Señal contradecida por mercado ({mkt_conf.get('detail', '')})."
 
     if not news:
         confidence = min(confidence, 0.5)
@@ -211,6 +271,7 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         "rationale_reasons": rationale_reasons,
         "profile_applied": canonical_profile,
         "profile_label": profile_label,
+        "status": "pending",
     }
 
 

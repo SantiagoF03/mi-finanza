@@ -17,6 +17,7 @@ from app.news.ingestion import (
     get_llm_eligible_news,
     run_ingestion,
 )
+from app.recommendations.scoring import score_and_classify_news
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider, get_provider_info
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
@@ -136,6 +137,37 @@ def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int
             db.rollback()
             continue
     return inserted
+
+
+def _build_scoring_summary(scored_news: list[dict]) -> dict:
+    """Build observability summary from scored news items."""
+    by_class: dict[str, int] = {}
+    by_confirmation: dict[str, int] = {}
+    top_signals = []
+
+    for item in scored_news:
+        cls = item.get("signal_class", "unknown")
+        by_class[cls] = by_class.get(cls, 0) + 1
+
+        conf = (item.get("market_confirmation") or {}).get("status", "unknown")
+        by_confirmation[conf] = by_confirmation.get(conf, 0) + 1
+
+        if len(top_signals) < 5:
+            top_signals.append({
+                "title": item.get("title", "")[:100],
+                "signal_score": item.get("signal_score", 0),
+                "signal_class": cls,
+                "market_confirmation": conf,
+                "source_count": item.get("source_count", 1),
+                "related_assets": item.get("related_assets", [])[:5],
+            })
+
+    return {
+        "total_signals": len(scored_news),
+        "by_class": by_class,
+        "by_confirmation": by_confirmation,
+        "top_signals": top_signals,
+    }
 
 
 def _extract_cluster_traceability(news_items: list[dict]) -> list[dict]:
@@ -303,7 +335,12 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         catalog_map = {}
 
     allowed_assets = build_allowed_assets(positions, catalog_symbols=catalog_symbols)
-    rec = generate_recommendation(snapshot_dict, analysis, engine_news, settings.max_movement_per_cycle)
+
+    # --- Score and classify news signals (cluster-aware + market confirmation) ---
+    scored_news = score_and_classify_news(engine_news, positions, allowed_assets)
+    scoring_summary = _build_scoring_summary(scored_news)
+
+    rec = generate_recommendation(snapshot_dict, analysis, scored_news, settings.max_movement_per_cycle)
 
     # Replace news-only external_opportunities with full candidate sourcing
     rec["external_opportunities"] = generate_external_candidates(
@@ -418,6 +455,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "profile_label": rec.get("profile_label"),
             "news_mode": news_mode,
             "cluster_traceability": _extract_cluster_traceability(engine_news) if news_mode != "individual" else None,
+            "scoring_summary": scoring_summary,
         },
     )
     db.add(rec_model)
