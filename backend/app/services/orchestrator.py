@@ -142,13 +142,16 @@ def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int
 def _build_scoring_summary(scored_news: list[dict]) -> dict:
     """Build observability summary from scored news items.
 
-    ranked_signals_preview: top 5 items ordered by signal_score descending.
-    This is a pure-score ranking (not class-first), so the name reflects it.
+    ranked_signals_preview: top 5 items ordered by effective_score descending.
+    Includes promoted_count, suppressed_count, and confirmation source breakdown.
     """
     by_class: dict[str, int] = {}
     by_confirmation: dict[str, int] = {}
+    by_confirmation_source: dict[str, int] = {}
     actionable_count = 0
     observed_count = 0
+    promoted_count = 0
+    suppressed_count = 0
 
     entries = []
     for item in scored_news:
@@ -160,27 +163,43 @@ def _build_scoring_summary(scored_news: list[dict]) -> dict:
         else:
             actionable_count += 1
 
-        conf = (item.get("market_confirmation") or {}).get("status", "unknown")
+        if item.get("promoted_from_observed"):
+            promoted_count += 1
+        if item.get("suppressed_by_contradiction"):
+            suppressed_count += 1
+
+        conf_dict = item.get("market_confirmation") or {}
+        conf = conf_dict.get("status", "unknown")
         by_confirmation[conf] = by_confirmation.get(conf, 0) + 1
+
+        conf_source = conf_dict.get("source", "none")
+        by_confirmation_source[conf_source] = by_confirmation_source.get(conf_source, 0) + 1
 
         entries.append({
             "title": item.get("title", "")[:100],
             "signal_score": item.get("signal_score", 0),
+            "effective_score": item.get("effective_score", item.get("signal_score", 0)),
             "signal_class": cls,
             "market_confirmation": conf,
+            "confirmation_source": conf_source,
             "source_count": item.get("source_count", 1),
             "related_assets": item.get("related_assets", [])[:5],
+            "promoted_from_observed": item.get("promoted_from_observed", False),
+            "suppressed_by_contradiction": item.get("suppressed_by_contradiction", False),
         })
 
-    # Sort by signal_score descending for preview
-    entries.sort(key=lambda x: x["signal_score"], reverse=True)
+    # Sort by effective_score descending for preview
+    entries.sort(key=lambda x: x["effective_score"], reverse=True)
 
     return {
         "total_signals": len(scored_news),
         "actionable_count": actionable_count,
         "observed_count": observed_count,
+        "promoted_count": promoted_count,
+        "suppressed_count": suppressed_count,
         "by_class": by_class,
         "by_confirmation": by_confirmation,
+        "by_confirmation_source": by_confirmation_source,
         "ranked_signals_preview": entries[:5],
     }
 
