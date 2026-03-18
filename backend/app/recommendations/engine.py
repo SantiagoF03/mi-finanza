@@ -45,7 +45,9 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
     # --- External opportunities: only from external_opportunity class ---
     # observed_candidate items are tracked separately for observability
     # but do NOT enter the actionable opportunities list.
+    # suppressed items (contradicted + weak) are separated into their own list.
     observed_candidates = []
+    suppressed_candidates = []
     for item in news:
         signal_class = item.get("signal_class", "")
         item_score = item.get("signal_score", item.get("pre_score", 0.5))
@@ -72,7 +74,10 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
                 "suppressed_by_contradiction": item.get("suppressed_by_contradiction", False),
             }
 
-            if signal_class == "observed_candidate":
+            # Suppressed items go to their own list regardless of signal_class
+            if item.get("suppressed_by_contradiction"):
+                suppressed_candidates.append(entry)
+            elif signal_class == "observed_candidate":
                 observed_candidates.append(entry)
             else:
                 # external_opportunity, holding_opportunity (non-held asset), or legacy (no class)
@@ -281,6 +286,7 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         "actions": actions,
         "external_opportunities": external_opportunities,
         "observed_candidates": observed_candidates,
+        "suppressed_candidates": suppressed_candidates,
         "rebalance_observability": rebalance_obs,
         "rationale_reasons": rationale_reasons,
         "profile_applied": canonical_profile,

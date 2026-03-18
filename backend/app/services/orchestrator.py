@@ -191,6 +191,10 @@ def _build_scoring_summary(scored_news: list[dict]) -> dict:
     # Sort by effective_score descending for preview
     entries.sort(key=lambda x: x["effective_score"], reverse=True)
 
+    # Top actionable preview: exclude suppressed items so the preview
+    # shows the real top signals, not noise.
+    actionable_entries = [e for e in entries if not e.get("suppressed_by_contradiction")]
+
     return {
         "total_signals": len(scored_news),
         "actionable_count": actionable_count,
@@ -200,7 +204,7 @@ def _build_scoring_summary(scored_news: list[dict]) -> dict:
         "by_class": by_class,
         "by_confirmation": by_confirmation,
         "by_confirmation_source": by_confirmation_source,
-        "ranked_signals_preview": entries[:5],
+        "ranked_signals_preview": actionable_entries[:5],
     }
 
 
@@ -475,6 +479,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "ingestion": ingestion_meta,
             "external_opportunities": rec.get("external_opportunities", []),
             "observed_candidates": rec.get("observed_candidates", []),
+            "suppressed_candidates": rec.get("suppressed_candidates", []),
             "allowed_assets": {
                 "holdings": sorted(allowed_assets["holdings"]),
                 "whitelist": sorted(allowed_assets["whitelist"]),
