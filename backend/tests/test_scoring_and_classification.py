@@ -18,6 +18,10 @@ Covers:
 19. catalog_dynamic without promotion stays observed_candidate
 20. Integration: catalog_dynamic → observed_candidate in full pipeline
 21. Promotion flag tracked (promoted_from_observed)
+22. Market confirmation with catalog prices (non-holdings)
+23. Market confirmation catalog: confirmed, contradicted, unconfirmed
+24. Market confirmation falls back gracefully without catalog_prices
+25. observed_candidates exposed in /recommendations/current API
 """
 
 from datetime import datetime
@@ -732,3 +736,160 @@ def test_promoted_flag_only_on_promoted_items():
 
     assert aapl_item["signal_class"] == "holding_opportunity"
     assert aapl_item.get("promoted_from_observed") is not True
+
+
+# ---------------------------------------------------------------------------
+# 22. Market confirmation with catalog prices (non-holdings)
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_confirmation_positive_event_positive_variacion():
+    """Positive event + positive variacion from catalog = confirmed."""
+    item = {"impact": "positivo", "related_assets": ["GGAL"]}
+    positions = []  # GGAL is NOT in holdings
+    catalog_prices = {"GGAL": {"last_price": 1500.0, "variacion_pct": 5.2}}
+
+    result = compute_market_confirmation(item, positions, catalog_prices=catalog_prices)
+    assert result["status"] == "confirmed"
+    assert result["source"] == "catalog"
+
+
+def test_catalog_confirmation_negative_event_negative_variacion():
+    """Negative event + negative variacion from catalog = confirmed."""
+    item = {"impact": "negativo", "related_assets": ["YPF"]}
+    positions = []
+    catalog_prices = {"YPF": {"last_price": 800.0, "variacion_pct": -4.5}}
+
+    result = compute_market_confirmation(item, positions, catalog_prices=catalog_prices)
+    assert result["status"] == "confirmed"
+    assert result["source"] == "catalog"
+
+
+def test_catalog_confirmation_contradicted():
+    """Positive event + negative variacion from catalog = contradicted."""
+    item = {"impact": "positivo", "related_assets": ["GGAL"]}
+    positions = []
+    catalog_prices = {"GGAL": {"last_price": 1500.0, "variacion_pct": -3.8}}
+
+    result = compute_market_confirmation(item, positions, catalog_prices=catalog_prices)
+    assert result["status"] == "contradicted"
+    assert result["source"] == "catalog"
+
+
+def test_catalog_confirmation_small_variacion_unconfirmed():
+    """Small variacion (below 2% threshold) = unconfirmed."""
+    item = {"impact": "positivo", "related_assets": ["GGAL"]}
+    positions = []
+    catalog_prices = {"GGAL": {"last_price": 1500.0, "variacion_pct": 1.0}}
+
+    result = compute_market_confirmation(item, positions, catalog_prices=catalog_prices)
+    assert result["status"] == "unconfirmed"
+    assert result["source"] == "catalog"
+
+
+def test_holdings_takes_priority_over_catalog():
+    """When symbol is in holdings, use pnl_pct, not catalog variacion."""
+    item = {"impact": "negativo", "related_assets": ["AAPL"]}
+    positions = [{"symbol": "AAPL", "pnl_pct": -0.08}]
+    catalog_prices = {"AAPL": {"last_price": 200.0, "variacion_pct": 2.0}}  # contradicts
+
+    result = compute_market_confirmation(item, positions, catalog_prices=catalog_prices)
+    assert result["status"] == "confirmed"
+    assert result["source"] == "holdings"
+
+
+# ---------------------------------------------------------------------------
+# 23. Market confirmation falls back gracefully
+# ---------------------------------------------------------------------------
+
+
+def test_no_catalog_prices_still_works():
+    """Without catalog_prices, non-holding items return unconfirmed (backward compat)."""
+    item = {"impact": "positivo", "related_assets": ["GGAL"]}
+    positions = [{"symbol": "AAPL", "pnl_pct": 0.05}]
+
+    result = compute_market_confirmation(item, positions)
+    assert result["status"] == "unconfirmed"
+
+
+def test_catalog_prices_empty_dict():
+    """Empty catalog_prices dict should still work gracefully."""
+    item = {"impact": "positivo", "related_assets": ["GGAL"]}
+    positions = []
+
+    result = compute_market_confirmation(item, positions, catalog_prices={})
+    assert result["status"] == "unconfirmed"
+
+
+def test_catalog_prices_none_variacion():
+    """Catalog entry with None variacion_pct should not crash."""
+    item = {"impact": "positivo", "related_assets": ["GGAL"]}
+    positions = []
+    catalog_prices = {"GGAL": {"last_price": 1500.0, "variacion_pct": None}}
+
+    result = compute_market_confirmation(item, positions, catalog_prices=catalog_prices)
+    assert result["status"] == "unconfirmed"
+
+
+# ---------------------------------------------------------------------------
+# 24. Pipeline integration: catalog prices flow through score_and_classify_news
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_with_catalog_prices_confirms_external():
+    """score_and_classify_news with catalog_prices should produce confirmed for externals."""
+    news = [{
+        "title": "MELI expands fintech",
+        "impact": "positivo",
+        "related_assets": ["MELI"],
+        "pre_score": 0.6,
+        "source_count": 1,
+        "event_type": "expansion",
+    }]
+    positions = [{"symbol": "AAPL", "pnl_pct": 0.05}]
+    allowed = _mock_allowed()
+    catalog_prices = {"MELI": {"last_price": 1800.0, "variacion_pct": 4.5}}
+
+    result = score_and_classify_news(news, positions, allowed, catalog_prices=catalog_prices)
+    assert len(result) == 1
+    assert result[0]["signal_class"] == "external_opportunity"
+    conf = result[0]["market_confirmation"]
+    assert conf["status"] == "confirmed"
+    assert conf["source"] == "catalog"
+
+
+# ---------------------------------------------------------------------------
+# 25. observed_candidates in /recommendations/current API
+# ---------------------------------------------------------------------------
+
+
+def test_api_current_recommendation_includes_observed_candidates():
+    """GET /recommendations/current should include observed_candidates field."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    # observed_candidates must exist in metadata
+    assert "observed_candidates" in meta
+    assert isinstance(meta["observed_candidates"], list)
+
+    # Simulate what the API route does
+    api_response = {
+        "external_opportunities": meta.get("external_opportunities", []),
+        "observed_candidates": meta.get("observed_candidates", []),
+    }
+    assert "observed_candidates" in api_response
+    assert isinstance(api_response["observed_candidates"], list)

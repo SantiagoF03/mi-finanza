@@ -105,6 +105,7 @@ def current_recommendation(db: Session = Depends(get_db)):
         "news_is_mock": meta.get("news_is_mock"),
         "news_provider_info": meta.get("news_provider_info", {}),
         "external_opportunities": meta.get("external_opportunities", []),
+        "observed_candidates": meta.get("observed_candidates", []),
         "allowed_assets": meta.get("allowed_assets", {}),
         "unchanged": meta.get("unchanged", False),
         "unchanged_reason": meta.get("unchanged_reason", ""),

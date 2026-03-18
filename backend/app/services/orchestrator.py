@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.market.candidates import generate_external_candidates
 from app.market.assets import build_catalog_asset_type_map
-from app.market.discovery import get_eligible_universe_symbols, refresh_instrument_catalog
+from app.market.discovery import build_catalog_price_map, get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.ingestion import (
     get_engine_eligible_clusters,
@@ -349,10 +349,16 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     except Exception:
         catalog_map = {}
 
+    # Build catalog price map for market confirmation on non-holdings
+    try:
+        catalog_prices = build_catalog_price_map(db)
+    except Exception:
+        catalog_prices = {}
+
     allowed_assets = build_allowed_assets(positions, catalog_symbols=catalog_symbols)
 
     # --- Score and classify news signals (cluster-aware + market confirmation) ---
-    scored_news = score_and_classify_news(engine_news, positions, allowed_assets)
+    scored_news = score_and_classify_news(engine_news, positions, allowed_assets, catalog_prices=catalog_prices)
     scoring_summary = _build_scoring_summary(scored_news)
 
     rec = generate_recommendation(snapshot_dict, analysis, scored_news, settings.max_movement_per_cycle)
