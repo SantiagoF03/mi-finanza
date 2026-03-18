@@ -12,6 +12,12 @@ Covers:
 9. External opportunities include signal_class and signal_score
 10. Scoring summary appears in recommendation metadata
 11. Legacy (non-enriched) news still works
+12-16. observed_candidate / external_opportunity separation
+17. catalog_dynamic defaults to observed_candidate (not external_opportunity)
+18. catalog_dynamic promotion with strong evidence
+19. catalog_dynamic without promotion stays observed_candidate
+20. Integration: catalog_dynamic → observed_candidate in full pipeline
+21. Promotion flag tracked (promoted_from_observed)
 """
 
 from datetime import datetime
@@ -23,6 +29,7 @@ from app.db.session import Base
 from app.recommendations.scoring import (
     classify_signal,
     compute_market_confirmation,
+    promote_catalog_candidate,
     score_and_classify_news,
     score_news_item,
 )
@@ -59,9 +66,10 @@ def _mock_allowed():
         "holdings": {"AAPL", "SPY"},
         "whitelist": {"AAPL", "SPY", "QQQ", "AL30"},
         "watchlist": {"MELI", "GLOB"},
+        "universe_curated": {"MELI", "GLOB"},
+        "catalog_dynamic": {"GGAL", "YPF"},
         "universe": {"MELI", "GLOB", "GGAL", "YPF"},
         "main_allowed": {"AAPL", "SPY", "QQQ", "AL30"},
-        "catalog_dynamic": {"GGAL", "YPF"},
     }
 
 
@@ -505,3 +513,222 @@ def test_scoring_summary_counts_actionable_vs_observed():
     assert summary["actionable_count"] == 2
     assert summary["observed_count"] == 2
     assert summary["total_signals"] == 4
+
+
+# ---------------------------------------------------------------------------
+# 17. catalog_dynamic defaults to observed_candidate
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_dynamic_defaults_to_observed_candidate():
+    """A symbol only in catalog_dynamic (not in watchlist/universe_curated/main_allowed)
+    should classify as observed_candidate, NOT external_opportunity."""
+    # GGAL is in catalog_dynamic but NOT in watchlist or universe_curated
+    item = {"impact": "positivo", "related_assets": ["GGAL"]}
+    # universe_curated does NOT include GGAL
+    cls = classify_signal(item, {"AAPL"}, {"AAPL"}, {"MELI"}, {"MELI"})
+    assert cls == "observed_candidate"
+
+
+def test_catalog_dynamic_in_curated_is_external_opportunity():
+    """A symbol in both catalog_dynamic AND universe_curated should be external_opportunity."""
+    item = {"impact": "positivo", "related_assets": ["MELI"]}
+    # MELI is in both watchlist and universe_curated
+    cls = classify_signal(item, {"AAPL"}, {"AAPL"}, {"MELI"}, {"MELI"})
+    assert cls == "external_opportunity"
+
+
+# ---------------------------------------------------------------------------
+# 18. catalog_dynamic promotion with strong evidence
+# ---------------------------------------------------------------------------
+
+
+def test_promote_catalog_candidate_multi_source():
+    """catalog_dynamic item with source_count>=2 and high score should be promoted."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.65,
+        "related_assets": ["GGAL"],
+        "source_count": 2,
+    }
+    assert promote_catalog_candidate(item, {"GGAL", "YPF"}) is True
+
+
+def test_promote_catalog_candidate_high_relevance():
+    """catalog_dynamic item with high relevance_score should be promoted."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.60,
+        "related_assets": ["YPF"],
+        "source_count": 1,
+        "relevance_score": 0.7,
+    }
+    assert promote_catalog_candidate(item, {"GGAL", "YPF"}) is True
+
+
+def test_promote_catalog_candidate_external_opp_flag():
+    """catalog_dynamic item with external_opportunity_candidate flag should be promoted."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.58,
+        "related_assets": ["GGAL"],
+        "source_count": 1,
+        "external_opportunity_candidate": True,
+    }
+    assert promote_catalog_candidate(item, {"GGAL"}) is True
+
+
+def test_promote_catalog_candidate_market_confirmed():
+    """catalog_dynamic item with market confirmation should be promoted."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.60,
+        "related_assets": ["GGAL"],
+        "source_count": 1,
+        "market_confirmation": {"status": "confirmed"},
+    }
+    assert promote_catalog_candidate(item, {"GGAL"}) is True
+
+
+# ---------------------------------------------------------------------------
+# 19. catalog_dynamic WITHOUT promotion stays observed_candidate
+# ---------------------------------------------------------------------------
+
+
+def test_no_promote_low_score():
+    """catalog_dynamic item with low signal_score should NOT be promoted."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.40,
+        "related_assets": ["GGAL"],
+        "source_count": 3,
+    }
+    assert promote_catalog_candidate(item, {"GGAL"}) is False
+
+
+def test_no_promote_weak_evidence():
+    """catalog_dynamic item with score above min but no strong evidence should NOT be promoted."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.56,
+        "related_assets": ["GGAL"],
+        "source_count": 1,
+        "relevance_score": 0.3,
+    }
+    assert promote_catalog_candidate(item, {"GGAL"}) is False
+
+
+def test_no_promote_non_catalog_symbol():
+    """Item relating to symbol NOT in catalog_dynamic should NOT be promoted."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.70,
+        "related_assets": ["RANDOM_TICKER"],
+        "source_count": 3,
+    }
+    assert promote_catalog_candidate(item, {"GGAL", "YPF"}) is False
+
+
+def test_no_promote_already_external():
+    """Items already classified as external_opportunity should not be promoted."""
+    item = {
+        "signal_class": "external_opportunity",
+        "signal_score": 0.80,
+        "related_assets": ["GGAL"],
+        "source_count": 3,
+    }
+    assert promote_catalog_candidate(item, {"GGAL"}) is False
+
+
+# ---------------------------------------------------------------------------
+# 20. Integration: catalog_dynamic → observed_candidate in full pipeline
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_catalog_dynamic_observed_by_default():
+    """score_and_classify_news should classify catalog-only items as observed_candidate."""
+    news = [{
+        "title": "GGAL earnings strong",
+        "impact": "positivo",
+        "related_assets": ["GGAL"],
+        "pre_score": 0.5,
+        "source_count": 1,
+        "event_type": "earnings",
+    }]
+    positions = [{"symbol": "AAPL", "pnl_pct": 0.05}]
+    allowed = _mock_allowed()
+
+    result = score_and_classify_news(news, positions, allowed)
+    assert len(result) == 1
+    assert result[0]["signal_class"] == "observed_candidate"
+
+
+def test_pipeline_catalog_dynamic_promoted_with_evidence():
+    """score_and_classify_news should promote catalog item with strong evidence."""
+    news = [{
+        "title": "GGAL multi-source strong signal",
+        "impact": "positivo",
+        "related_assets": ["GGAL"],
+        "pre_score": 0.6,
+        "source_count": 3,
+        "item_count": 5,
+        "event_type": "upgrade",
+    }]
+    positions = [{"symbol": "AAPL", "pnl_pct": 0.05}]
+    allowed = _mock_allowed()
+
+    result = score_and_classify_news(news, positions, allowed)
+    assert len(result) == 1
+    assert result[0]["signal_class"] == "external_opportunity"
+    assert result[0].get("promoted_from_observed") is True
+
+
+def test_pipeline_watchlist_still_external_opportunity():
+    """Watchlist items should remain external_opportunity (not affected by catalog fix)."""
+    news = [{
+        "title": "MELI fintech expansion",
+        "impact": "positivo",
+        "related_assets": ["MELI"],
+        "pre_score": 0.5,
+        "source_count": 1,
+        "event_type": "expansion",
+    }]
+    positions = [{"symbol": "AAPL", "pnl_pct": 0.05}]
+    allowed = _mock_allowed()
+
+    result = score_and_classify_news(news, positions, allowed)
+    assert len(result) == 1
+    assert result[0]["signal_class"] == "external_opportunity"
+    assert result[0].get("promoted_from_observed") is not True
+
+
+# ---------------------------------------------------------------------------
+# 21. Promotion flag tracked
+# ---------------------------------------------------------------------------
+
+
+def test_promoted_flag_only_on_promoted_items():
+    """promoted_from_observed should only appear on items that were actually promoted."""
+    news = [
+        {
+            "title": "GGAL weak signal", "impact": "positivo", "related_assets": ["GGAL"],
+            "pre_score": 0.3, "source_count": 1, "event_type": "rumor",
+        },
+        {
+            "title": "AAPL holding event", "impact": "positivo", "related_assets": ["AAPL"],
+            "pre_score": 0.6, "source_count": 2, "event_type": "earnings",
+        },
+    ]
+    positions = [{"symbol": "AAPL", "pnl_pct": 0.05}]
+    allowed = _mock_allowed()
+
+    result = score_and_classify_news(news, positions, allowed)
+
+    ggal_item = [r for r in result if "GGAL" in r.get("related_assets", [])][0]
+    aapl_item = [r for r in result if "AAPL" in r.get("related_assets", [])][0]
+
+    assert ggal_item["signal_class"] == "observed_candidate"
+    assert ggal_item.get("promoted_from_observed") is not True
+
+    assert aapl_item["signal_class"] == "holding_opportunity"
+    assert aapl_item.get("promoted_from_observed") is not True

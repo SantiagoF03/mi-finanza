@@ -168,21 +168,25 @@ def classify_signal(
     held_symbols: set,
     main_allowed: set,
     watchlist: set,
-    universe: set,
+    universe_curated: set,
 ) -> str:
     """Classify a news/cluster item into one of four signal classes.
 
     Priority:
     1. holding_risk: negative impact + affects holdings
     2. holding_opportunity: positive impact + affects holdings
-    3. external_opportunity: affects main_allowed/watchlist/universe (investable, not held)
+    3. external_opportunity: affects main_allowed/watchlist/universe_curated (NOT catalog_dynamic)
     4. observed_candidate: everything else (catalog-only, untracked)
+
+    NOTE: catalog_dynamic is intentionally excluded from the universe check.
+    Catalog-only items default to observed_candidate and require explicit
+    promotion via promote_catalog_candidate() to become external_opportunity.
     """
     impact = item.get("impact", "neutro")
     related = set(item.get("related_assets", []))
 
     touches_holdings = bool(related & held_symbols) or item.get("affects_holdings", False)
-    touches_allowed = bool(related & (main_allowed | watchlist | universe))
+    touches_allowed = bool(related & (main_allowed | watchlist | universe_curated))
 
     if touches_holdings:
         if impact == "negativo":
@@ -193,6 +197,61 @@ def classify_signal(
         return "external_opportunity"
 
     return "observed_candidate"
+
+
+# ---------------------------------------------------------------------------
+# Parte C.2 — Catalog promotion: observed_candidate → external_opportunity
+# ---------------------------------------------------------------------------
+
+# Minimum thresholds for catalog_dynamic promotion
+_PROMO_MIN_SIGNAL_SCORE = 0.55
+_PROMO_MIN_SOURCE_COUNT = 2
+
+
+def promote_catalog_candidate(item: dict, catalog_dynamic: set) -> bool:
+    """Determine if an observed_candidate from catalog_dynamic should be promoted
+    to external_opportunity.
+
+    Promotion requires STRONG evidence — multiple criteria must be met:
+    1. Item relates to a catalog_dynamic symbol (mandatory)
+    2. signal_score >= 0.55 (above noise threshold)
+    3. At least ONE of:
+       a. source_count >= 2 (multi-source corroboration)
+       b. relevance_score >= 0.6 (high cluster relevance)
+       c. external_opportunity_candidate flag from cluster triage
+       d. llm_candidate flag from cluster triage
+       e. market_confirmation status == "confirmed"
+
+    Returns True if the item should be promoted.
+    """
+    if item.get("signal_class") != "observed_candidate":
+        return False
+
+    related = set(item.get("related_assets", []))
+    if not (related & catalog_dynamic):
+        return False  # Not from catalog_dynamic — don't touch
+
+    score = item.get("signal_score", 0)
+    if score < _PROMO_MIN_SIGNAL_SCORE:
+        return False
+
+    # At least one strong evidence criterion
+    source_count = item.get("source_count", 1)
+    relevance = float(item.get("relevance_score", 0) or 0)
+    mkt_conf = (item.get("market_confirmation") or {}).get("status", "")
+
+    if source_count >= _PROMO_MIN_SOURCE_COUNT:
+        return True
+    if relevance >= 0.6:
+        return True
+    if item.get("external_opportunity_candidate"):
+        return True
+    if item.get("llm_candidate"):
+        return True
+    if mkt_conf == "confirmed":
+        return True
+
+    return False
 
 
 def score_and_classify_news(
@@ -206,6 +265,11 @@ def score_and_classify_news(
     - signal_score (float 0-1)
     - signal_class (str)
     - market_confirmation (dict)
+    - promoted_from_observed (bool, only if promoted)
+
+    Classification uses universe_curated (NOT universe which includes catalog_dynamic).
+    catalog_dynamic items default to observed_candidate and are promoted only if
+    they meet strong evidence criteria via promote_catalog_candidate().
 
     Returns items sorted by: signal_class priority (risk first), then signal_score desc.
     Items are NOT filtered — all are returned, just ranked better.
@@ -213,16 +277,25 @@ def score_and_classify_news(
     held_symbols = set(allowed_assets.get("holdings", set()))
     main_allowed = set(allowed_assets.get("main_allowed", set()))
     watchlist = set(allowed_assets.get("watchlist", set()))
-    universe = set(allowed_assets.get("universe", set()))
-    all_allowed = main_allowed | watchlist | universe
+    universe_curated = set(allowed_assets.get("universe_curated", set()))
+    catalog_dynamic = set(allowed_assets.get("catalog_dynamic", set()))
+    # all_allowed still includes catalog_dynamic for scoring boosts (not classification)
+    all_allowed = main_allowed | watchlist | universe_curated | catalog_dynamic
 
     scored = []
     for item in news:
         enriched = dict(item)  # shallow copy — don't mutate originals
 
         enriched["signal_score"] = score_news_item(item, held_symbols, all_allowed)
-        enriched["signal_class"] = classify_signal(item, held_symbols, main_allowed, watchlist, universe)
+        enriched["signal_class"] = classify_signal(
+            item, held_symbols, main_allowed, watchlist, universe_curated,
+        )
         enriched["market_confirmation"] = compute_market_confirmation(item, positions)
+
+        # Promotion: catalog_dynamic observed_candidate → external_opportunity
+        if promote_catalog_candidate(enriched, catalog_dynamic):
+            enriched["signal_class"] = "external_opportunity"
+            enriched["promoted_from_observed"] = True
 
         scored.append(enriched)
 
