@@ -1354,3 +1354,210 @@ def test_scoring_summary_all_suppressed_empty_preview():
     assert summary["ranked_signals_preview"] == []
     assert summary["suppressed_count"] == 1
     assert summary["total_signals"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 36. curate_llm_input excludes suppressed items
+# ---------------------------------------------------------------------------
+
+
+def test_curate_llm_input_excludes_suppressed():
+    """Suppressed items should be excluded from LLM input."""
+    from app.recommendations.scoring import curate_llm_input
+
+    scored = [
+        {"title": "Suppressed", "effective_score": 0.40, "signal_class": "external_opportunity",
+         "suppressed_by_contradiction": True, "source_count": 1},
+        {"title": "Good holding risk", "effective_score": 0.70, "signal_class": "holding_risk",
+         "source_count": 2},
+    ]
+    curated, meta = curate_llm_input(scored)
+
+    titles = [c["title"] for c in curated]
+    assert "Suppressed" not in titles
+    assert "Good holding risk" in titles
+    assert meta["excluded_suppressed"] == 1
+    assert meta["sent_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 37. curate_llm_input excludes weak effective_score
+# ---------------------------------------------------------------------------
+
+
+def test_curate_llm_input_excludes_weak():
+    """Items with effective_score < 0.30 should be excluded."""
+    from app.recommendations.scoring import curate_llm_input
+
+    scored = [
+        {"title": "Too weak", "effective_score": 0.20, "signal_class": "holding_opportunity",
+         "source_count": 1},
+        {"title": "Strong enough", "effective_score": 0.50, "signal_class": "holding_opportunity",
+         "source_count": 1},
+    ]
+    curated, meta = curate_llm_input(scored)
+
+    titles = [c["title"] for c in curated]
+    assert "Too weak" not in titles
+    assert "Strong enough" in titles
+    assert meta["excluded_weak"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 38. curate_llm_input excludes non-promoted observed_candidate
+# ---------------------------------------------------------------------------
+
+
+def test_curate_llm_input_excludes_observed_candidate():
+    """observed_candidate without promotion should be excluded (noise)."""
+    from app.recommendations.scoring import curate_llm_input
+
+    scored = [
+        {"title": "Observed not promoted", "effective_score": 0.60,
+         "signal_class": "observed_candidate", "source_count": 1},
+        {"title": "Promoted observed", "effective_score": 0.65,
+         "signal_class": "external_opportunity", "promoted_from_observed": True,
+         "source_count": 2},
+        {"title": "Holding risk", "effective_score": 0.70,
+         "signal_class": "holding_risk", "source_count": 1},
+    ]
+    curated, meta = curate_llm_input(scored)
+
+    titles = [c["title"] for c in curated]
+    assert "Observed not promoted" not in titles
+    assert "Promoted observed" in titles
+    assert "Holding risk" in titles
+    assert meta["excluded_observed"] == 1
+    assert meta["sent_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 39. curate_llm_input ranking: class priority + effective_score + source_count
+# ---------------------------------------------------------------------------
+
+
+def test_curate_llm_input_ranking():
+    """Items should be ranked by class priority, then effective_score desc, then source_count desc."""
+    from app.recommendations.scoring import curate_llm_input
+
+    scored = [
+        {"title": "External high", "effective_score": 0.90,
+         "signal_class": "external_opportunity", "source_count": 3},
+        {"title": "Holding risk low", "effective_score": 0.40,
+         "signal_class": "holding_risk", "source_count": 1},
+        {"title": "Holding opp mid", "effective_score": 0.60,
+         "signal_class": "holding_opportunity", "source_count": 2},
+        {"title": "Holding risk high", "effective_score": 0.80,
+         "signal_class": "holding_risk", "source_count": 2},
+    ]
+    curated, meta = curate_llm_input(scored)
+
+    titles = [c["title"] for c in curated]
+    # holding_risk items first (class priority 0), then holding_opportunity (1), then external (2)
+    assert titles[0] == "Holding risk high"
+    assert titles[1] == "Holding risk low"
+    assert titles[2] == "Holding opp mid"
+    assert titles[3] == "External high"
+    assert meta["sent_count"] == 4
+
+
+# ---------------------------------------------------------------------------
+# 40. curate_llm_input respects max_items cap
+# ---------------------------------------------------------------------------
+
+
+def test_curate_llm_input_max_items():
+    """Output should be capped at max_items."""
+    from app.recommendations.scoring import curate_llm_input
+
+    scored = [
+        {"title": f"Item {i}", "effective_score": 0.50 + i * 0.01,
+         "signal_class": "holding_opportunity", "source_count": 1}
+        for i in range(20)
+    ]
+    curated, meta = curate_llm_input(scored, max_items=5)
+
+    assert len(curated) == 5
+    assert meta["eligible_count"] == 20
+    assert meta["sent_count"] == 5
+    assert meta["max_items"] == 5
+
+
+# ---------------------------------------------------------------------------
+# 41. curate_llm_input observability: sent_classes breakdown
+# ---------------------------------------------------------------------------
+
+
+def test_curate_llm_input_observability():
+    """llm_input_meta should include class breakdown and exclusion counts."""
+    from app.recommendations.scoring import curate_llm_input
+
+    scored = [
+        {"title": "HR1", "effective_score": 0.80, "signal_class": "holding_risk", "source_count": 2},
+        {"title": "HR2", "effective_score": 0.70, "signal_class": "holding_risk", "source_count": 1},
+        {"title": "HO1", "effective_score": 0.60, "signal_class": "holding_opportunity", "source_count": 1},
+        {"title": "EO1", "effective_score": 0.50, "signal_class": "external_opportunity", "source_count": 1},
+        {"title": "Weak", "effective_score": 0.10, "signal_class": "holding_risk", "source_count": 1},
+        {"title": "OC1", "effective_score": 0.55, "signal_class": "observed_candidate", "source_count": 1},
+        {"title": "Sup", "effective_score": 0.35, "signal_class": "external_opportunity",
+         "suppressed_by_contradiction": True, "source_count": 1},
+    ]
+    curated, meta = curate_llm_input(scored)
+
+    assert meta["total_scored"] == 7
+    assert meta["excluded_suppressed"] == 1
+    assert meta["excluded_weak"] == 1
+    assert meta["excluded_observed"] == 1
+    assert meta["eligible_count"] == 4
+    assert meta["sent_count"] == 4
+    assert meta["sent_classes"] == {
+        "holding_risk": 2,
+        "holding_opportunity": 1,
+        "external_opportunity": 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 42. curate_llm_input empty scored_news returns empty
+# ---------------------------------------------------------------------------
+
+
+def test_curate_llm_input_empty():
+    """Empty scored_news should return empty curated list."""
+    from app.recommendations.scoring import curate_llm_input
+
+    curated, meta = curate_llm_input([])
+    assert curated == []
+    assert meta["total_scored"] == 0
+    assert meta["sent_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 43. Orchestrator persists llm_input_meta in metadata_json
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_llm_input_meta_persisted():
+    """metadata_json should contain llm_input_meta from curation."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    assert "llm_input_meta" in meta
+    llm_meta = meta["llm_input_meta"]
+    # Should have the standard curation keys (not fallback, since scored_news is always populated)
+    assert "sent_count" in llm_meta
+    assert "total_scored" in llm_meta or "fallback" in llm_meta

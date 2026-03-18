@@ -17,7 +17,7 @@ from app.news.ingestion import (
     get_llm_eligible_news,
     run_ingestion,
 )
-from app.recommendations.scoring import score_and_classify_news
+from app.recommendations.scoring import curate_llm_input, score_and_classify_news
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider, get_provider_info
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
@@ -433,13 +433,20 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     rec.pop("_news_items", None)
 
     # --- LLM explanation layer (best-effort, never breaks cycle) ---
-    # LLM only receives send_to_llm + trigger_recalc (stricter than engine)
-    if settings.use_clusters:
-        llm_news_items = get_llm_eligible_clusters(db)
-        if not llm_news_items:
-            llm_news_items = get_llm_eligible_news(db)
+    # Curate LLM input from scored_news (excludes suppressed, weak, observed).
+    # Fallback to raw llm_news_items when scored_news is empty (backward compat).
+    llm_input_meta = {}
+    if scored_news:
+        llm_news_items, llm_input_meta = curate_llm_input(scored_news)
     else:
-        llm_news_items = get_llm_eligible_news(db)
+        # Fallback: no scoring available — use raw DB-sourced items
+        if settings.use_clusters:
+            llm_news_items = get_llm_eligible_clusters(db)
+            if not llm_news_items:
+                llm_news_items = get_llm_eligible_news(db)
+        else:
+            llm_news_items = get_llm_eligible_news(db)
+        llm_input_meta = {"fallback": True, "sent_count": len(llm_news_items)}
 
     news_summary = None
     recommendation_explanation_llm = None
@@ -502,6 +509,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_mode": news_mode,
             "cluster_traceability": _extract_cluster_traceability(engine_news) if news_mode != "individual" else None,
             "scoring_summary": scoring_summary,
+            "llm_input_meta": llm_input_meta,
         },
     )
     db.add(rec_model)

@@ -107,7 +107,7 @@ def test_orchestrator_metadata_includes_ingestion_and_llm_count():
 
 
 def test_orchestrator_no_llm_call_without_eligible_news():
-    """When no triage-eligible news exists, LLM should not be called."""
+    """When no curated news passes LLM curation, LLM should not be called."""
     db = make_db()
     s = get_settings()
     s.trigger_cooldown_seconds = 0
@@ -120,14 +120,14 @@ def test_orchestrator_no_llm_call_without_eligible_news():
         summarize_called.append(True)
         return "summary"
 
-    # Patch get_llm_eligible_news to return empty
-    with patch("app.services.orchestrator.get_llm_eligible_news", return_value=[]), \
+    # Patch curate_llm_input to return empty (simulates all items excluded)
+    with patch("app.services.orchestrator.curate_llm_input", return_value=([], {"sent_count": 0})), \
          patch("app.services.orchestrator.llm_summarize", side_effect=mock_summarize), \
          patch("app.services.orchestrator.llm_explain", return_value="expl"):
         result = run_cycle(db, source="test")
 
     assert "recommendation_id" in result
-    # LLM should NOT have been called since no eligible news
+    # LLM should NOT have been called since curated input is empty
     assert len(summarize_called) == 0
 
     s.llm_enabled = False
