@@ -100,7 +100,8 @@ def test_run_ingestion_includes_clustering_metadata():
 def test_same_topic_hash_same_bucket_one_cluster():
     """Two items with same topic_hash in same 12h bucket -> one cluster."""
     db, _ = make_db()
-    now = datetime.utcnow()
+    # Fixed time safely in H0 bucket (9:00 UTC) so +2h = 11:00 stays in H0
+    now = datetime(2026, 3, 17, 9, 0, 0)
 
     _insert_normalized(db, title="Fed raises rates impact on SPY",
                        topic_hash="abc123", published_at=now, source="reuters",
@@ -232,7 +233,8 @@ def test_get_recent_clusters_include_items():
 def test_clustering_metadata_counts_are_correct():
     """clusters_touched == clusters_created + clusters_updated; items_clustered is accurate."""
     db, _ = make_db()
-    now = datetime.utcnow()
+    # Fixed time safely in H0 bucket so +1h stays within same bucket
+    now = datetime(2026, 3, 17, 10, 0, 0)
 
     # Create 3 items: 2 same cluster, 1 different
     _insert_normalized(db, title="A1", topic_hash="aaa", published_at=now)
@@ -432,7 +434,8 @@ def test_items_have_event_cluster_id_set():
 def test_get_engine_eligible_clusters_returns_correct_format():
     """Cluster-sourced dicts must have same keys as _news_rows_to_dicts + traceability."""
     db, _ = make_db()
-    now = datetime.utcnow()
+    # Fixed time safely in H0 bucket so +1h stays within same bucket
+    now = datetime(2026, 3, 17, 10, 0, 0)
 
     _insert_normalized(db, title="Engine cluster A", topic_hash="eng01",
                        published_at=now, pre_score=0.6, triage_level="observe",
@@ -519,7 +522,8 @@ def test_get_llm_eligible_clusters_only_llm_candidates():
 def test_cluster_deduplication_over_individual_items():
     """5 items about the same event should become 1 cluster entry, not 5."""
     db, _ = make_db()
-    now = datetime.utcnow()
+    # Fixed time safely in H0 bucket; max offset is 4*30=120min, 10:00+2h=12:00 → use 9:00
+    now = datetime(2026, 3, 17, 9, 0, 0)
 
     for i in range(5):
         _insert_normalized(
