@@ -427,3 +427,85 @@ def score_and_classify_news(
     ))
 
     return scored
+
+
+# ---------------------------------------------------------------------------
+# Parte D — LLM input curation
+# ---------------------------------------------------------------------------
+
+# Minimum effective_score to send an item to the LLM (filters noise)
+_LLM_MIN_EFFECTIVE_SCORE = 0.30
+_LLM_MAX_ITEMS = 15
+
+
+def curate_llm_input(
+    scored_news: list[dict],
+    max_items: int = _LLM_MAX_ITEMS,
+) -> tuple[list[dict], dict]:
+    """Curate scored news for LLM input: exclude noise, rank by quality.
+
+    Exclusion policy:
+    1. suppressed_by_contradiction → excluded (contradicted + weak)
+    2. effective_score < 0.30 → excluded (too weak for LLM context)
+    3. observed_candidate without promotion → excluded (unvetted noise)
+
+    Ranking (items that pass):
+    1. signal_class priority (holding_risk first)
+    2. effective_score descending
+    3. source_count descending (tiebreaker)
+
+    Returns (curated_items, llm_input_meta).
+    curated_items: list of enriched news dicts, capped at max_items.
+    llm_input_meta: observability dict for metadata_json.
+    """
+    excluded_suppressed = 0
+    excluded_weak = 0
+    excluded_observed = 0
+    eligible = []
+
+    for item in scored_news:
+        # Exclusion 1: suppressed by contradiction
+        if item.get("suppressed_by_contradiction"):
+            excluded_suppressed += 1
+            continue
+
+        # Exclusion 2: weak effective_score
+        if item.get("effective_score", 0) < _LLM_MIN_EFFECTIVE_SCORE:
+            excluded_weak += 1
+            continue
+
+        # Exclusion 3: observed_candidate not promoted
+        if (item.get("signal_class") == "observed_candidate"
+                and not item.get("promoted_from_observed")):
+            excluded_observed += 1
+            continue
+
+        eligible.append(item)
+
+    # Rank: class priority → effective_score desc → source_count desc
+    eligible.sort(key=lambda x: (
+        _SIGNAL_CLASS_PRIORITY.get(x.get("signal_class", ""), 99),
+        -x.get("effective_score", 0),
+        -x.get("source_count", 1),
+    ))
+
+    curated = eligible[:max_items]
+
+    # Observability: breakdown of what was sent by signal_class
+    sent_classes: dict[str, int] = {}
+    for item in curated:
+        cls = item.get("signal_class", "unknown")
+        sent_classes[cls] = sent_classes.get(cls, 0) + 1
+
+    llm_input_meta = {
+        "total_scored": len(scored_news),
+        "excluded_suppressed": excluded_suppressed,
+        "excluded_weak": excluded_weak,
+        "excluded_observed": excluded_observed,
+        "eligible_count": len(eligible),
+        "sent_count": len(curated),
+        "sent_classes": sent_classes,
+        "max_items": max_items,
+    }
+
+    return curated, llm_input_meta
