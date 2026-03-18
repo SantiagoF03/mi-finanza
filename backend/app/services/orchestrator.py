@@ -233,6 +233,137 @@ def _extract_cluster_traceability(news_items: list[dict]) -> list[dict]:
     return result
 
 
+def _build_decision_summary(
+    rec: dict,
+    scored_news: list[dict],
+    scoring_summary: dict,
+    llm_input_meta: dict,
+    fresh_quote_meta: dict,
+    unchanged: bool,
+    unchanged_reason: str,
+) -> dict:
+    """Build a unified decision explainability summary.
+
+    Derives all fields from real pipeline data — never invents explanations.
+    The primary_driver is inferred from the engine's actual decision branch
+    (action + rationale_reasons), not from a separate scoring pass.
+    """
+    action = rec.get("action", "mantener")
+    actions = rec.get("actions", [])
+    rationale_reasons = rec.get("rationale_reasons", [])
+    reason_types = {r.get("type") for r in rationale_reasons}
+
+    # --- Primary driver: infer from engine decision ---
+    if unchanged:
+        primary_driver = "unchanged"
+    elif action == "reducir riesgo":
+        primary_driver = "concentration"
+    elif action == "rebalancear":
+        primary_driver = "rebalance"
+    elif action == "aumentar posición":
+        primary_driver = "positive_signal"
+    elif not scored_news:
+        primary_driver = "empty_portfolio" if "Portfolio vacío" in rec.get("rationale", "") else "no_signal"
+    else:
+        primary_driver = "no_signal"
+
+    # --- Winning signal: the item from scored_news that drove the action ---
+    winning_signal = None
+    if actions and primary_driver in ("positive_signal", "concentration", "rebalance"):
+        target_symbol = actions[0].get("symbol")
+        if target_symbol:
+            # Find the best scored_news item for this symbol
+            candidates = [
+                n for n in scored_news
+                if target_symbol in (n.get("related_assets") or [])
+            ]
+            if candidates:
+                best = max(candidates, key=lambda n: n.get("effective_score", 0))
+                winning_signal = {
+                    "symbol": target_symbol,
+                    "title": best.get("title", "")[:120],
+                    "signal_class": best.get("signal_class"),
+                    "signal_score": best.get("signal_score"),
+                    "effective_score": best.get("effective_score"),
+                    "source_count": best.get("source_count", 1),
+                    "market_confirmation": (best.get("market_confirmation") or {}).get("status"),
+                    "confirmation_source": (best.get("market_confirmation") or {}).get("source"),
+                    "promoted_from_observed": best.get("promoted_from_observed", False),
+                }
+
+    # --- Confirmation used for winning signal ---
+    confirmation_used = {}
+    if winning_signal:
+        confirmation_used = {
+            "status": winning_signal.get("market_confirmation"),
+            "source": winning_signal.get("confirmation_source"),
+        }
+
+    # --- Shortlist ---
+    shortlist_data = fresh_quote_meta.get("shortlist", {})
+    shortlist_used = shortlist_data.get("symbols", [])
+
+    # --- LLM input summary ---
+    llm_summary = {
+        "sent_count": llm_input_meta.get("sent_count", 0),
+        "excluded_count": (
+            llm_input_meta.get("excluded_suppressed", 0)
+            + llm_input_meta.get("excluded_weak", 0)
+            + llm_input_meta.get("excluded_observed", 0)
+        ),
+        "sent_classes": llm_input_meta.get("sent_classes", {}),
+    }
+
+    # --- Candidates summary with top 3 from each group ---
+    ext_ops = rec.get("external_opportunities", [])
+    obs_cands = rec.get("observed_candidates", [])
+    sup_cands = rec.get("suppressed_candidates", [])
+
+    def _top_n(items, n=3):
+        return [
+            {"symbol": i.get("symbol"), "effective_score": i.get("effective_score"),
+             "signal_class": i.get("signal_class"), "market_confirmation": i.get("market_confirmation")}
+            for i in items[:n]
+        ]
+
+    candidates = {
+        "actionable_count": len(ext_ops),
+        "observed_count": len(obs_cands),
+        "suppressed_count": len(sup_cands),
+        "top_actionable": _top_n(ext_ops),
+        "top_observed": _top_n(obs_cands),
+        "top_suppressed": _top_n(sup_cands),
+    }
+
+    # --- Promotion events ---
+    refinement = fresh_quote_meta.get("refinement", {})
+    promotion_events = {
+        "promoted_count": scoring_summary.get("promoted_count", 0),
+        "suppressed_count": scoring_summary.get("suppressed_count", 0),
+        "fresh_promoted": refinement.get("promotions", 0),
+        "fresh_demoted": refinement.get("demotions", 0),
+    }
+
+    # --- Why selected: derive from rationale_reasons ---
+    if unchanged:
+        why_selected = f"Sin cambios significativos: {unchanged_reason}"
+    elif rationale_reasons:
+        why_selected = " ".join(r.get("detail", "") for r in rationale_reasons[:3])
+    else:
+        why_selected = rec.get("rationale", "Sin señales suficientes para actuar.")
+
+    return {
+        "primary_driver": primary_driver,
+        "winning_signal": winning_signal,
+        "confirmation_used": confirmation_used,
+        "shortlist_used": shortlist_used,
+        "llm_input": llm_summary,
+        "candidates": candidates,
+        "promotion_events": promotion_events,
+        "why_selected": why_selected,
+    }
+
+
 def run_cycle(db: Session, source: str = "manual") -> dict:
     settings = get_settings()
 
@@ -487,6 +618,12 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         except Exception:
             recommendation_explanation_llm = None
 
+    # --- Decision explainability summary ---
+    decision_summary = _build_decision_summary(
+        rec, scored_news, scoring_summary, llm_input_meta,
+        fresh_quote_meta, unchanged, unchanged_reason,
+    )
+
     rec_model = Recommendation(
         action=rec["action"],
         status=rec["status"],
@@ -535,6 +672,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "scoring_summary": scoring_summary,
             "fresh_quote_meta": fresh_quote_meta,
             "llm_input_meta": llm_input_meta,
+            "decision_summary": decision_summary,
         },
     )
     db.add(rec_model)
