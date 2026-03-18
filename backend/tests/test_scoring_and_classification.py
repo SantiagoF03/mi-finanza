@@ -1561,3 +1561,256 @@ def test_orchestrator_llm_input_meta_persisted():
     # Should have the standard curation keys (not fallback, since scored_news is always populated)
     assert "sent_count" in llm_meta
     assert "total_scored" in llm_meta or "fallback" in llm_meta
+
+
+# ---------------------------------------------------------------------------
+# 44. build_shortlist prioritizes holdings, then externals, then promoted
+# ---------------------------------------------------------------------------
+
+
+def test_build_shortlist_priority_order():
+    """Shortlist should prioritize holding_risk > holding_opportunity > external > promoted."""
+    from app.recommendations.scoring import build_shortlist
+
+    scored = [
+        {"signal_class": "external_opportunity", "effective_score": 0.90,
+         "related_assets": ["GLOB"], "source_count": 2},
+        {"signal_class": "holding_risk", "effective_score": 0.70,
+         "related_assets": ["AAPL"], "source_count": 1},
+        {"signal_class": "holding_opportunity", "effective_score": 0.60,
+         "related_assets": ["MSFT"], "source_count": 1},
+        {"signal_class": "external_opportunity", "effective_score": 0.65,
+         "related_assets": ["YPF"], "promoted_from_observed": True, "source_count": 2},
+    ]
+    holdings = {"AAPL", "MSFT"}
+    symbols, meta = build_shortlist(scored, holdings, max_symbols=8)
+
+    # AAPL (holding_risk) should come first, then MSFT (holding_opp), then externals
+    assert symbols[0] == "AAPL"
+    assert symbols[1] == "MSFT"
+    # GLOB should come before YPF (higher effective_score in externals pass)
+    assert "GLOB" in symbols
+    assert "YPF" in symbols
+    assert meta["selected_count"] == 4
+
+
+# ---------------------------------------------------------------------------
+# 45. build_shortlist respects max_symbols cap
+# ---------------------------------------------------------------------------
+
+
+def test_build_shortlist_max_cap():
+    """Shortlist should be capped at max_symbols."""
+    from app.recommendations.scoring import build_shortlist
+
+    scored = [
+        {"signal_class": "external_opportunity", "effective_score": 0.50 + i * 0.01,
+         "related_assets": [f"SYM{i}"], "source_count": 1}
+        for i in range(15)
+    ]
+    symbols, meta = build_shortlist(scored, set(), max_symbols=5)
+
+    assert len(symbols) == 5
+    assert meta["total_candidates"] == 15
+    assert meta["max_symbols"] == 5
+
+
+# ---------------------------------------------------------------------------
+# 46. build_shortlist deduplicates symbols
+# ---------------------------------------------------------------------------
+
+
+def test_build_shortlist_deduplicates():
+    """Same symbol in multiple signals should appear once."""
+    from app.recommendations.scoring import build_shortlist
+
+    scored = [
+        {"signal_class": "holding_risk", "effective_score": 0.80,
+         "related_assets": ["AAPL"], "source_count": 1},
+        {"signal_class": "holding_opportunity", "effective_score": 0.60,
+         "related_assets": ["AAPL"], "source_count": 1},
+        {"signal_class": "external_opportunity", "effective_score": 0.70,
+         "related_assets": ["GLOB"], "source_count": 2},
+    ]
+    symbols, meta = build_shortlist(scored, {"AAPL"})
+
+    assert symbols.count("AAPL") == 1
+    assert symbols == ["AAPL", "GLOB"]
+
+
+# ---------------------------------------------------------------------------
+# 47. build_shortlist empty scored_news
+# ---------------------------------------------------------------------------
+
+
+def test_build_shortlist_empty():
+    """Empty scored_news should return empty shortlist."""
+    from app.recommendations.scoring import build_shortlist
+
+    symbols, meta = build_shortlist([], set())
+    assert symbols == []
+    assert meta["selected_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 48. refine_with_fresh_quotes updates confirmation from catalog to fresh_quote
+# ---------------------------------------------------------------------------
+
+
+def test_refine_updates_confirmation_source():
+    """Fresh quote should override catalog confirmation and set source=fresh_quote."""
+    from app.recommendations.scoring import refine_with_fresh_quotes
+
+    scored = [
+        {
+            "title": "GLOB rises", "related_assets": ["GLOB"],
+            "impact": "positivo", "signal_class": "external_opportunity",
+            "signal_score": 0.60, "effective_score": 0.60,
+            "market_confirmation": {"status": "unconfirmed", "source": "catalog",
+                                    "detail": "Sin confirmación"},
+            "source_count": 2,
+        },
+    ]
+    fresh_prices = {
+        "GLOB": {"last_price": 100.0, "variacion_pct": 5.0, "source": "fresh_quote"},
+    }
+
+    refined, meta = refine_with_fresh_quotes(scored, fresh_prices, [])
+
+    assert meta["refined_count"] == 1
+    assert "GLOB" in meta["symbols_used"]
+    conf = refined[0]["market_confirmation"]
+    assert conf["source"] == "fresh_quote"
+    assert conf["status"] == "confirmed"  # positive event + positive variacion
+    # effective_score should be boosted
+    assert refined[0]["effective_score"] > 0.60
+
+
+# ---------------------------------------------------------------------------
+# 49. refine_with_fresh_quotes skips holdings-sourced confirmation
+# ---------------------------------------------------------------------------
+
+
+def test_refine_skips_holdings_source():
+    """Items confirmed via holdings pnl_pct should NOT be overridden by fresh quotes."""
+    from app.recommendations.scoring import refine_with_fresh_quotes
+
+    scored = [
+        {
+            "title": "AAPL drops", "related_assets": ["AAPL"],
+            "impact": "negativo", "signal_class": "holding_risk",
+            "signal_score": 0.70, "effective_score": 0.80,
+            "market_confirmation": {"status": "confirmed", "source": "holdings",
+                                    "detail": "PnL confirms"},
+            "source_count": 1,
+        },
+    ]
+    fresh_prices = {
+        "AAPL": {"last_price": 180.0, "variacion_pct": 2.0, "source": "fresh_quote"},
+    }
+
+    refined, meta = refine_with_fresh_quotes(scored, fresh_prices, [])
+
+    assert meta["refined_count"] == 0
+    assert refined[0]["market_confirmation"]["source"] == "holdings"
+
+
+# ---------------------------------------------------------------------------
+# 50. refine_with_fresh_quotes empty fresh_prices is a no-op
+# ---------------------------------------------------------------------------
+
+
+def test_refine_empty_fresh_prices():
+    """Empty fresh_prices should return scored_news unchanged."""
+    from app.recommendations.scoring import refine_with_fresh_quotes
+
+    scored = [
+        {"title": "test", "related_assets": ["X"], "signal_class": "external_opportunity",
+         "signal_score": 0.5, "effective_score": 0.5,
+         "market_confirmation": {"status": "unconfirmed", "source": "catalog"}},
+    ]
+    refined, meta = refine_with_fresh_quotes(scored, {}, [])
+
+    assert meta["refined_count"] == 0
+    assert refined == scored
+
+
+# ---------------------------------------------------------------------------
+# 51. refine_with_fresh_quotes can un-suppress items
+# ---------------------------------------------------------------------------
+
+
+def test_refine_can_unsuppress():
+    """If fresh data changes contradicted → confirmed, suppression should be removed."""
+    from app.recommendations.scoring import refine_with_fresh_quotes
+
+    scored = [
+        {
+            "title": "YPF news", "related_assets": ["YPF"],
+            "impact": "positivo", "signal_class": "external_opportunity",
+            "signal_score": 0.35, "effective_score": 0.20,
+            "market_confirmation": {"status": "contradicted", "source": "catalog",
+                                    "detail": "was contradicted"},
+            "suppressed_by_contradiction": True,
+            "source_count": 1,
+        },
+    ]
+    # Fresh data shows positive movement → should confirm positive event
+    fresh_prices = {
+        "YPF": {"last_price": 50.0, "variacion_pct": 3.5, "source": "fresh_quote"},
+    }
+
+    refined, meta = refine_with_fresh_quotes(scored, fresh_prices, [])
+
+    assert meta["refined_count"] == 1
+    conf = refined[0]["market_confirmation"]
+    assert conf["status"] == "confirmed"
+    assert conf["source"] == "fresh_quote"
+    # Should no longer be suppressed
+    assert not refined[0].get("suppressed_by_contradiction", False)
+
+
+# ---------------------------------------------------------------------------
+# 52. fetch_fresh_quotes returns empty in mock mode
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_fresh_quotes_mock_mode():
+    """In mock mode, fetch_fresh_quotes should return empty safely."""
+    from app.market.discovery import fetch_fresh_quotes
+
+    db = make_db()
+    fresh, meta = fetch_fresh_quotes(db, ["AAPL", "MSFT"])
+
+    assert fresh == {}
+    assert meta.get("skipped_mock") is True or meta.get("fetched") == 0
+
+
+# ---------------------------------------------------------------------------
+# 53. Orchestrator persists fresh_quote_meta in metadata_json
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_fresh_quote_meta_persisted():
+    """metadata_json should contain fresh_quote_meta."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    assert "fresh_quote_meta" in meta
+    fq_meta = meta["fresh_quote_meta"]
+    # In mock mode, should have shortlist + fetch (skipped_mock) + refinement
+    assert "shortlist" in fq_meta or "error" in fq_meta

@@ -509,3 +509,152 @@ def curate_llm_input(
     }
 
     return curated, llm_input_meta
+
+
+# ---------------------------------------------------------------------------
+# Parte E — Fresh quote shortlist and refinement
+# ---------------------------------------------------------------------------
+
+_SHORTLIST_MAX_SYMBOLS = 8
+
+
+def build_shortlist(
+    scored_news: list[dict],
+    holdings: set,
+    max_symbols: int = _SHORTLIST_MAX_SYMBOLS,
+) -> tuple[list[str], dict]:
+    """Build a small shortlist of symbols that deserve fresh quotes.
+
+    Priority (in order, deduplicated):
+    1. Holdings mentioned in holding_risk signals (highest urgency)
+    2. Holdings mentioned in holding_opportunity signals
+    3. Symbols from top external_opportunities (by effective_score)
+    4. Symbols from promoted_from_observed items
+
+    Returns (symbols, shortlist_meta).
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def _add_symbols(item: dict, filter_set: set | None = None):
+        for sym in item.get("related_assets", []):
+            if sym not in seen and (filter_set is None or sym in filter_set):
+                seen.add(sym)
+                ordered.append(sym)
+
+    # Pass 1: holding_risk symbols (only holdings)
+    for item in scored_news:
+        if item.get("signal_class") == "holding_risk":
+            _add_symbols(item, holdings)
+
+    # Pass 2: holding_opportunity symbols (only holdings)
+    for item in scored_news:
+        if item.get("signal_class") == "holding_opportunity":
+            _add_symbols(item, holdings)
+
+    # Pass 3: top external_opportunities by effective_score
+    externals = sorted(
+        [i for i in scored_news if i.get("signal_class") == "external_opportunity"],
+        key=lambda x: -x.get("effective_score", 0),
+    )
+    for item in externals:
+        _add_symbols(item)
+
+    # Pass 4: promoted from observed
+    for item in scored_news:
+        if item.get("promoted_from_observed"):
+            _add_symbols(item)
+
+    result = ordered[:max_symbols]
+
+    shortlist_meta = {
+        "total_candidates": len(ordered),
+        "selected_count": len(result),
+        "max_symbols": max_symbols,
+        "symbols": result,
+    }
+
+    return result, shortlist_meta
+
+
+def refine_with_fresh_quotes(
+    scored_news: list[dict],
+    fresh_prices: dict,
+    positions: list[dict],
+) -> tuple[list[dict], dict]:
+    """Re-evaluate market_confirmation for items whose symbols got fresh quotes.
+
+    For each scored item that has related_assets in fresh_prices and whose
+    current confirmation source is NOT 'holdings' (pnl_pct takes priority),
+    recompute market_confirmation using the fresh variacion_pct.
+
+    Also recomputes effective_score and suppression flag for affected items.
+
+    Returns (updated_scored_news, refinement_meta).
+    Items are returned in the same order, with affected items updated in-place copies.
+    """
+    fresh_symbols = set(fresh_prices.keys())
+    if not fresh_symbols:
+        return scored_news, {"refined_count": 0, "symbols_used": []}
+
+    refined_count = 0
+    symbols_actually_used: set[str] = set()
+    result = []
+
+    for item in scored_news:
+        related = set(item.get("related_assets", []))
+        current_source = (item.get("market_confirmation") or {}).get("source", "")
+
+        # Only refine if: item touches fresh symbols AND current source isn't holdings
+        if (related & fresh_symbols) and current_source != "holdings":
+            updated = dict(item)  # shallow copy
+
+            # Build a mini catalog_prices with only fresh data for this item's symbols
+            fresh_for_item = {
+                sym: fresh_prices[sym]
+                for sym in related
+                if sym in fresh_prices
+            }
+
+            # Recompute market_confirmation using fresh data
+            # compute_market_confirmation labels catalog-sourced results as "catalog";
+            # since we're passing fresh data, relabel to "fresh_quote" for traceability.
+            new_conf = compute_market_confirmation(
+                updated, positions, catalog_prices=fresh_for_item,
+            )
+
+            # Only update if the catalog path produced a result (which is our fresh data)
+            if new_conf.get("source") == "catalog":
+                new_conf["source"] = "fresh_quote"
+                updated["market_confirmation"] = new_conf
+                updated["effective_score"] = compute_effective_score(updated)
+
+                # Re-evaluate suppression
+                conf_status = (new_conf or {}).get("status", "")
+                was_suppressed = updated.get("suppressed_by_contradiction", False)
+                should_suppress = (
+                    conf_status == "contradicted"
+                    and updated["effective_score"] < _SUPPRESSION_THRESHOLD
+                    and updated.get("signal_class") in ("external_opportunity", "observed_candidate")
+                )
+
+                if should_suppress:
+                    updated["suppressed_by_contradiction"] = True
+                elif was_suppressed and conf_status != "contradicted":
+                    # Fresh data un-contradicted → un-suppress
+                    updated.pop("suppressed_by_contradiction", None)
+
+                refined_count += 1
+                for sym in related & fresh_symbols:
+                    symbols_actually_used.add(sym)
+                result.append(updated)
+                continue
+
+        result.append(item)
+
+    refinement_meta = {
+        "refined_count": refined_count,
+        "symbols_used": sorted(symbols_actually_used),
+    }
+
+    return result, refinement_meta
