@@ -417,6 +417,107 @@ def build_catalog_price_map(db: Session) -> dict[str, dict]:
     return price_map
 
 
+def fetch_fresh_quotes(
+    db: "Session",
+    symbols: list[str],
+    broker=None,
+) -> tuple[dict, dict]:
+    """Fetch fresh quotes from IOL for a small shortlist of symbols.
+
+    For each symbol, calls /api/v2/Cotizaciones/detalle/bCBA/{symbol}
+    to get ultimoPrecio. Computes variacion_pct by comparing fresh price
+    against the catalog's last_price.
+
+    Returns (fresh_prices, fetch_meta).
+    fresh_prices: {symbol: {"last_price": float, "variacion_pct": float, "source": "fresh_quote"}}
+    fetch_meta: observability dict.
+
+    Safe: read-only, per-symbol fallback, never breaks the cycle.
+    """
+    if not symbols:
+        return {}, {"requested": 0, "fetched": 0, "failed": 0, "failures": []}
+
+    # Need a real broker for API access
+    if broker is None:
+        from app.core.config import get_settings
+        settings = get_settings()
+        if settings.broker_mode == "mock":
+            return {}, {
+                "requested": len(symbols),
+                "fetched": 0,
+                "failed": 0,
+                "skipped_mock": True,
+            }
+        from app.services.orchestrator import _get_broker
+        broker = _get_broker()
+
+    # Check if broker is mock
+    if hasattr(broker, "_mock_orders"):
+        return {}, {
+            "requested": len(symbols),
+            "fetched": 0,
+            "failed": 0,
+            "skipped_mock": True,
+        }
+
+    # Load catalog prices for variacion calculation
+    catalog_map = build_catalog_price_map(db)
+
+    fresh_prices: dict[str, dict] = {}
+    failures: list[str] = []
+
+    for symbol in symbols:
+        try:
+            resp = broker._authorized_get(
+                f"/api/v2/Cotizaciones/detalle/bCBA/{symbol}"
+            )
+            data = resp.json()
+            if not isinstance(data, dict):
+                failures.append(symbol)
+                continue
+
+            ultimo = data.get("ultimoPrecio")
+            if not ultimo or float(ultimo) <= 0:
+                failures.append(symbol)
+                continue
+
+            fresh_price = float(ultimo)
+
+            # Compute variacion_pct vs catalog last_price
+            catalog_entry = catalog_map.get(symbol, {})
+            catalog_last = catalog_entry.get("last_price")
+            variacion_pct = None
+            if catalog_last and catalog_last > 0:
+                variacion_pct = round(
+                    ((fresh_price - catalog_last) / catalog_last) * 100, 2
+                )
+
+            # If IOL provides variacionPorcentual directly, prefer it
+            iol_var = data.get("variacionPorcentual")
+            if iol_var is not None:
+                try:
+                    variacion_pct = round(float(iol_var), 2)
+                except (ValueError, TypeError):
+                    pass  # keep computed value
+
+            fresh_prices[symbol] = {
+                "last_price": fresh_price,
+                "variacion_pct": variacion_pct,
+                "source": "fresh_quote",
+            }
+        except Exception:
+            failures.append(symbol)
+
+    fetch_meta = {
+        "requested": len(symbols),
+        "fetched": len(fresh_prices),
+        "failed": len(failures),
+        "failures": failures,
+    }
+
+    return fresh_prices, fetch_meta
+
+
 def _catalog_to_dict(inst: InstrumentCatalog) -> dict:
     return {
         "id": inst.id,

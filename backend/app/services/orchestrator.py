@@ -8,7 +8,7 @@ from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.market.candidates import generate_external_candidates
 from app.market.assets import build_catalog_asset_type_map
-from app.market.discovery import build_catalog_price_map, get_eligible_universe_symbols, refresh_instrument_catalog
+from app.market.discovery import build_catalog_price_map, fetch_fresh_quotes, get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.ingestion import (
     get_engine_eligible_clusters,
@@ -17,7 +17,7 @@ from app.news.ingestion import (
     get_llm_eligible_news,
     run_ingestion,
 )
-from app.recommendations.scoring import curate_llm_input, score_and_classify_news
+from app.recommendations.scoring import build_shortlist, curate_llm_input, refine_with_fresh_quotes, score_and_classify_news
 from app.news.pipeline import MockNewsProvider, deduplicate_news_items, get_news_provider, get_provider_info
 from app.portfolio.analyzer import analyze_portfolio
 from app.recommendations.engine import generate_recommendation
@@ -382,6 +382,28 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
 
     # --- Score and classify news signals (cluster-aware + market confirmation) ---
     scored_news = score_and_classify_news(engine_news, positions, allowed_assets, catalog_prices=catalog_prices)
+
+    # --- Fresh quote refinement for shortlist symbols (best-effort) ---
+    fresh_quote_meta = {}
+    try:
+        shortlist, shortlist_meta = build_shortlist(
+            scored_news, allowed_assets.get("holdings", set()),
+        )
+        fresh_prices, fetch_meta = fetch_fresh_quotes(db, shortlist, broker=broker)
+        if fresh_prices:
+            scored_news, refinement_meta = refine_with_fresh_quotes(
+                scored_news, fresh_prices, positions,
+            )
+        else:
+            refinement_meta = {"refined_count": 0, "symbols_used": []}
+        fresh_quote_meta = {
+            "shortlist": shortlist_meta,
+            "fetch": fetch_meta,
+            "refinement": refinement_meta,
+        }
+    except Exception as exc:
+        fresh_quote_meta = {"error": str(exc)[:200]}
+
     scoring_summary = _build_scoring_summary(scored_news)
 
     rec = generate_recommendation(snapshot_dict, analysis, scored_news, settings.max_movement_per_cycle)
@@ -509,6 +531,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_mode": news_mode,
             "cluster_traceability": _extract_cluster_traceability(engine_news) if news_mode != "individual" else None,
             "scoring_summary": scoring_summary,
+            "fresh_quote_meta": fresh_quote_meta,
             "llm_input_meta": llm_input_meta,
         },
     )
