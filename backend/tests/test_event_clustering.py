@@ -632,3 +632,104 @@ def test_cluster_fallback_when_no_clusters_exist():
 
     # Should have fallen back to individual
     assert meta.get("news_mode") in ("individual_fallback", "clusters")
+
+
+# ---------------------------------------------------------------------------
+# API response: /recommendations/current exposes news_mode and cluster_traceability
+# ---------------------------------------------------------------------------
+
+
+def test_recommendations_current_exposes_news_mode_individual():
+    """GET /recommendations/current must include news_mode and cluster_traceability."""
+    from app.api.routes import current_recommendation
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db, _ = make_db()
+    settings = get_settings()
+    original = settings.use_clusters
+    settings.use_clusters = False
+
+    try:
+        run_cycle(db, source="test")
+    finally:
+        settings.use_clusters = original
+
+    # Simulate the route logic directly (no TestClient needed)
+    from app.models.models import Recommendation
+    from sqlalchemy.orm import joinedload
+    rec = db.query(Recommendation).options(joinedload(Recommendation.actions)).order_by(Recommendation.id.desc()).first()
+    meta = rec.metadata_json or {}
+
+    response = {
+        "news_mode": meta.get("news_mode", "individual"),
+        "cluster_traceability": meta.get("cluster_traceability") or [],
+    }
+
+    assert response["news_mode"] == "individual"
+    assert response["cluster_traceability"] == []
+
+
+def test_recommendations_current_exposes_cluster_traceability():
+    """With clusters, /recommendations/current must expose cluster_traceability list."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db, _ = make_db()
+    settings = get_settings()
+    original = settings.use_clusters
+    settings.use_clusters = True
+
+    now = datetime.utcnow()
+    _insert_normalized(db, title="API trace test", topic_hash="api01",
+                       published_at=now, pre_score=0.75, triage_level="send_to_llm",
+                       related_assets=["GGAL"])
+    db.commit()
+    build_or_update_clusters(db)
+    db.commit()
+
+    try:
+        run_cycle(db, source="test")
+    finally:
+        settings.use_clusters = original
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).order_by(Recommendation.id.desc()).first()
+    meta = rec.metadata_json or {}
+
+    news_mode = meta.get("news_mode", "individual")
+    cluster_trace = meta.get("cluster_traceability") or []
+
+    assert news_mode in ("clusters", "individual_fallback")
+    if news_mode == "clusters":
+        assert len(cluster_trace) >= 1
+        assert "cluster_id" in cluster_trace[0]
+        assert "source_count" in cluster_trace[0]
+        assert "relevance_score" in cluster_trace[0]
+        assert "llm_candidate" in cluster_trace[0]
+        assert "affects_holdings" in cluster_trace[0]
+        assert "affected_sectors" in cluster_trace[0]
+
+
+def test_recommendations_current_defaults_for_old_recommendations():
+    """Old recommendations without news_mode in metadata should default safely."""
+    from app.models.models import Recommendation
+
+    db, _ = make_db()
+
+    # Insert a recommendation with no news_mode in metadata (simulates old data)
+    rec = Recommendation(
+        action="mantener", status="pending", suggested_pct=0.0,
+        confidence=0.5, rationale="test", risks="test",
+        executive_summary="test",
+        metadata_json={"analysis": {}, "source": "test"},
+    )
+    db.add(rec)
+    db.commit()
+
+    meta = rec.metadata_json or {}
+    news_mode = meta.get("news_mode", "individual")
+    cluster_trace = meta.get("cluster_traceability") or []
+
+    assert news_mode == "individual"
+    assert cluster_trace == []

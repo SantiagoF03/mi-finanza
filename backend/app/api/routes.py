@@ -115,6 +115,8 @@ def current_recommendation(db: Session = Depends(get_db)):
         "profile_applied": meta.get("profile_applied"),
         "profile_label": meta.get("profile_label"),
         "proposed_reallocation_plan": meta.get("proposed_reallocation_plan", {}),
+        "news_mode": meta.get("news_mode", "individual"),
+        "cluster_traceability": meta.get("cluster_traceability") or [],
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 
