@@ -121,6 +121,7 @@ def current_recommendation(db: Session = Depends(get_db)):
         "cluster_traceability": meta.get("cluster_traceability") or [],
         "scoring_summary": meta.get("scoring_summary") or {},
         "fresh_quote_meta": meta.get("fresh_quote_meta") or {},
+        "decision_summary": meta.get("decision_summary") or {},
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 

@@ -2001,3 +2001,253 @@ def test_api_exposes_fresh_quote_meta():
     }
     assert "fresh_quote_meta" in api_response
     assert isinstance(api_response["fresh_quote_meta"], dict)
+
+
+# ---------------------------------------------------------------------------
+# 60. _build_decision_summary: no_signal driver for mantener
+# ---------------------------------------------------------------------------
+
+
+def test_decision_summary_no_signal_driver():
+    """When action is 'mantener' with no strong signals, primary_driver is no_signal."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener", "rationale": "Cartera estable.", "rationale_reasons": [],
+        "actions": [], "external_opportunities": [], "observed_candidates": [],
+        "suppressed_candidates": [],
+    }
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+
+    assert summary["primary_driver"] == "no_signal"
+    assert summary["winning_signal"] is None
+    assert summary["confirmation_used"] == {}
+
+
+# ---------------------------------------------------------------------------
+# 61. _build_decision_summary: concentration driver
+# ---------------------------------------------------------------------------
+
+
+def test_decision_summary_concentration_driver():
+    """When action is 'reducir riesgo', primary_driver is concentration."""
+    from app.services.orchestrator import _build_decision_summary
+
+    scored = [
+        {"title": "Risk on AAPL", "related_assets": ["AAPL"], "signal_class": "holding_risk",
+         "signal_score": 0.70, "effective_score": 0.80, "source_count": 2,
+         "market_confirmation": {"status": "confirmed", "source": "holdings"}},
+    ]
+    rec = {
+        "action": "reducir riesgo", "rationale": "Sobreconcentración.",
+        "rationale_reasons": [{"type": "concentration_reason", "detail": "AAPL 60%"}],
+        "actions": [{"symbol": "AAPL", "target_change_pct": -0.05, "reason": "Sobreconcentración"}],
+        "external_opportunities": [], "observed_candidates": [], "suppressed_candidates": [],
+    }
+    summary = _build_decision_summary(rec, scored, {}, {}, {}, False, "")
+
+    assert summary["primary_driver"] == "concentration"
+    assert summary["winning_signal"] is not None
+    assert summary["winning_signal"]["symbol"] == "AAPL"
+    assert summary["winning_signal"]["effective_score"] == 0.80
+    assert summary["confirmation_used"]["source"] == "holdings"
+
+
+# ---------------------------------------------------------------------------
+# 62. _build_decision_summary: positive_signal driver with winning signal
+# ---------------------------------------------------------------------------
+
+
+def test_decision_summary_positive_signal_driver():
+    """When action is 'aumentar posición', winning_signal matches the action symbol."""
+    from app.services.orchestrator import _build_decision_summary
+
+    scored = [
+        {"title": "MSFT boost", "related_assets": ["MSFT"], "signal_class": "holding_opportunity",
+         "signal_score": 0.65, "effective_score": 0.75, "source_count": 3,
+         "market_confirmation": {"status": "confirmed", "source": "fresh_quote"}},
+    ]
+    rec = {
+        "action": "aumentar posición", "rationale": "Evento positivo.",
+        "rationale_reasons": [{"type": "return_expectation_reason", "detail": "Catalizador en MSFT"}],
+        "actions": [{"symbol": "MSFT", "target_change_pct": 0.04, "reason": "Evento positivo"}],
+        "external_opportunities": [], "observed_candidates": [], "suppressed_candidates": [],
+    }
+    summary = _build_decision_summary(rec, scored, {}, {}, {}, False, "")
+
+    assert summary["primary_driver"] == "positive_signal"
+    assert summary["winning_signal"]["symbol"] == "MSFT"
+    assert summary["winning_signal"]["effective_score"] == 0.75
+    assert summary["winning_signal"]["confirmation_source"] == "fresh_quote"
+    assert summary["confirmation_used"]["source"] == "fresh_quote"
+
+
+# ---------------------------------------------------------------------------
+# 63. _build_decision_summary: unchanged driver
+# ---------------------------------------------------------------------------
+
+
+def test_decision_summary_unchanged_driver():
+    """When unchanged=True, primary_driver is unchanged."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener", "rationale": "Sin cambios.",
+        "rationale_reasons": [], "actions": [],
+        "external_opportunities": [], "observed_candidates": [], "suppressed_candidates": [],
+    }
+    summary = _build_decision_summary(rec, [], {}, {}, {}, True, "Similar a recomendación anterior")
+
+    assert summary["primary_driver"] == "unchanged"
+    assert "Similar a recomendación anterior" in summary["why_selected"]
+
+
+# ---------------------------------------------------------------------------
+# 64. _build_decision_summary: candidates summary with top 3
+# ---------------------------------------------------------------------------
+
+
+def test_decision_summary_candidates_top3():
+    """candidates should include counts and top 3 from each group."""
+    from app.services.orchestrator import _build_decision_summary
+
+    ext = [{"symbol": f"E{i}", "effective_score": 0.8 - i * 0.1,
+            "signal_class": "external_opportunity", "market_confirmation": "confirmed"}
+           for i in range(5)]
+    obs = [{"symbol": f"O{i}", "effective_score": 0.5, "signal_class": "observed_candidate",
+            "market_confirmation": "unconfirmed"} for i in range(2)]
+    sup = [{"symbol": "S0", "effective_score": 0.2, "signal_class": "external_opportunity",
+            "market_confirmation": "contradicted"}]
+
+    rec = {
+        "action": "mantener", "rationale": "test", "rationale_reasons": [], "actions": [],
+        "external_opportunities": ext, "observed_candidates": obs,
+        "suppressed_candidates": sup,
+    }
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+
+    cands = summary["candidates"]
+    assert cands["actionable_count"] == 5
+    assert cands["observed_count"] == 2
+    assert cands["suppressed_count"] == 1
+    assert len(cands["top_actionable"]) == 3
+    assert len(cands["top_observed"]) == 2
+    assert len(cands["top_suppressed"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# 65. _build_decision_summary: llm_input summary from llm_input_meta
+# ---------------------------------------------------------------------------
+
+
+def test_decision_summary_llm_input():
+    """llm_input should aggregate from llm_input_meta."""
+    from app.services.orchestrator import _build_decision_summary
+
+    llm_meta = {
+        "sent_count": 5, "excluded_suppressed": 2, "excluded_weak": 3,
+        "excluded_observed": 1, "sent_classes": {"holding_risk": 3, "external_opportunity": 2},
+    }
+    rec = {
+        "action": "mantener", "rationale": "test", "rationale_reasons": [], "actions": [],
+        "external_opportunities": [], "observed_candidates": [], "suppressed_candidates": [],
+    }
+    summary = _build_decision_summary(rec, [], {}, llm_meta, {}, False, "")
+
+    assert summary["llm_input"]["sent_count"] == 5
+    assert summary["llm_input"]["excluded_count"] == 6  # 2+3+1
+    assert summary["llm_input"]["sent_classes"]["holding_risk"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 66. _build_decision_summary: shortlist from fresh_quote_meta
+# ---------------------------------------------------------------------------
+
+
+def test_decision_summary_shortlist():
+    """shortlist_used should come from fresh_quote_meta."""
+    from app.services.orchestrator import _build_decision_summary
+
+    fq_meta = {
+        "shortlist": {"symbols": ["AAPL", "GLOB"], "selected_count": 2},
+        "fetch": {"fetched": 2}, "refinement": {"promotions": 1, "demotions": 0},
+    }
+    rec = {
+        "action": "mantener", "rationale": "test", "rationale_reasons": [], "actions": [],
+        "external_opportunities": [], "observed_candidates": [], "suppressed_candidates": [],
+    }
+    summary = _build_decision_summary(rec, [], {}, {}, fq_meta, False, "")
+
+    assert summary["shortlist_used"] == ["AAPL", "GLOB"]
+    assert summary["promotion_events"]["fresh_promoted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 67. Orchestrator persists decision_summary in metadata_json
+# ---------------------------------------------------------------------------
+
+
+def test_orchestrator_decision_summary_persisted():
+    """metadata_json should contain decision_summary with required keys."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    assert "decision_summary" in meta
+    ds = meta["decision_summary"]
+    assert "primary_driver" in ds
+    assert "winning_signal" in ds
+    assert "confirmation_used" in ds
+    assert "shortlist_used" in ds
+    assert "llm_input" in ds
+    assert "candidates" in ds
+    assert "promotion_events" in ds
+    assert "why_selected" in ds
+    # primary_driver should be a valid value
+    assert ds["primary_driver"] in (
+        "concentration", "rebalance", "positive_signal",
+        "no_signal", "unchanged", "empty_portfolio",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 68. API exposes decision_summary top-level
+# ---------------------------------------------------------------------------
+
+
+def test_api_exposes_decision_summary():
+    """GET /recommendations/current should include decision_summary."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    # Simulate API extraction
+    api_decision_summary = meta.get("decision_summary") or {}
+    assert isinstance(api_decision_summary, dict)
+    assert "primary_driver" in api_decision_summary
