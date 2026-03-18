@@ -286,7 +286,8 @@ def promote_catalog_candidate(item: dict, catalog_dynamic: set) -> bool:
     Promotion requires STRONG evidence — multiple criteria must be met:
     1. Item relates to a catalog_dynamic symbol (mandatory)
     2. signal_score >= 0.55 (above noise threshold)
-    3. At least ONE of:
+    3. market_confirmation != "contradicted" (hard block)
+    4. At least ONE of:
        a. source_count >= 2 (multi-source corroboration)
        b. relevance_score >= 0.6 (high cluster relevance)
        c. external_opportunity_candidate flag from cluster triage
@@ -306,10 +307,14 @@ def promote_catalog_candidate(item: dict, catalog_dynamic: set) -> bool:
     if score < _PROMO_MIN_SIGNAL_SCORE:
         return False
 
+    # Hard block: contradicted by market → never promote
+    mkt_conf = (item.get("market_confirmation") or {}).get("status", "")
+    if mkt_conf == "contradicted":
+        return False
+
     # At least one strong evidence criterion
     source_count = item.get("source_count", 1)
     relevance = float(item.get("relevance_score", 0) or 0)
-    mkt_conf = (item.get("market_confirmation") or {}).get("status", "")
 
     if source_count >= _PROMO_MIN_SOURCE_COUNT:
         return True
@@ -325,6 +330,32 @@ def promote_catalog_candidate(item: dict, catalog_dynamic: set) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Parte C.3 — Effective score: signal_score adjusted by market confirmation
+# ---------------------------------------------------------------------------
+
+# Confirmation adjustments to signal_score for ranking purposes
+_CONFIRMATION_BOOST = 0.10   # confirmed → +0.10
+_CONTRADICTION_PENALTY = 0.15  # contradicted → -0.15
+_SUPPRESSION_THRESHOLD = 0.45  # contradicted + effective_score < this → suppressed
+
+
+def compute_effective_score(item: dict) -> float:
+    """Compute an effective_score that integrates signal_score + market confirmation.
+
+    confirmed → boost, contradicted → penalty, unconfirmed → unchanged.
+    Used for final ranking. The original signal_score is preserved unchanged.
+    """
+    base = item.get("signal_score", 0)
+    conf_status = (item.get("market_confirmation") or {}).get("status", "")
+
+    if conf_status == "confirmed":
+        return round(min(base + _CONFIRMATION_BOOST, 1.0), 3)
+    elif conf_status == "contradicted":
+        return round(max(base - _CONTRADICTION_PENALTY, 0.0), 3)
+    return round(base, 3)
+
+
 def score_and_classify_news(
     news: list[dict],
     positions: list[dict],
@@ -334,10 +365,12 @@ def score_and_classify_news(
     """Main entry point: score, classify, and rank all news/cluster items.
 
     Each item gets enriched with:
-    - signal_score (float 0-1)
+    - signal_score (float 0-1, raw quality score)
+    - effective_score (float 0-1, signal_score adjusted by market confirmation)
     - signal_class (str)
     - market_confirmation (dict)
     - promoted_from_observed (bool, only if promoted)
+    - suppressed_by_contradiction (bool, if contradicted + weak effective_score)
 
     Classification uses universe_curated (NOT universe which includes catalog_dynamic).
     catalog_dynamic items default to observed_candidate and are promoted only if
@@ -346,7 +379,7 @@ def score_and_classify_news(
     catalog_prices: optional {symbol: {"last_price": float, "variacion_pct": float}}
     from InstrumentCatalog — enables market confirmation for non-holdings.
 
-    Returns items sorted by: signal_class priority (risk first), then signal_score desc.
+    Returns items sorted by: signal_class priority (risk first), then effective_score desc.
     Items are NOT filtered — all are returned, just ranked better.
     """
     held_symbols = set(allowed_assets.get("holdings", set()))
@@ -369,17 +402,28 @@ def score_and_classify_news(
             item, positions, catalog_prices=catalog_prices,
         )
 
+        # Effective score: signal_score adjusted by market confirmation
+        enriched["effective_score"] = compute_effective_score(enriched)
+
         # Promotion: catalog_dynamic observed_candidate → external_opportunity
+        # (uses market_confirmation: contradicted blocks, confirmed helps)
         if promote_catalog_candidate(enriched, catalog_dynamic):
             enriched["signal_class"] = "external_opportunity"
             enriched["promoted_from_observed"] = True
 
+        # Suppression: contradicted + weak effective_score → flag for observability
+        conf_status = (enriched["market_confirmation"] or {}).get("status", "")
+        if (conf_status == "contradicted"
+                and enriched["effective_score"] < _SUPPRESSION_THRESHOLD
+                and enriched["signal_class"] in ("external_opportunity", "observed_candidate")):
+            enriched["suppressed_by_contradiction"] = True
+
         scored.append(enriched)
 
-    # Sort: class priority first (holding_risk=0 first), then score descending
+    # Sort: class priority first (holding_risk=0 first), then effective_score desc
     scored.sort(key=lambda x: (
         _SIGNAL_CLASS_PRIORITY.get(x["signal_class"], 99),
-        -x["signal_score"],
+        -x["effective_score"],
     ))
 
     return scored

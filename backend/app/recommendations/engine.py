@@ -65,7 +65,11 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
                 "impact": item.get("impact", "neutro"),
                 "signal_class": signal_class,
                 "signal_score": item_score,
+                "effective_score": item.get("effective_score", item_score),
                 "source_count": item.get("source_count", 1),
+                "market_confirmation": (item.get("market_confirmation") or {}).get("status", "unconfirmed"),
+                "promoted_from_observed": item.get("promoted_from_observed", False),
+                "suppressed_by_contradiction": item.get("suppressed_by_contradiction", False),
             }
 
             if signal_class == "observed_candidate":
@@ -84,8 +88,9 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         dedup_ops.append(op)
     external_opportunities = dedup_ops
 
-    # Sort external opportunities by signal_score (best first)
-    external_opportunities.sort(key=lambda x: x.get("signal_score", 0), reverse=True)
+    # Sort external opportunities by effective_score (best first)
+    # effective_score = signal_score adjusted by market confirmation
+    external_opportunities.sort(key=lambda x: x.get("effective_score", x.get("signal_score", 0)), reverse=True)
 
     if "Portfolio vacío o sin valor." in alerts:
         confidence = 0.3

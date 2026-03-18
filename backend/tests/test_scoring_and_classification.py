@@ -22,6 +22,12 @@ Covers:
 23. Market confirmation catalog: confirmed, contradicted, unconfirmed
 24. Market confirmation falls back gracefully without catalog_prices
 25. observed_candidates exposed in /recommendations/current API
+26. Contradicted blocks catalog promotion
+27. effective_score boosts confirmed, penalizes contradicted
+28. Ranking uses effective_score (confirmed items rank higher)
+29. suppressed_by_contradiction flag on weak contradicted externals
+30. scoring_summary includes promoted_count, suppressed_count, confirmation_source
+31. Engine external_opportunities sorted by effective_score
 """
 
 from datetime import datetime
@@ -32,6 +38,7 @@ from sqlalchemy.orm import sessionmaker
 from app.db.session import Base
 from app.recommendations.scoring import (
     classify_signal,
+    compute_effective_score,
     compute_market_confirmation,
     promote_catalog_candidate,
     score_and_classify_news,
@@ -893,3 +900,268 @@ def test_api_current_recommendation_includes_observed_candidates():
     }
     assert "observed_candidates" in api_response
     assert isinstance(api_response["observed_candidates"], list)
+
+
+# ---------------------------------------------------------------------------
+# 26. Contradicted blocks catalog promotion
+# ---------------------------------------------------------------------------
+
+
+def test_contradicted_blocks_catalog_promotion():
+    """Catalog item with contradicted market confirmation should NOT be promoted
+    even if other criteria are strong."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.70,
+        "related_assets": ["GGAL"],
+        "source_count": 3,
+        "market_confirmation": {"status": "contradicted"},
+    }
+    assert promote_catalog_candidate(item, {"GGAL"}) is False
+
+
+def test_confirmed_helps_catalog_promotion():
+    """Catalog item with confirmed market + high score should be promoted."""
+    item = {
+        "signal_class": "observed_candidate",
+        "signal_score": 0.60,
+        "related_assets": ["GGAL"],
+        "source_count": 1,
+        "market_confirmation": {"status": "confirmed"},
+    }
+    assert promote_catalog_candidate(item, {"GGAL"}) is True
+
+
+def test_contradicted_pipeline_blocks_promotion():
+    """Full pipeline: catalog item with contradicted confirmation stays observed."""
+    news = [{
+        "title": "GGAL strong signal but market disagrees",
+        "impact": "positivo",
+        "related_assets": ["GGAL"],
+        "pre_score": 0.6,
+        "source_count": 3,
+        "item_count": 5,
+        "event_type": "upgrade",
+    }]
+    positions = []
+    allowed = _mock_allowed()
+    # GGAL dropping 5% contradicts positive event
+    catalog_prices = {"GGAL": {"last_price": 1500.0, "variacion_pct": -5.0}}
+
+    result = score_and_classify_news(news, positions, allowed, catalog_prices=catalog_prices)
+    assert len(result) == 1
+    assert result[0]["signal_class"] == "observed_candidate"
+    assert result[0].get("promoted_from_observed") is not True
+    assert result[0]["market_confirmation"]["status"] == "contradicted"
+
+
+# ---------------------------------------------------------------------------
+# 27. effective_score boosts confirmed, penalizes contradicted
+# ---------------------------------------------------------------------------
+
+
+def test_effective_score_confirmed_boosted():
+    """confirmed market confirmation should boost effective_score."""
+    item = {"signal_score": 0.60, "market_confirmation": {"status": "confirmed"}}
+    eff = compute_effective_score(item)
+    assert eff == 0.70  # 0.60 + 0.10
+
+
+def test_effective_score_contradicted_penalized():
+    """contradicted should penalize effective_score."""
+    item = {"signal_score": 0.60, "market_confirmation": {"status": "contradicted"}}
+    eff = compute_effective_score(item)
+    assert eff == 0.45  # 0.60 - 0.15
+
+
+def test_effective_score_unconfirmed_unchanged():
+    """unconfirmed should not change effective_score."""
+    item = {"signal_score": 0.60, "market_confirmation": {"status": "unconfirmed"}}
+    eff = compute_effective_score(item)
+    assert eff == 0.60
+
+
+def test_effective_score_capped_at_1():
+    """effective_score should not exceed 1.0."""
+    item = {"signal_score": 0.95, "market_confirmation": {"status": "confirmed"}}
+    eff = compute_effective_score(item)
+    assert eff == 1.0
+
+
+def test_effective_score_floored_at_0():
+    """effective_score should not go below 0.0."""
+    item = {"signal_score": 0.10, "market_confirmation": {"status": "contradicted"}}
+    eff = compute_effective_score(item)
+    assert eff == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 28. Ranking uses effective_score
+# ---------------------------------------------------------------------------
+
+
+def test_confirmed_external_ranks_above_unconfirmed():
+    """An external_opportunity with confirmed should rank above same-class unconfirmed."""
+    news = [
+        {
+            "title": "MELI unconfirmed",
+            "impact": "positivo", "related_assets": ["MELI"],
+            "pre_score": 0.6, "source_count": 1, "event_type": "expansion",
+        },
+        {
+            "title": "GLOB confirmed",
+            "impact": "positivo", "related_assets": ["GLOB"],
+            "pre_score": 0.55, "source_count": 1, "event_type": "upgrade",
+        },
+    ]
+    positions = []
+    allowed = _mock_allowed()
+    # GLOB rising confirms, MELI flat
+    catalog_prices = {
+        "GLOB": {"last_price": 300.0, "variacion_pct": 6.0},
+        "MELI": {"last_price": 1800.0, "variacion_pct": 0.5},
+    }
+
+    result = score_and_classify_news(news, positions, allowed, catalog_prices=catalog_prices)
+    externals = [r for r in result if r["signal_class"] == "external_opportunity"]
+    assert len(externals) == 2
+    # GLOB should rank first despite lower pre_score, because confirmed boosts effective_score
+    assert externals[0]["related_assets"] == ["GLOB"]
+    assert externals[0]["effective_score"] > externals[1]["effective_score"]
+
+
+# ---------------------------------------------------------------------------
+# 29. suppressed_by_contradiction flag
+# ---------------------------------------------------------------------------
+
+
+def test_suppressed_by_contradiction_weak_external():
+    """Weak contradicted external should get suppressed flag."""
+    news = [{
+        "title": "MELI weak contradicted",
+        "impact": "positivo", "related_assets": ["MELI"],
+        "pre_score": 0.3, "source_count": 1, "event_type": "rumor",
+    }]
+    positions = []
+    allowed = _mock_allowed()
+    catalog_prices = {"MELI": {"last_price": 1800.0, "variacion_pct": -4.0}}
+
+    result = score_and_classify_news(news, positions, allowed, catalog_prices=catalog_prices)
+    assert len(result) == 1
+    assert result[0]["suppressed_by_contradiction"] is True
+
+
+def test_strong_contradicted_not_suppressed():
+    """Strong signal contradicted should NOT be suppressed (still valuable info)."""
+    news = [{
+        "title": "MELI strong but contradicted",
+        "impact": "positivo", "related_assets": ["MELI"],
+        "pre_score": 0.7, "source_count": 3, "item_count": 5, "event_type": "upgrade",
+    }]
+    positions = []
+    allowed = _mock_allowed()
+    catalog_prices = {"MELI": {"last_price": 1800.0, "variacion_pct": -4.0}}
+
+    result = score_and_classify_news(news, positions, allowed, catalog_prices=catalog_prices)
+    assert len(result) == 1
+    # effective_score: high base (~0.85+) - 0.15 = still above 0.45
+    assert result[0].get("suppressed_by_contradiction") is not True
+
+
+def test_holding_risk_not_suppressed():
+    """holding_risk should never be suppressed (even if contradicted)."""
+    news = [{
+        "title": "AAPL risk",
+        "impact": "negativo", "related_assets": ["AAPL"],
+        "pre_score": 0.3, "source_count": 1, "event_type": "downgrade",
+    }]
+    positions = [{"symbol": "AAPL", "pnl_pct": 0.05}]  # positive pnl contradicts negative event
+    allowed = _mock_allowed()
+
+    result = score_and_classify_news(news, positions, allowed)
+    holding_items = [r for r in result if r["signal_class"] == "holding_risk"]
+    for item in holding_items:
+        assert item.get("suppressed_by_contradiction") is not True
+
+
+# ---------------------------------------------------------------------------
+# 30. Enhanced scoring_summary
+# ---------------------------------------------------------------------------
+
+
+def test_scoring_summary_includes_promoted_suppressed_counts():
+    """scoring_summary should include promoted_count and suppressed_count."""
+    from app.services.orchestrator import _build_scoring_summary
+
+    scored = [
+        {"title": "Promoted", "signal_score": 0.7, "effective_score": 0.8,
+         "signal_class": "external_opportunity", "promoted_from_observed": True,
+         "market_confirmation": {"status": "confirmed", "source": "catalog"},
+         "source_count": 2, "related_assets": ["GGAL"]},
+        {"title": "Suppressed", "signal_score": 0.3, "effective_score": 0.15,
+         "signal_class": "observed_candidate", "suppressed_by_contradiction": True,
+         "market_confirmation": {"status": "contradicted", "source": "catalog"},
+         "source_count": 1, "related_assets": ["YPF"]},
+        {"title": "Normal", "signal_score": 0.5, "effective_score": 0.5,
+         "signal_class": "external_opportunity",
+         "market_confirmation": {"status": "unconfirmed"},
+         "source_count": 1, "related_assets": ["MELI"]},
+    ]
+    summary = _build_scoring_summary(scored)
+
+    assert summary["promoted_count"] == 1
+    assert summary["suppressed_count"] == 1
+    assert summary["actionable_count"] == 2
+    assert summary["observed_count"] == 1
+    assert "by_confirmation_source" in summary
+    assert summary["by_confirmation_source"].get("catalog", 0) == 2
+
+
+def test_scoring_summary_ranked_by_effective_score():
+    """ranked_signals_preview should be sorted by effective_score, not signal_score."""
+    from app.services.orchestrator import _build_scoring_summary
+
+    scored = [
+        {"title": "High signal, contradicted", "signal_score": 0.8, "effective_score": 0.65,
+         "signal_class": "external_opportunity",
+         "market_confirmation": {"status": "contradicted", "source": "catalog"},
+         "source_count": 2, "related_assets": ["MELI"]},
+        {"title": "Mid signal, confirmed", "signal_score": 0.6, "effective_score": 0.70,
+         "signal_class": "external_opportunity",
+         "market_confirmation": {"status": "confirmed", "source": "catalog"},
+         "source_count": 1, "related_assets": ["GLOB"]},
+    ]
+    summary = _build_scoring_summary(scored)
+    preview = summary["ranked_signals_preview"]
+
+    assert preview[0]["title"] == "Mid signal, confirmed"
+    assert preview[1]["title"] == "High signal, contradicted"
+
+
+# ---------------------------------------------------------------------------
+# 31. Engine external_opportunities sorted by effective_score
+# ---------------------------------------------------------------------------
+
+
+def test_engine_external_opportunities_include_effective_score():
+    """Engine external_opportunities should include effective_score and confirmation fields."""
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+    news = [{
+        "impact": "positivo", "related_assets": ["MELI"],
+        "signal_score": 0.65, "effective_score": 0.75,
+        "pre_score": 0.65, "event_type": "expansion",
+        "title": "MELI grows", "signal_class": "external_opportunity",
+        "market_confirmation": {"status": "confirmed", "source": "catalog"},
+        "promoted_from_observed": False,
+        "suppressed_by_contradiction": False,
+    }]
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    ext = rec["external_opportunities"]
+    meli_ops = [o for o in ext if o["symbol"] == "MELI"]
+    assert len(meli_ops) >= 1
+    op = meli_ops[0]
+    assert "effective_score" in op
+    assert op["effective_score"] == 0.75
+    assert op["market_confirmation"] == "confirmed"
