@@ -140,33 +140,48 @@ def _persist_news_without_duplicates(db: Session, news_items: list[dict]) -> int
 
 
 def _build_scoring_summary(scored_news: list[dict]) -> dict:
-    """Build observability summary from scored news items."""
+    """Build observability summary from scored news items.
+
+    ranked_signals_preview: top 5 items ordered by signal_score descending.
+    This is a pure-score ranking (not class-first), so the name reflects it.
+    """
     by_class: dict[str, int] = {}
     by_confirmation: dict[str, int] = {}
-    top_signals = []
+    actionable_count = 0
+    observed_count = 0
 
+    entries = []
     for item in scored_news:
         cls = item.get("signal_class", "unknown")
         by_class[cls] = by_class.get(cls, 0) + 1
 
+        if cls == "observed_candidate":
+            observed_count += 1
+        else:
+            actionable_count += 1
+
         conf = (item.get("market_confirmation") or {}).get("status", "unknown")
         by_confirmation[conf] = by_confirmation.get(conf, 0) + 1
 
-        if len(top_signals) < 5:
-            top_signals.append({
-                "title": item.get("title", "")[:100],
-                "signal_score": item.get("signal_score", 0),
-                "signal_class": cls,
-                "market_confirmation": conf,
-                "source_count": item.get("source_count", 1),
-                "related_assets": item.get("related_assets", [])[:5],
-            })
+        entries.append({
+            "title": item.get("title", "")[:100],
+            "signal_score": item.get("signal_score", 0),
+            "signal_class": cls,
+            "market_confirmation": conf,
+            "source_count": item.get("source_count", 1),
+            "related_assets": item.get("related_assets", [])[:5],
+        })
+
+    # Sort by signal_score descending for preview
+    entries.sort(key=lambda x: x["signal_score"], reverse=True)
 
     return {
         "total_signals": len(scored_news),
+        "actionable_count": actionable_count,
+        "observed_count": observed_count,
         "by_class": by_class,
         "by_confirmation": by_confirmation,
-        "top_signals": top_signals,
+        "ranked_signals_preview": entries[:5],
     }
 
 
@@ -434,6 +449,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             "news_provider_info": news_provider_info,
             "ingestion": ingestion_meta,
             "external_opportunities": rec.get("external_opportunities", []),
+            "observed_candidates": rec.get("observed_candidates", []),
             "allowed_assets": {
                 "holdings": sorted(allowed_assets["holdings"]),
                 "whitelist": sorted(allowed_assets["whitelist"]),

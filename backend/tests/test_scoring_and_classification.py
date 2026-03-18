@@ -348,7 +348,9 @@ def test_orchestrator_includes_scoring_summary():
     assert "total_signals" in ss
     assert "by_class" in ss
     assert "by_confirmation" in ss
-    assert "top_signals" in ss
+    assert "ranked_signals_preview" in ss
+    assert "actionable_count" in ss
+    assert "observed_count" in ss
 
 
 # ---------------------------------------------------------------------------
@@ -370,3 +372,136 @@ def test_legacy_news_without_signal_fields():
     # Should still trigger positive action using pre_score as fallback
     assert rec["action"] == "aumentar posición"
     assert rec["confidence"] >= 0.5
+
+
+# ---------------------------------------------------------------------------
+# 12. observed_candidate does NOT enter external_opportunities
+# ---------------------------------------------------------------------------
+
+
+def test_observed_candidate_excluded_from_external_opportunities():
+    """Items with signal_class=observed_candidate must not appear in external_opportunities."""
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+    news = [
+        {
+            "impact": "positivo", "related_assets": ["RANDOM_TICKER"],
+            "signal_score": 0.6, "pre_score": 0.6, "event_type": "upgrade",
+            "title": "Unknown asset rallies", "signal_class": "observed_candidate",
+        },
+    ]
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    symbols_in_ext = [o["symbol"] for o in rec["external_opportunities"]]
+    assert "RANDOM_TICKER" not in symbols_in_ext
+
+    # But it SHOULD be in observed_candidates
+    symbols_in_obs = [o["symbol"] for o in rec["observed_candidates"]]
+    assert "RANDOM_TICKER" in symbols_in_obs
+
+
+# ---------------------------------------------------------------------------
+# 13. external_opportunity class DOES enter external_opportunities
+# ---------------------------------------------------------------------------
+
+
+def test_external_opportunity_enters_external_opportunities():
+    """Items with signal_class=external_opportunity must appear in external_opportunities."""
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+    news = [
+        {
+            "impact": "positivo", "related_assets": ["MELI"],
+            "signal_score": 0.65, "pre_score": 0.65, "event_type": "expansion",
+            "title": "MELI expands fintech", "signal_class": "external_opportunity",
+        },
+    ]
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    symbols_in_ext = [o["symbol"] for o in rec["external_opportunities"]]
+    assert "MELI" in symbols_in_ext
+
+    symbols_in_obs = [o["symbol"] for o in rec["observed_candidates"]]
+    assert "MELI" not in symbols_in_obs
+
+
+# ---------------------------------------------------------------------------
+# 14. Metadata separates observed vs actionable
+# ---------------------------------------------------------------------------
+
+
+def test_metadata_separates_observed_and_actionable():
+    """Orchestrator metadata must include both external_opportunities and observed_candidates."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    # Both keys must exist
+    assert "external_opportunities" in meta
+    assert "observed_candidates" in meta
+    assert isinstance(meta["external_opportunities"], list)
+    assert isinstance(meta["observed_candidates"], list)
+
+
+# ---------------------------------------------------------------------------
+# 15. ranked_signals_preview is ordered by signal_score
+# ---------------------------------------------------------------------------
+
+
+def test_ranked_signals_preview_ordered_by_score():
+    """ranked_signals_preview in scoring_summary must be sorted by signal_score desc."""
+    from app.services.orchestrator import _build_scoring_summary
+
+    scored = [
+        {"title": "Low", "signal_score": 0.2, "signal_class": "observed_candidate",
+         "market_confirmation": {"status": "unconfirmed"}, "source_count": 1, "related_assets": []},
+        {"title": "High", "signal_score": 0.9, "signal_class": "holding_risk",
+         "market_confirmation": {"status": "confirmed"}, "source_count": 3, "related_assets": ["AAPL"]},
+        {"title": "Mid", "signal_score": 0.5, "signal_class": "external_opportunity",
+         "market_confirmation": {"status": "unconfirmed"}, "source_count": 2, "related_assets": ["MELI"]},
+    ]
+    summary = _build_scoring_summary(scored)
+
+    preview = summary["ranked_signals_preview"]
+    assert len(preview) == 3
+    assert preview[0]["title"] == "High"
+    assert preview[1]["title"] == "Mid"
+    assert preview[2]["title"] == "Low"
+
+    # Scores must be descending
+    scores = [p["signal_score"] for p in preview]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_scoring_summary_counts_actionable_vs_observed():
+    """scoring_summary must separate actionable_count from observed_count."""
+    from app.services.orchestrator import _build_scoring_summary
+
+    scored = [
+        {"title": "A", "signal_score": 0.8, "signal_class": "holding_risk",
+         "market_confirmation": {"status": "confirmed"}, "source_count": 1, "related_assets": []},
+        {"title": "B", "signal_score": 0.6, "signal_class": "external_opportunity",
+         "market_confirmation": {"status": "unconfirmed"}, "source_count": 1, "related_assets": []},
+        {"title": "C", "signal_score": 0.3, "signal_class": "observed_candidate",
+         "market_confirmation": {"status": "unconfirmed"}, "source_count": 1, "related_assets": []},
+        {"title": "D", "signal_score": 0.2, "signal_class": "observed_candidate",
+         "market_confirmation": {"status": "unconfirmed"}, "source_count": 1, "related_assets": []},
+    ]
+    summary = _build_scoring_summary(scored)
+
+    assert summary["actionable_count"] == 2
+    assert summary["observed_count"] == 2
+    assert summary["total_signals"] == 4

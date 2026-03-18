@@ -42,29 +42,37 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
     confidence = 0.55
     rationale_reasons = []
 
-    # --- External opportunities with signal_class awareness ---
+    # --- External opportunities: only from external_opportunity class ---
+    # observed_candidate items are tracked separately for observability
+    # but do NOT enter the actionable opportunities list.
+    observed_candidates = []
     for item in news:
         signal_class = item.get("signal_class", "")
         item_score = item.get("signal_score", item.get("pre_score", 0.5))
 
-        # Skip very weak signals for opportunity detection too
         if item_score < _MIN_SIGNAL_SCORE:
             continue
 
         for symbol in item.get("related_assets", []):
-            if symbol not in held_set:
-                external_opportunities.append(
-                    {
-                        "symbol": symbol,
-                        "reason": item.get("title") or "Oportunidad detectada por noticia externa",
-                        "confidence": item.get("confidence", 0.5),
-                        "event_type": item.get("event_type", "otro"),
-                        "impact": item.get("impact", "neutro"),
-                        "signal_class": signal_class,
-                        "signal_score": item_score,
-                        "source_count": item.get("source_count", 1),
-                    }
-                )
+            if symbol in held_set:
+                continue
+
+            entry = {
+                "symbol": symbol,
+                "reason": item.get("title") or "Oportunidad detectada por noticia externa",
+                "confidence": item.get("confidence", 0.5),
+                "event_type": item.get("event_type", "otro"),
+                "impact": item.get("impact", "neutro"),
+                "signal_class": signal_class,
+                "signal_score": item_score,
+                "source_count": item.get("source_count", 1),
+            }
+
+            if signal_class == "observed_candidate":
+                observed_candidates.append(entry)
+            else:
+                # external_opportunity, holding_opportunity (non-held asset), or legacy (no class)
+                external_opportunities.append(entry)
 
     dedup_ops = []
     seen = set()
@@ -267,6 +275,7 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         "executive_summary": f"Sugerencia: {action}. Movimiento sugerido: {round(pct*100,2)}% del portfolio. Perfil: {profile_label}.",
         "actions": actions,
         "external_opportunities": external_opportunities,
+        "observed_candidates": observed_candidates,
         "rebalance_observability": rebalance_obs,
         "rationale_reasons": rationale_reasons,
         "profile_applied": canonical_profile,
