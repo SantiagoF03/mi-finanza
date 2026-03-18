@@ -383,6 +383,40 @@ def get_catalog_asset_type(db: Session, symbol: str) -> str | None:
     return result[0] if result else None
 
 
+def build_catalog_price_map(db: Session) -> dict[str, dict]:
+    """Build a symbol → price data map from active InstrumentCatalog entries.
+
+    Returns: {symbol: {"last_price": float|None, "variacion_pct": float|None}}
+
+    variacion_pct comes from IOL's variacionPorcentual (daily % change),
+    stored in metadata_json["variacion"] during catalog refresh.
+    """
+    results = (
+        db.query(
+            InstrumentCatalog.symbol,
+            InstrumentCatalog.last_price,
+            InstrumentCatalog.metadata_json,
+        )
+        .filter(InstrumentCatalog.is_active == True)
+        .all()
+    )
+    price_map = {}
+    for symbol, last_price, meta in results:
+        variacion = None
+        if meta and isinstance(meta, dict):
+            raw = meta.get("variacion")
+            if raw is not None:
+                try:
+                    variacion = float(raw)
+                except (ValueError, TypeError):
+                    variacion = None
+        price_map[symbol] = {
+            "last_price": last_price,
+            "variacion_pct": variacion,
+        }
+    return price_map
+
+
 def _catalog_to_dict(inst: InstrumentCatalog) -> dict:
     return {
         "id": inst.id,

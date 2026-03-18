@@ -82,73 +82,144 @@ def score_news_item(item: dict, held_symbols: set, allowed_symbols: set) -> floa
 def compute_market_confirmation(
     item: dict,
     positions: list[dict],
+    catalog_prices: dict | None = None,
 ) -> dict:
-    """Compute cheap market confirmation using available portfolio data.
+    """Compute market confirmation using portfolio data + catalog prices.
 
-    Uses pnl_pct from holdings as a proxy for recent momentum.
-    Returns a dict with confirmation_status and detail.
+    Two data sources (tried in order):
+    1. Holdings: pnl_pct from portfolio positions (existing behavior)
+    2. Catalog: variacion_pct from InstrumentCatalog (IOL daily % change)
 
-    Logic:
-    - Negative event + negative pnl → confirmed
-    - Negative event + positive pnl → contradicted (market disagrees)
-    - Positive event + positive pnl → confirmed
-    - Positive event + negative pnl → contradicted
-    - Neutro/no overlap → unconfirmed
+    For holdings, uses pnl_pct (accumulated P&L).
+    For non-holdings, uses variacion_pct (daily market change) from catalog.
+    This allows market confirmation for external opportunities and observed candidates.
+
+    Logic (same for both sources):
+    - Negative event + negative change → confirmed
+    - Negative event + positive change → contradicted
+    - Positive event + positive change → confirmed
+    - Positive event + negative change → contradicted
+    - Neutro/no data → unconfirmed
     """
     impact = item.get("impact", "neutro")
     related = set(item.get("related_assets", []))
 
     if not related:
-        return {"status": "unconfirmed", "detail": "Sin activos relacionados en portfolio"}
+        return {"status": "unconfirmed", "detail": "Sin activos relacionados"}
 
-    # Find matching positions
+    # --- Try holdings first (pnl_pct, existing behavior) ---
     position_map = {p["symbol"]: p for p in positions if p.get("symbol")}
-    matched = [(sym, position_map[sym]) for sym in related if sym in position_map]
+    matched_holdings = [(sym, position_map[sym]) for sym in related if sym in position_map]
 
-    if not matched:
-        return {"status": "unconfirmed", "detail": "Activos no están en holdings actuales"}
+    if matched_holdings:
+        pnl_values = [p.get("pnl_pct", 0) for _, p in matched_holdings]
+        avg_pnl = sum(pnl_values) / len(pnl_values) if pnl_values else 0
+        matched_symbols = [sym for sym, _ in matched_holdings]
 
-    # Average pnl_pct of matched positions
-    pnl_values = [p.get("pnl_pct", 0) for _, p in matched]
-    avg_pnl = sum(pnl_values) / len(pnl_values) if pnl_values else 0
-    matched_symbols = [sym for sym, _ in matched]
+        result = _evaluate_confirmation(
+            impact, avg_pnl, matched_symbols, source="holdings", threshold=0.03,
+        )
+        if result:
+            return result
 
-    # Strong threshold: ±3% is meaningful movement
-    significant = abs(avg_pnl) >= 0.03
-    direction = "positive" if avg_pnl > 0 else "negative" if avg_pnl < 0 else "flat"
+    # --- Fallback: catalog prices for non-holdings ---
+    if catalog_prices:
+        matched_catalog = [
+            (sym, catalog_prices[sym])
+            for sym in related
+            if sym in catalog_prices and sym not in position_map
+        ]
+        if matched_catalog:
+            var_values = [
+                p.get("variacion_pct", 0) or 0 for _, p in matched_catalog
+            ]
+            # variacion_pct from IOL is already in percentage (e.g., 3.5 = 3.5%)
+            # Normalize to fraction for consistent threshold logic
+            avg_var = sum(var_values) / len(var_values) if var_values else 0
+            avg_var_frac = avg_var / 100.0  # 3.5 → 0.035
+
+            matched_symbols = [sym for sym, _ in matched_catalog]
+
+            result = _evaluate_confirmation(
+                impact, avg_var_frac, matched_symbols, source="catalog", threshold=0.02,
+            )
+            if result:
+                return result
+
+            return {
+                "status": "unconfirmed",
+                "detail": f"Sin confirmación clara: variación {round(avg_var, 1)}% en {', '.join(matched_symbols)}",
+                "variacion_pct": round(avg_var, 2),
+                "source": "catalog",
+            }
+
+    # No data at all
+    if not matched_holdings:
+        return {"status": "unconfirmed", "detail": "Activos no están en holdings ni en catálogo"}
+
+    # Holdings matched but inconclusive
+    avg_pnl = sum(p.get("pnl_pct", 0) for _, p in matched_holdings) / len(matched_holdings)
+    matched_symbols = [sym for sym, _ in matched_holdings]
+    return {
+        "status": "unconfirmed",
+        "detail": f"Sin confirmación clara: PnL {round(avg_pnl*100,1)}% en {', '.join(matched_symbols)}",
+        "avg_pnl_pct": round(avg_pnl, 4),
+        "source": "holdings",
+    }
+
+
+def _evaluate_confirmation(
+    impact: str,
+    change_value: float,
+    symbols: list[str],
+    source: str,
+    threshold: float,
+) -> dict | None:
+    """Shared confirmation logic for holdings (pnl) and catalog (variacion).
+
+    Returns a result dict if confirmed/contradicted, None if inconclusive.
+    change_value is a fraction (0.03 = 3%).
+    """
+    significant = abs(change_value) >= threshold
+    direction = "positive" if change_value > 0 else "negative" if change_value < 0 else "flat"
+
+    label = "PnL" if source == "holdings" else "variación"
+    pct_display = round(change_value * 100, 1)
+    sign = "+" if change_value > 0 else ""
+    symbols_str = ", ".join(symbols)
 
     if impact == "negativo":
         if direction == "negative" and significant:
             return {
                 "status": "confirmed",
-                "detail": f"Evento negativo confirmado: {', '.join(matched_symbols)} con PnL {round(avg_pnl*100,1)}%",
-                "avg_pnl_pct": round(avg_pnl, 4),
+                "detail": f"Evento negativo confirmado: {symbols_str} con {label} {pct_display}%",
+                "avg_pnl_pct": round(change_value, 4),
+                "source": source,
             }
         elif direction == "positive" and significant:
             return {
                 "status": "contradicted",
-                "detail": f"Evento negativo pero mercado positivo: {', '.join(matched_symbols)} con PnL +{round(avg_pnl*100,1)}%",
-                "avg_pnl_pct": round(avg_pnl, 4),
+                "detail": f"Evento negativo pero mercado positivo: {symbols_str} con {label} {sign}{pct_display}%",
+                "avg_pnl_pct": round(change_value, 4),
+                "source": source,
             }
     elif impact == "positivo":
         if direction == "positive" and significant:
             return {
                 "status": "confirmed",
-                "detail": f"Evento positivo confirmado: {', '.join(matched_symbols)} con PnL +{round(avg_pnl*100,1)}%",
-                "avg_pnl_pct": round(avg_pnl, 4),
+                "detail": f"Evento positivo confirmado: {symbols_str} con {label} {sign}{pct_display}%",
+                "avg_pnl_pct": round(change_value, 4),
+                "source": source,
             }
         elif direction == "negative" and significant:
             return {
                 "status": "contradicted",
-                "detail": f"Evento positivo pero mercado negativo: {', '.join(matched_symbols)} con PnL {round(avg_pnl*100,1)}%",
-                "avg_pnl_pct": round(avg_pnl, 4),
+                "detail": f"Evento positivo pero mercado negativo: {symbols_str} con {label} {pct_display}%",
+                "avg_pnl_pct": round(change_value, 4),
+                "source": source,
             }
 
-    return {
-        "status": "unconfirmed",
-        "detail": f"Sin confirmación clara: PnL {round(avg_pnl*100,1)}% en {', '.join(matched_symbols)}",
-        "avg_pnl_pct": round(avg_pnl, 4),
-    }
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +329,7 @@ def score_and_classify_news(
     news: list[dict],
     positions: list[dict],
     allowed_assets: dict,
+    catalog_prices: dict | None = None,
 ) -> list[dict]:
     """Main entry point: score, classify, and rank all news/cluster items.
 
@@ -270,6 +342,9 @@ def score_and_classify_news(
     Classification uses universe_curated (NOT universe which includes catalog_dynamic).
     catalog_dynamic items default to observed_candidate and are promoted only if
     they meet strong evidence criteria via promote_catalog_candidate().
+
+    catalog_prices: optional {symbol: {"last_price": float, "variacion_pct": float}}
+    from InstrumentCatalog — enables market confirmation for non-holdings.
 
     Returns items sorted by: signal_class priority (risk first), then signal_score desc.
     Items are NOT filtered — all are returned, just ranked better.
@@ -290,7 +365,9 @@ def score_and_classify_news(
         enriched["signal_class"] = classify_signal(
             item, held_symbols, main_allowed, watchlist, universe_curated,
         )
-        enriched["market_confirmation"] = compute_market_confirmation(item, positions)
+        enriched["market_confirmation"] = compute_market_confirmation(
+            item, positions, catalog_prices=catalog_prices,
+        )
 
         # Promotion: catalog_dynamic observed_candidate → external_opportunity
         if promote_catalog_candidate(enriched, catalog_dynamic):
