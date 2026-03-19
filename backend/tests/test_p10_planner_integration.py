@@ -156,6 +156,7 @@ def test_planner_uses_cash_before_unnecessary_sells():
             "source_types": ["watchlist"],
             "reason": "Oportunidad detectada",
             "investable": True,
+            "actionable_external": True,
         },
     ]
     allowed_assets = {"main_allowed": {"SPY", "MSFT", "AL30"}, "holdings": {"SPY", "AL30"}}
@@ -210,9 +211,10 @@ def test_spy_overweighted_sell_buy_dryrun():
             "asset_type": "CEDEAR",
             "asset_type_status": "known_valid",
             "priority_score": 0.75,
-            "source_types": ["catalog"],
+            "source_types": ["catalog", "news"],
             "reason": "Opportunity",
             "investable": True,
+            "actionable_external": True,
         },
     ]
     allowed_assets = {"main_allowed": {"SPY", "V", "AL30"}, "holdings": {"SPY", "AL30"}}
@@ -270,6 +272,7 @@ def test_unknown_asset_type_excluded():
             "source_types": ["catalog"],
             "reason": "Unknown",
             "investable": False,
+            "actionable_external": True,
         },
         {
             "symbol": "MSFT",
@@ -279,6 +282,7 @@ def test_unknown_asset_type_excluded():
             "source_types": ["watchlist"],
             "reason": "Valid",
             "investable": True,
+            "actionable_external": True,
         },
     ]
     allowed_assets = {"main_allowed": {"AAPL", "MSFT", "WEIRD"}, "holdings": {"AAPL"}}
@@ -328,9 +332,10 @@ def test_outside_main_allowed_excluded():
             "asset_type": "ACCIONES",
             "asset_type_status": "known_valid",
             "priority_score": 0.9,
-            "source_types": ["catalog"],
+            "source_types": ["catalog", "news"],
             "reason": "Not whitelisted",
             "investable": True,
+            "actionable_external": True,
         },
     ]
     # DANGER_STOCK is NOT in main_allowed

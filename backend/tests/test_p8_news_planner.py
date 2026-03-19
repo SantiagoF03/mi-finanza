@@ -181,6 +181,7 @@ def test_planner_uses_cash_first():
             "source_types": ["watchlist"],
             "reason": "Oportunidad detectada",
             "investable": True,
+            "actionable_external": True,
         },
     ]
     allowed_assets = {
@@ -246,6 +247,7 @@ def test_overweighted_plus_opportunity_sell_buy():
             "source_types": ["watchlist"],
             "reason": "Opportunity",
             "investable": True,
+            "actionable_external": True,
         },
     ]
     allowed_assets = {
@@ -310,6 +312,7 @@ def test_unknown_asset_type_excluded_from_buys():
             "source_types": ["catalog"],
             "reason": "Unknown type opportunity",
             "investable": False,
+            "actionable_external": True,
         },
         {
             "symbol": "UNSUPPORTED_SYM",
@@ -319,6 +322,7 @@ def test_unknown_asset_type_excluded_from_buys():
             "source_types": ["catalog"],
             "reason": "Unsupported type opportunity",
             "investable": False,
+            "actionable_external": True,
         },
         {
             "symbol": "MSFT",
@@ -328,6 +332,7 @@ def test_unknown_asset_type_excluded_from_buys():
             "source_types": ["watchlist"],
             "reason": "Valid opportunity",
             "investable": True,
+            "actionable_external": True,
         },
     ]
     allowed_assets = {

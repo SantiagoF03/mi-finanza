@@ -2444,3 +2444,204 @@ def test_catalog_plus_news_ranks_higher_than_catalog_only():
     assert tsla["priority_score"] > meli["priority_score"]
     assert tsla["actionable_external"] is True
     assert meli["actionable_external"] is False
+
+
+# ===========================================================================
+# Sprint 15: End-to-end alignment — buckets, decision_summary, planner, hygiene
+# ===========================================================================
+
+
+def test_decision_summary_actionable_count_uses_actionable_external():
+    """decision_summary.candidates.actionable_count must reflect actionable_external=True items only."""
+    from unittest.mock import patch, MagicMock
+    from app.services.orchestrator import _build_decision_summary
+
+    # Simulate rec with split buckets (orchestrator now separates them)
+    rec = {
+        "action": "mantener",
+        "actions": [],
+        "rationale_reasons": [],
+        "rationale": "Estable",
+        "external_opportunities": [
+            {"symbol": "TSLA", "actionable_external": True, "effective_score": 0.7,
+             "signal_class": "external_opportunity", "market_confirmation": "confirmed"},
+        ],
+        "observed_candidates": [
+            {"symbol": f"OBS{i}", "actionable_external": False, "effective_score": 0.3,
+             "signal_class": "observed_candidate", "market_confirmation": "unconfirmed"}
+            for i in range(50)
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(
+        rec=rec, scored_news=[], scoring_summary={},
+        llm_input_meta={}, fresh_quote_meta={},
+        unchanged=False, unchanged_reason="",
+    )
+
+    assert summary["candidates"]["actionable_count"] == 1
+    assert summary["candidates"]["observed_count"] == 50
+    assert len(summary["candidates"]["top_actionable"]) == 1
+    assert summary["candidates"]["top_actionable"][0]["symbol"] == "TSLA"
+
+
+def test_orchestrator_splits_external_vs_observed():
+    """Real run_cycle must split actionable vs observed in metadata."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    ext_ops = meta.get("external_opportunities", [])
+    obs_cands = meta.get("observed_candidates", [])
+
+    # All items in external_opportunities must have actionable_external=True (or be news-backed)
+    for item in ext_ops:
+        if "actionable_external" in item:
+            assert item["actionable_external"] is True, \
+                f"{item.get('symbol')} in external_opportunities but actionable_external=False"
+
+    # decision_summary counts must match actual bucket sizes
+    ds = meta.get("decision_summary", {})
+    if ds:
+        assert ds["candidates"]["actionable_count"] == len(ext_ops)
+        assert ds["candidates"]["observed_count"] == len(obs_cands)
+
+
+def test_planner_rejects_non_actionable():
+    """Planner must not propose buys for candidates with actionable_external=False."""
+    from unittest.mock import patch, MagicMock
+    from app.services.planner import generate_reallocation_plan
+
+    snapshot = {
+        "total_value": 100000, "cash": 20000,
+        "positions": [{"symbol": "AAPL", "asset_type": "CEDEAR", "quantity": 50, "market_value": 80000}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.80}}
+    external_opportunities = [
+        {
+            "symbol": "MELI",
+            "asset_type": "CEDEAR",
+            "asset_type_status": "known_valid",
+            "priority_score": 0.9,
+            "source_types": ["catalog"],
+            "reason": "Observado desde catalog",
+            "investable": True,
+            "actionable_external": False,
+        },
+        {
+            "symbol": "MSFT",
+            "asset_type": "CEDEAR",
+            "asset_type_status": "known_valid",
+            "priority_score": 0.7,
+            "source_types": ["news", "watchlist"],
+            "reason": "Valid opportunity",
+            "investable": True,
+            "actionable_external": True,
+        },
+    ]
+    allowed_assets = {"main_allowed": {"AAPL", "MSFT", "MELI"}, "holdings": {"AAPL"}}
+
+    with patch("app.services.planner.get_settings") as mock_s:
+        s = MagicMock()
+        s.investor_profile_target = "moderate_aggressive"
+        s.investor_profile = "moderado"
+        s.max_movement_per_cycle = 0.10
+        mock_s.return_value = s
+
+        plan = generate_reallocation_plan(
+            snapshot=snapshot, analysis=analysis,
+            external_opportunities=external_opportunities,
+            allowed_assets=allowed_assets,
+        )
+
+    buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
+    assert "MELI" not in buy_symbols, "Non-actionable must not be bought"
+    assert "MSFT" in buy_symbols, "Actionable must be bought"
+
+    # Check rejection reason mentions "no accionable"
+    rejected_text = " ".join(plan["why_rejected"])
+    assert "MELI" in rejected_text
+    assert "no accionable" in rejected_text
+
+
+def test_shortlist_filters_pseudo_tickers():
+    """build_shortlist must not include pseudo-tickers like WSJ, NASA, SEC."""
+    from app.recommendations.scoring import build_shortlist
+
+    scored_news = [
+        {
+            "signal_class": "external_opportunity",
+            "effective_score": 0.8,
+            "related_assets": ["TSLA", "WSJ", "NASA", "SEC"],
+        },
+        {
+            "signal_class": "holding_risk",
+            "effective_score": 0.9,
+            "related_assets": ["AAPL"],
+        },
+    ]
+    holdings = {"AAPL"}
+    symbols, meta = build_shortlist(scored_news, holdings)
+
+    assert "TSLA" in symbols
+    assert "AAPL" in symbols
+    assert "WSJ" not in symbols
+    assert "NASA" not in symbols
+    assert "SEC" not in symbols
+
+
+def test_blocklist_includes_wsj_nasa():
+    """Blocklist must include media/agency entities found in runtime."""
+    from app.market.candidates import PSEUDO_TICKER_BLOCKLIST
+
+    for token in ["WSJ", "NASA", "BBC", "CNN", "CNBC", "EPA", "FDA", "NATO", "OPEC"]:
+        assert token in PSEUDO_TICKER_BLOCKLIST, f"{token} missing from blocklist"
+
+
+def test_pseudo_ticker_filtered_from_candidates_and_shortlist():
+    """End-to-end: WSJ/NASA don't enter candidates, don't enter shortlist."""
+    from app.market.candidates import generate_external_candidates
+    from app.recommendations.scoring import build_shortlist
+
+    # Step 1: candidates filter
+    allowed = {
+        "holdings": set(), "whitelist": set(), "watchlist": set(),
+        "universe": {"WSJ", "NASA", "TSLA"},
+        "catalog_dynamic": {"WSJ", "NASA", "TSLA"},
+        "main_allowed": set(), "external_allowed": {"WSJ", "NASA", "TSLA"},
+    }
+    news = [
+        {"symbol": "WSJ", "reason": "WSJ article", "confidence": 0.8,
+         "event_type": "otro", "impact": "positivo"},
+        {"symbol": "TSLA", "reason": "Tesla news", "confidence": 0.8,
+         "event_type": "earnings", "impact": "positivo"},
+    ]
+    candidates = generate_external_candidates(news, allowed, [])
+    cand_symbols = {c["symbol"] for c in candidates}
+    assert "WSJ" not in cand_symbols
+    assert "NASA" not in cand_symbols
+    assert "TSLA" in cand_symbols
+
+    # Step 2: shortlist filter
+    scored_news = [
+        {"signal_class": "external_opportunity", "effective_score": 0.9,
+         "related_assets": ["WSJ", "NASA", "TSLA"]},
+    ]
+    symbols, _ = build_shortlist(scored_news, set())
+    assert "WSJ" not in symbols
+    assert "NASA" not in symbols
+    assert "TSLA" in symbols
