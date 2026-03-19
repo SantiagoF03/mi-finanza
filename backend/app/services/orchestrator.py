@@ -319,12 +319,15 @@ def _build_decision_summary(
     obs_cands = rec.get("observed_candidates", [])
     sup_cands = rec.get("suppressed_candidates", [])
 
-    def _top_n(items, n=3):
+    def _top_n(items, n=3, sort_key=None):
+        source = items
+        if sort_key:
+            source = sorted(items, key=sort_key, reverse=True)
         return [
             {"symbol": i.get("symbol"), "effective_score": i.get("effective_score"),
              "signal_class": i.get("signal_class"), "market_confirmation": i.get("market_confirmation"),
              "reason": i.get("reason"), "source_types": i.get("source_types")}
-            for i in items[:n]
+            for i in source[:n]
         ]
 
     candidates = {
@@ -332,7 +335,7 @@ def _build_decision_summary(
         "observed_count": len(obs_cands),
         "suppressed_count": len(sup_cands),
         "top_actionable": _top_n(ext_ops),
-        "top_observed": _top_n(obs_cands),
+        "top_observed": _top_n(obs_cands, sort_key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0)),
         "top_suppressed": _top_n(sup_cands),
     }
 
@@ -555,7 +558,10 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     # Non-actionable (catalog/universe-only) merge into observed_candidates.
     rec["external_opportunities"] = [c for c in all_candidates if c.get("actionable_external")]
     observed_from_candidates = [c for c in all_candidates if not c.get("actionable_external")]
-    rec["observed_candidates"] = rec.get("observed_candidates", []) + observed_from_candidates
+    # Merge engine-observed + candidate-observed, sort by effective_score so top_observed is useful
+    merged_observed = rec.get("observed_candidates", []) + observed_from_candidates
+    merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
+    rec["observed_candidates"] = merged_observed
 
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
 
