@@ -29,6 +29,8 @@ PSEUDO_TICKER_BLOCKLIST = frozenset({
     "UK", "US", "EU", "UN",
     # Government / regulatory agencies
     "DOJ", "SEC", "FBI", "CIA", "FED", "IMF", "WHO",
+    "HHS", "CDC", "NTSB", "DHS", "DOD", "DOE", "NIH", "NSF",
+    "FEMA", "TSA", "ATF", "DEA", "ICE", "CBP", "USDA",
     # Financial acronyms
     "GDP", "IPO", "ETF", "EPS", "PE", "ROI", "ROE", "ESG",
     # Exchanges (not tickers)
@@ -77,6 +79,10 @@ def generate_external_candidates(
             "confidence": op.get("confidence", 0.5),
             "event_type": op.get("event_type", "otro"),
             "impact": op.get("impact", "neutro"),
+            "signal_class": op.get("signal_class"),
+            "signal_score": op.get("signal_score"),
+            "effective_score": op.get("effective_score"),
+            "market_confirmation": op.get("market_confirmation"),
         })
 
     # 2. Catalog candidates (PRIMARY external source — dynamic from IOL discovery)
@@ -138,15 +144,14 @@ def generate_external_candidates(
             score += 0.1
 
         # --- Actionable semantics ---
-        # actionable_external: requires real evidence, not just catalog/universe membership.
-        # Catalog/universe alone → observed (not actionable). Promotion requires:
-        #   - news signal present, OR
-        #   - watchlist membership + known_valid asset type
+        # actionable_external: requires real evidence AND known_valid asset type.
+        # unknown/unsupported types are NEVER actionable (even with news).
+        # Promotion requires:
+        #   - known_valid asset type, AND
+        #   - (news signal present, OR watchlist membership)
         has_news = "news" in c["source_types"]
-        watchlist_valid = "watchlist" in c["source_types"] and asset_type_status == "known_valid"
-        actionable = has_news or watchlist_valid
-        if asset_type_status == "unsupported":
-            actionable = False
+        in_watchlist = "watchlist" in c["source_types"]
+        actionable = asset_type_status == "known_valid" and (has_news or in_watchlist)
 
         # investable: is this ready for potential manual investment?
         #   True if in main_allowed AND type is known_valid
@@ -162,8 +167,13 @@ def generate_external_candidates(
             in_main=in_main,
         )
 
-        # Pick best news signal for display
-        best_news = max(c["news_signals"], key=lambda s: s["confidence"], default=None) if c["news_signals"] else None
+        # Pick best news signal for display (by effective_score, then confidence)
+        best_news = None
+        if c["news_signals"]:
+            best_news = max(
+                c["news_signals"],
+                key=lambda s: (s.get("effective_score") or 0, s.get("confidence") or 0),
+            )
 
         results.append({
             "symbol": sym,
@@ -182,6 +192,10 @@ def generate_external_candidates(
             "confidence": best_news["confidence"] if best_news else 0.3,
             "event_type": best_news["event_type"] if best_news else "otro",
             "impact": best_news["impact"] if best_news else "neutro",
+            # Pipeline metadata from scored_news (for explainability)
+            "effective_score": best_news.get("effective_score") if best_news else None,
+            "signal_class": best_news.get("signal_class") if best_news else None,
+            "market_confirmation": best_news.get("market_confirmation") if best_news else None,
         })
 
     # Sort by priority descending
