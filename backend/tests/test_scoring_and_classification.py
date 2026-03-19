@@ -2395,7 +2395,7 @@ def test_pseudo_ticker_blocklist_has_common_tokens():
 
 
 def test_healthy_distribution_with_mixed_sources():
-    """With catalog + news mix, only news-backed symbols are actionable."""
+    """With catalog + news mix, only news-backed + known_valid symbols are actionable."""
     from app.market.candidates import generate_external_candidates
 
     catalog_syms = {f"SYM{i}" for i in range(100)}
@@ -2412,12 +2412,14 @@ def test_healthy_distribution_with_mixed_sources():
     }
     news = [{"symbol": s, "reason": "Test news", "confidence": 0.7,
              "event_type": "earnings", "impact": "positivo"} for s in news_syms]
+    # News symbols have known_valid type via catalog_map; rest are unknown
+    catalog_map = {s: "CEDEAR" for s in news_syms}
 
-    candidates = generate_external_candidates(news, allowed, [])
+    candidates = generate_external_candidates(news, allowed, [], catalog_map=catalog_map)
     actionable = [c for c in candidates if c["actionable_external"]]
     observed = [c for c in candidates if not c["actionable_external"]]
 
-    # Only 3 news-backed should be actionable, rest observed
+    # Only 3 news-backed + known_valid should be actionable, rest observed
     assert len(actionable) == 3
     assert len(observed) == 97
     assert {c["symbol"] for c in actionable} == news_syms
@@ -2641,7 +2643,204 @@ def test_pseudo_ticker_filtered_from_candidates_and_shortlist():
         {"signal_class": "external_opportunity", "effective_score": 0.9,
          "related_assets": ["WSJ", "NASA", "TSLA"]},
     ]
-    symbols, _ = build_shortlist(scored_news, set())
+    symbols, _ = build_shortlist(scored_news, set(), known_symbols={"TSLA"})
     assert "WSJ" not in symbols
     assert "NASA" not in symbols
+    assert "TSLA" in symbols
+
+
+# ===========================================================================
+# Sprint 16: Fine-grained actionable/shortlist/observed hygiene
+# ===========================================================================
+
+
+def test_unknown_asset_type_blocks_actionable():
+    """A news-backed symbol with unknown asset_type must NOT be actionable."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(), "whitelist": set(), "watchlist": set(),
+        "universe": {"HHS"}, "catalog_dynamic": {"HHS"},
+        "main_allowed": set(), "external_allowed": {"HHS"},
+    }
+    news = [{"symbol": "HHS", "reason": "HHS policy change", "confidence": 0.7,
+             "event_type": "regulatorio", "impact": "positivo"}]
+    candidates = generate_external_candidates(news, allowed, [])
+    # HHS is in blocklist now, should be filtered entirely
+    symbols = {c["symbol"] for c in candidates}
+    assert "HHS" not in symbols
+
+
+def test_unknown_not_in_blocklist_still_not_actionable():
+    """A news-backed symbol with unknown type (not blocklisted) is NOT actionable."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(), "whitelist": set(), "watchlist": set(),
+        "universe": {"XYZFAKE"}, "catalog_dynamic": {"XYZFAKE"},
+        "main_allowed": set(), "external_allowed": {"XYZFAKE"},
+    }
+    news = [{"symbol": "XYZFAKE", "reason": "Some news", "confidence": 0.8,
+             "event_type": "otro", "impact": "positivo"}]
+    candidates = generate_external_candidates(news, allowed, [])
+    c = next((x for x in candidates if x["symbol"] == "XYZFAKE"), None)
+    assert c is not None
+    assert c["asset_type_status"] == "unknown"
+    assert c["actionable_external"] is False
+
+
+def test_known_valid_with_news_is_actionable():
+    """A news-backed symbol with known_valid type IS actionable."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(), "whitelist": set(), "watchlist": set(),
+        "universe": {"TSLA"}, "catalog_dynamic": {"TSLA"},
+        "main_allowed": set(), "external_allowed": {"TSLA"},
+    }
+    news = [{"symbol": "TSLA", "reason": "Tesla earnings", "confidence": 0.8,
+             "event_type": "earnings", "impact": "positivo",
+             "signal_class": "external_opportunity", "effective_score": 0.75,
+             "market_confirmation": "confirmed"}]
+    candidates = generate_external_candidates(news, allowed, [])
+    tsla = next(c for c in candidates if c["symbol"] == "TSLA")
+    assert tsla["actionable_external"] is True
+    assert tsla["asset_type_status"] == "known_valid"
+
+
+def test_candidate_propagates_pipeline_metadata():
+    """Candidates must propagate effective_score, signal_class, market_confirmation from news."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(), "whitelist": set(), "watchlist": set(),
+        "universe": {"TSLA"}, "catalog_dynamic": {"TSLA"},
+        "main_allowed": set(), "external_allowed": {"TSLA"},
+    }
+    news = [{"symbol": "TSLA", "reason": "Tesla earnings", "confidence": 0.8,
+             "event_type": "earnings", "impact": "positivo",
+             "signal_class": "external_opportunity", "effective_score": 0.75,
+             "market_confirmation": "confirmed"}]
+    candidates = generate_external_candidates(news, allowed, [])
+    tsla = next(c for c in candidates if c["symbol"] == "TSLA")
+
+    assert tsla["effective_score"] == 0.75
+    assert tsla["signal_class"] == "external_opportunity"
+    assert tsla["market_confirmation"] == "confirmed"
+
+
+def test_candidate_without_news_has_null_metadata():
+    """Candidates from catalog-only should have None for pipeline metadata."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(), "whitelist": set(), "watchlist": set(),
+        "universe": {"MELI"}, "catalog_dynamic": {"MELI"},
+        "main_allowed": set(), "external_allowed": {"MELI"},
+    }
+    candidates = generate_external_candidates([], allowed, [])
+    meli = next(c for c in candidates if c["symbol"] == "MELI")
+    assert meli["effective_score"] is None
+    assert meli["signal_class"] is None
+    assert meli["market_confirmation"] is None
+
+
+def test_shortlist_structural_filter_known_symbols():
+    """build_shortlist passes 3-4 only accept symbols in known_symbols."""
+    from app.recommendations.scoring import build_shortlist
+
+    scored_news = [
+        {"signal_class": "external_opportunity", "effective_score": 0.9,
+         "related_assets": ["TSLA", "HHS", "XYZFAKE"]},
+    ]
+    known = {"TSLA", "AAPL"}
+    symbols, meta = build_shortlist(scored_news, set(), known_symbols=known)
+    assert "TSLA" in symbols
+    assert "HHS" not in symbols  # blocklist
+    assert "XYZFAKE" not in symbols  # not in known_symbols
+
+
+def test_shortlist_without_known_symbols_backward_compat():
+    """Without known_symbols, passes 3-4 accept any non-blocklisted symbol."""
+    from app.recommendations.scoring import build_shortlist
+
+    scored_news = [
+        {"signal_class": "external_opportunity", "effective_score": 0.9,
+         "related_assets": ["TSLA", "XYZFAKE"]},
+    ]
+    symbols, _ = build_shortlist(scored_news, set())
+    assert "TSLA" in symbols
+    assert "XYZFAKE" in symbols  # no known_symbols → no structural filter
+
+
+def test_blocklist_includes_hhs_cdc_ntsb():
+    """Blocklist must include government agencies found in runtime."""
+    from app.market.candidates import PSEUDO_TICKER_BLOCKLIST
+
+    for token in ["HHS", "CDC", "NTSB", "DHS", "DOD", "NIH", "FEMA"]:
+        assert token in PSEUDO_TICKER_BLOCKLIST, f"{token} missing from blocklist"
+
+
+def test_top_actionable_includes_reason_and_sources():
+    """decision_summary top_actionable should include reason and source_types."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener", "actions": [], "rationale_reasons": [],
+        "rationale": "Estable",
+        "external_opportunities": [
+            {"symbol": "TSLA", "effective_score": 0.75,
+             "signal_class": "external_opportunity", "market_confirmation": "confirmed",
+             "reason": "Tesla earnings beat", "source_types": ["news", "catalog"]},
+        ],
+        "observed_candidates": [],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(
+        rec=rec, scored_news=[], scoring_summary={},
+        llm_input_meta={}, fresh_quote_meta={},
+        unchanged=False, unchanged_reason="",
+    )
+
+    top = summary["candidates"]["top_actionable"][0]
+    assert top["symbol"] == "TSLA"
+    assert top["effective_score"] == 0.75
+    assert top["signal_class"] == "external_opportunity"
+    assert top["market_confirmation"] == "confirmed"
+    assert top["reason"] == "Tesla earnings beat"
+    assert top["source_types"] == ["news", "catalog"]
+
+
+def test_end_to_end_unknown_never_actionable_or_shortlisted():
+    """E2E: unknown-type symbols cannot enter external_opportunities or shortlist."""
+    from app.market.candidates import generate_external_candidates
+    from app.recommendations.scoring import build_shortlist
+
+    # HHS has news but unknown type → not actionable
+    allowed = {
+        "holdings": set(), "whitelist": set(), "watchlist": set(),
+        "universe": {"TSLA"}, "catalog_dynamic": {"TSLA"},
+        "main_allowed": set(), "external_allowed": {"TSLA"},
+    }
+    # HHS is blocklisted, won't even appear as candidate
+    # XYZFAKE is not blocklisted but has unknown type → not actionable
+    news = [
+        {"symbol": "TSLA", "reason": "Tesla news", "confidence": 0.8,
+         "event_type": "earnings", "impact": "positivo",
+         "signal_class": "external_opportunity", "effective_score": 0.8,
+         "market_confirmation": "confirmed"},
+    ]
+    candidates = generate_external_candidates(news, allowed, [])
+    actionable = [c for c in candidates if c["actionable_external"]]
+    assert all(c["asset_type_status"] == "known_valid" for c in actionable)
+
+    # Shortlist with known_symbols
+    scored_news = [
+        {"signal_class": "external_opportunity", "effective_score": 0.9,
+         "related_assets": ["TSLA", "HHS", "CDC"]},
+    ]
+    symbols, _ = build_shortlist(scored_news, set(), known_symbols={"TSLA"})
+    assert "HHS" not in symbols
+    assert "CDC" not in symbols
     assert "TSLA" in symbols

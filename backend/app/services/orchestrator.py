@@ -322,7 +322,8 @@ def _build_decision_summary(
     def _top_n(items, n=3):
         return [
             {"symbol": i.get("symbol"), "effective_score": i.get("effective_score"),
-             "signal_class": i.get("signal_class"), "market_confirmation": i.get("market_confirmation")}
+             "signal_class": i.get("signal_class"), "market_confirmation": i.get("market_confirmation"),
+             "reason": i.get("reason"), "source_types": i.get("source_types")}
             for i in items[:n]
         ]
 
@@ -519,6 +520,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     try:
         shortlist, shortlist_meta = build_shortlist(
             scored_news, allowed_assets.get("holdings", set()),
+            known_symbols=allowed_assets.get("all_known"),
         )
         fresh_prices, fetch_meta = fetch_fresh_quotes(db, shortlist, broker=broker)
         if fresh_prices:

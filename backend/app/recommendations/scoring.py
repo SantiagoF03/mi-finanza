@@ -524,6 +524,7 @@ def build_shortlist(
     scored_news: list[dict],
     holdings: set,
     max_symbols: int = _SHORTLIST_MAX_SYMBOLS,
+    known_symbols: set | None = None,
 ) -> tuple[list[str], dict]:
     """Build a small shortlist of symbols that deserve fresh quotes.
 
@@ -532,6 +533,9 @@ def build_shortlist(
     2. Holdings mentioned in holding_opportunity signals
     3. Symbols from top external_opportunities (by effective_score)
     4. Symbols from promoted_from_observed items
+
+    known_symbols: if provided, passes 3-4 only accept symbols in this set
+    (prevents NLP-parsed non-ticker entities from contaminating the shortlist).
 
     Returns (symbols, shortlist_meta).
     """
@@ -557,17 +561,18 @@ def build_shortlist(
             _add_symbols(item, holdings)
 
     # Pass 3: top external_opportunities by effective_score
+    # Only accept symbols that are known tracked instruments (if known_symbols provided)
     externals = sorted(
         [i for i in scored_news if i.get("signal_class") == "external_opportunity"],
         key=lambda x: -x.get("effective_score", 0),
     )
     for item in externals:
-        _add_symbols(item)
+        _add_symbols(item, known_symbols)
 
-    # Pass 4: promoted from observed
+    # Pass 4: promoted from observed (also gated by known_symbols)
     for item in scored_news:
         if item.get("promoted_from_observed"):
-            _add_symbols(item)
+            _add_symbols(item, known_symbols)
 
     result = ordered[:max_symbols]
 
