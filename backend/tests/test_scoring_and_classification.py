@@ -2844,3 +2844,222 @@ def test_end_to_end_unknown_never_actionable_or_shortlisted():
     assert "HHS" not in symbols
     assert "CDC" not in symbols
     assert "TSLA" in symbols
+
+
+# ===========================================================================
+# Sprint 17: Observed path hygiene — engine filter + top_observed quality
+# ===========================================================================
+
+
+def test_engine_filters_pseudo_tickers_from_observed():
+    """Engine must not create observed_candidates entries for blocklisted symbols."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "WSJ reports on market",
+            "related_assets": ["WSJ", "TSLA"],
+            "signal_class": "observed_candidate",
+            "signal_score": 0.5,
+            "effective_score": 0.5,
+            "confidence": 0.6,
+            "event_type": "otro",
+            "impact": "neutro",
+            "source_count": 1,
+        },
+        {
+            "title": "NTSB investigation update",
+            "related_assets": ["NTSB"],
+            "signal_class": "observed_candidate",
+            "signal_score": 0.45,
+            "effective_score": 0.45,
+            "confidence": 0.5,
+            "event_type": "regulatorio",
+            "impact": "negativo",
+            "source_count": 1,
+        },
+    ]
+
+    snapshot = {
+        "total_value": 100000, "cash": 10000,
+        "positions": [{"symbol": "AAPL", "asset_type": "CEDEAR", "market_value": 90000,
+                        "quantity": 10, "pnl_pct": 0.05}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.9}, "alerts": []}
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    observed_symbols = {c["symbol"] for c in rec.get("observed_candidates", [])}
+
+    assert "WSJ" not in observed_symbols, "WSJ is a pseudo-ticker, should be filtered"
+    assert "NTSB" not in observed_symbols, "NTSB is a pseudo-ticker, should be filtered"
+    # TSLA is a real ticker and should survive
+    assert "TSLA" in observed_symbols
+
+
+def test_engine_filters_pseudo_tickers_from_external():
+    """Engine must not create external_opportunities entries for blocklisted symbols."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "SEC announces new regulation on HHS",
+            "related_assets": ["SEC", "HHS", "MELI"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.6,
+            "effective_score": 0.6,
+            "confidence": 0.7,
+            "event_type": "regulatorio",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = {
+        "total_value": 100000, "cash": 10000,
+        "positions": [{"symbol": "AAPL", "asset_type": "CEDEAR", "market_value": 90000,
+                        "quantity": 10, "pnl_pct": 0.05}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.9}, "alerts": []}
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    ext_symbols = {c["symbol"] for c in rec.get("external_opportunities", [])}
+
+    assert "SEC" not in ext_symbols
+    assert "HHS" not in ext_symbols
+    assert "MELI" in ext_symbols
+
+
+def test_top_observed_prefers_scored_items():
+    """top_observed should prefer items with effective_score over bare catalog items."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener", "actions": [], "rationale_reasons": [],
+        "rationale": "Estable",
+        "external_opportunities": [],
+        "observed_candidates": [
+            # Engine-observed with score (should rank first)
+            {"symbol": "MELI", "effective_score": 0.55, "signal_class": "observed_candidate",
+             "market_confirmation": "unconfirmed", "reason": "MELI expansion news",
+             "source_types": None},
+            # Bare catalog item (no score — should rank lower)
+            {"symbol": "SYM99", "effective_score": None, "signal_class": None,
+             "market_confirmation": None, "reason": "Observado desde catalog",
+             "priority_score": 0.25, "source_types": ["catalog"]},
+            # Another scored item
+            {"symbol": "GLOB", "effective_score": 0.48, "signal_class": "observed_candidate",
+             "market_confirmation": "confirmed", "reason": "GLOB quarterly results",
+             "source_types": None},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(
+        rec=rec, scored_news=[], scoring_summary={},
+        llm_input_meta={}, fresh_quote_meta={},
+        unchanged=False, unchanged_reason="",
+    )
+
+    top = summary["candidates"]["top_observed"]
+    assert len(top) == 3
+    # MELI should be first (highest effective_score)
+    assert top[0]["symbol"] == "MELI"
+    assert top[0]["effective_score"] == 0.55
+    # GLOB second
+    assert top[1]["symbol"] == "GLOB"
+
+
+def test_observed_count_not_broken_by_engine_filter():
+    """Filtering pseudo-tickers in engine should not break observed_count alignment."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    ds = meta.get("decision_summary", {})
+    obs_cands = meta.get("observed_candidates", [])
+
+    # Count must match actual list length
+    if ds:
+        assert ds["candidates"]["observed_count"] == len(obs_cands)
+
+    # No blocklisted symbols in observed
+    from app.market.candidates import PSEUDO_TICKER_BLOCKLIST
+    for item in obs_cands:
+        sym = item.get("symbol", "")
+        assert sym not in PSEUDO_TICKER_BLOCKLIST, f"{sym} is pseudo-ticker in observed_candidates"
+
+
+def test_legitimate_discovery_survives_filter():
+    """Real ticker symbols must survive engine filtering."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "MELI expansion in Brazil",
+            "related_assets": ["MELI", "GLOB"],
+            "signal_class": "observed_candidate",
+            "signal_score": 0.5,
+            "effective_score": 0.5,
+            "confidence": 0.6,
+            "event_type": "expansion",
+            "impact": "positivo",
+            "source_count": 1,
+        },
+    ]
+
+    snapshot = {
+        "total_value": 100000, "cash": 10000,
+        "positions": [{"symbol": "AAPL", "asset_type": "CEDEAR", "market_value": 90000,
+                        "quantity": 10, "pnl_pct": 0.05}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.9}, "alerts": []}
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    observed_symbols = {c["symbol"] for c in rec.get("observed_candidates", [])}
+
+    assert "MELI" in observed_symbols
+    assert "GLOB" in observed_symbols
+
+
+def test_no_regression_external_opportunities_planner():
+    """Engine pseudo-ticker filter must not affect external_opportunities or planner."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "TSLA earnings beat expectations",
+            "related_assets": ["TSLA"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "confidence": 0.8,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = {
+        "total_value": 100000, "cash": 10000,
+        "positions": [{"symbol": "AAPL", "asset_type": "CEDEAR", "market_value": 90000,
+                        "quantity": 10, "pnl_pct": 0.05}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.9}, "alerts": []}
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    ext_symbols = {c["symbol"] for c in rec.get("external_opportunities", [])}
+
+    assert "TSLA" in ext_symbols

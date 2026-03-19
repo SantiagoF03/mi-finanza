@@ -1,4 +1,5 @@
 from app.core.config import get_settings
+from app.market.candidates import PSEUDO_TICKER_BLOCKLIST
 from app.portfolio.profiles import get_profile_label, get_profile_thresholds, resolve_profile
 
 # Minimum signal_score to count as a meaningful hit (filters noise)
@@ -56,7 +57,7 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
             continue
 
         for symbol in item.get("related_assets", []):
-            if symbol in held_set:
+            if symbol in held_set or symbol in PSEUDO_TICKER_BLOCKLIST:
                 continue
 
             entry = {
