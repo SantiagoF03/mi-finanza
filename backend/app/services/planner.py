@@ -165,6 +165,11 @@ def generate_reallocation_plan(
             why_rejected.append(f"{sym}: ya en cartera")
             continue
 
+        # Must be actionable (has real evidence: news or watchlist+known_valid)
+        if not opp.get("actionable_external", False):
+            why_rejected.append(f"{sym}: no accionable (solo observado)")
+            continue
+
         # Must be in main_allowed (safety rail)
         if sym not in main_allowed:
             why_rejected.append(f"{sym}: no está en main_allowed (whitelist)")

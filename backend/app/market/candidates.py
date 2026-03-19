@@ -23,11 +23,24 @@ from app.recommendations.universe import classify_opportunity_status
 # Pseudo-ticker blocklist: common tokens that NLP/news pipelines
 # incorrectly parse as stock symbols. These are never real CEDEARs/tickers.
 PSEUDO_TICKER_BLOCKLIST = frozenset({
-    "CEO", "UK", "US", "EU", "DOJ", "SEC", "GDP", "IPO", "ETF",
-    "BMV", "NYSE", "FBI", "CIA", "FED", "IMF", "WHO", "UN", "AI",
-    "IT", "HR", "PR", "IR", "EPS", "PE", "ROI", "ROE", "ESG",
-    "USD", "EUR", "GBP", "JPY", "BRL", "CLP", "MXN",
+    # C-suite / roles
     "CEO", "CFO", "CTO", "COO", "CIO",
+    # Countries / regions
+    "UK", "US", "EU", "UN",
+    # Government / regulatory agencies
+    "DOJ", "SEC", "FBI", "CIA", "FED", "IMF", "WHO",
+    # Financial acronyms
+    "GDP", "IPO", "ETF", "EPS", "PE", "ROI", "ROE", "ESG",
+    # Exchanges (not tickers)
+    "BMV", "NYSE",
+    # Currencies
+    "USD", "EUR", "GBP", "JPY", "BRL", "CLP", "MXN",
+    # Tech / generic
+    "AI", "IT", "HR", "PR", "IR",
+    # Media / agencies / organizations (not investable)
+    "WSJ", "NASA", "BBC", "CNN", "CNBC", "EPA", "FDA", "IRS",
+    "NATO", "OPEC", "ECB", "BOJ", "RBI", "WTO", "IAEA",
+    "AP", "AFP", "MIT", "UCLA", "NFL", "NBA", "FIFA",
 })
 
 

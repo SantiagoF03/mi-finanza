@@ -12,6 +12,8 @@ generate_recommendation() calls score_and_classify_news() as a pre-processing st
 
 from __future__ import annotations
 
+from app.market.candidates import PSEUDO_TICKER_BLOCKLIST
+
 
 # ---------------------------------------------------------------------------
 # Parte A — Cluster-aware signal scoring
@@ -538,6 +540,8 @@ def build_shortlist(
 
     def _add_symbols(item: dict, filter_set: set | None = None):
         for sym in item.get("related_assets", []):
+            if sym in PSEUDO_TICKER_BLOCKLIST:
+                continue
             if sym not in seen and (filter_set is None or sym in filter_set):
                 seen.add(sym)
                 ordered.append(sym)

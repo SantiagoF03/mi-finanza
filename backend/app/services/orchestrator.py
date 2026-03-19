@@ -542,12 +542,18 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     rec = generate_recommendation(snapshot_dict, analysis, scored_news, settings.max_movement_per_cycle)
 
     # Replace news-only external_opportunities with full candidate sourcing
-    rec["external_opportunities"] = generate_external_candidates(
+    all_candidates = generate_external_candidates(
         news_opportunities=rec.get("external_opportunities", []),
         allowed_assets=allowed_assets,
         positions=positions,
         catalog_map=catalog_map,
     )
+
+    # Split: only truly actionable items stay in external_opportunities.
+    # Non-actionable (catalog/universe-only) merge into observed_candidates.
+    rec["external_opportunities"] = [c for c in all_candidates if c.get("actionable_external")]
+    observed_from_candidates = [c for c in all_candidates if not c.get("actionable_external")]
+    rec["observed_candidates"] = rec.get("observed_candidates", []) + observed_from_candidates
 
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
 
