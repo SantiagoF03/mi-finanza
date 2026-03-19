@@ -128,8 +128,8 @@ def test_candidate_unknown_status():
     assert c["asset_type"] == "DESCONOCIDO"
     assert c["asset_type_status"] == "unknown"
     assert c["asset_type_valid"] is False
-    # Unknown does NOT block actionable (it's in watchlist)
-    assert c["actionable_external"] is True
+    # Unknown type + watchlist → NOT actionable (needs known_valid for watchlist promotion)
+    assert c["actionable_external"] is False
 
 
 def test_candidate_unknown_not_shown_as_unsupported():
@@ -164,7 +164,8 @@ def test_candidate_in_universe_and_whitelist_is_investable():
     assert aapl["asset_type_status"] == "known_valid"
     assert aapl["in_main_allowed"] is True
     assert aapl["investable"] is True
-    assert aapl["actionable_external"] is True
+    # Universe alone (no news, no watchlist) → NOT actionable (Sprint 14 fix)
+    assert aapl["actionable_external"] is False
     assert "inversión" in aapl["actionable_reason"].lower() or "whitelist" in aapl["actionable_reason"].lower()
 
 
@@ -231,8 +232,8 @@ def test_real_runtime_scenario_aapl_nvda_in_universe():
         # In whitelist → investable
         assert c["in_main_allowed"] is True
         assert c["investable"] is True
-        # In universe → actionable
-        assert c["actionable_external"] is True
+        # Universe alone (no news) → NOT actionable (Sprint 14 fix)
+        assert c["actionable_external"] is False
         # No contradictory flags
         assert c["priority_score"] > 0.1  # More than base universe score
 

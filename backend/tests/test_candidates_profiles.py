@@ -151,8 +151,8 @@ def test_invalid_asset_type_does_not_break_cycle():
     c = candidates[0]
     assert c["asset_type"] == "DESCONOCIDO"
     assert c["asset_type_status"] == "unknown"  # NOT unsupported
-    # Unknown is still actionable because it's in watchlist
-    assert c["actionable_external"] is True
+    # Unknown type + watchlist → NOT actionable (needs known_valid for watchlist, Sprint 14)
+    assert c["actionable_external"] is False
     assert c["tracking_status"] == "watchlist"
 
 

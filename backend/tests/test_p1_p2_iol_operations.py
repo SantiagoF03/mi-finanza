@@ -350,7 +350,8 @@ def test_external_opportunity_from_catalog_no_whitelist(db):
 
     disc = next(c for c in candidates if c["symbol"] == "DISCOVERED")
     assert "catalog" in disc["source_types"]
-    assert disc["actionable_external"] is True
+    # Catalog alone → NOT actionable (Sprint 14: requires news or watchlist+known_valid)
+    assert disc["actionable_external"] is False
 
 
 # ===========================================================================

@@ -2251,3 +2251,196 @@ def test_api_exposes_decision_summary():
     api_decision_summary = meta.get("decision_summary") or {}
     assert isinstance(api_decision_summary, dict)
     assert "primary_driver" in api_decision_summary
+
+
+# ===========================================================================
+# Sprint 14: External opportunities inflation fix
+# ===========================================================================
+
+
+def test_catalog_only_not_actionable():
+    """A symbol from catalog_dynamic alone must NOT be actionable_external."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": set(),
+        "universe": {"MELI"},
+        "catalog_dynamic": {"MELI"},
+        "main_allowed": set(),
+        "external_allowed": {"MELI"},
+    }
+    candidates = generate_external_candidates([], allowed, [])
+    assert len(candidates) == 1
+    c = candidates[0]
+    assert c["actionable_external"] is False
+    assert "observado" in c["actionable_reason"].lower()
+
+
+def test_universe_only_not_actionable():
+    """A symbol in universe (no news, no watchlist) must NOT be actionable_external."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": set(),
+        "universe": {"GLOB"},
+        "catalog_dynamic": set(),
+        "main_allowed": set(),
+        "external_allowed": {"GLOB"},
+    }
+    candidates = generate_external_candidates([], allowed, [])
+    c = candidates[0]
+    assert c["actionable_external"] is False
+
+
+def test_news_makes_actionable():
+    """A symbol with news signal becomes actionable_external."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": set(),
+        "universe": {"TSLA"},
+        "catalog_dynamic": {"TSLA"},
+        "main_allowed": set(),
+        "external_allowed": {"TSLA"},
+    }
+    news = [{"symbol": "TSLA", "reason": "Tesla earnings beat", "confidence": 0.8,
+             "event_type": "earnings", "impact": "positivo"}]
+    candidates = generate_external_candidates(news, allowed, [])
+    tsla = next(c for c in candidates if c["symbol"] == "TSLA")
+    assert tsla["actionable_external"] is True
+    assert "news" in tsla["source_types"]
+
+
+def test_watchlist_known_valid_is_actionable():
+    """A watchlist symbol with known_valid asset_type is actionable."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": {"TSLA"},
+        "universe": set(),
+        "catalog_dynamic": set(),
+        "main_allowed": set(),
+        "external_allowed": {"TSLA"},
+    }
+    candidates = generate_external_candidates([], allowed, [])
+    c = candidates[0]
+    # TSLA resolves to CEDEAR (known_valid)
+    assert c["asset_type_status"] == "known_valid"
+    assert c["actionable_external"] is True
+
+
+def test_watchlist_unknown_type_not_actionable():
+    """A watchlist symbol with unknown asset_type is NOT actionable."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": {"ZZZNONSENSE"},
+        "universe": set(),
+        "catalog_dynamic": set(),
+        "main_allowed": set(),
+        "external_allowed": {"ZZZNONSENSE"},
+    }
+    candidates = generate_external_candidates([], allowed, [])
+    c = candidates[0]
+    assert c["asset_type_status"] == "unknown"
+    assert c["actionable_external"] is False
+
+
+def test_pseudo_ticker_filtered_from_news():
+    """Pseudo-tickers (CEO, UK, DOJ, etc.) must be filtered out entirely."""
+    from app.market.candidates import generate_external_candidates, PSEUDO_TICKER_BLOCKLIST
+
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": set(),
+        "universe": set(),
+        "catalog_dynamic": {"CEO", "UK", "DOJ", "TSLA"},
+        "main_allowed": set(),
+        "external_allowed": {"CEO", "UK", "DOJ", "TSLA"},
+    }
+    news = [
+        {"symbol": "CEO", "reason": "CEO appointed", "confidence": 0.6,
+         "event_type": "otro", "impact": "positivo"},
+        {"symbol": "TSLA", "reason": "Tesla news", "confidence": 0.7,
+         "event_type": "earnings", "impact": "positivo"},
+    ]
+    candidates = generate_external_candidates(news, allowed, [])
+    symbols = {c["symbol"] for c in candidates}
+    # CEO, UK, DOJ should be filtered
+    assert "CEO" not in symbols
+    assert "UK" not in symbols
+    assert "DOJ" not in symbols
+    # TSLA (real ticker) should remain
+    assert "TSLA" in symbols
+
+
+def test_pseudo_ticker_blocklist_has_common_tokens():
+    """Blocklist includes common false-positive tokens."""
+    from app.market.candidates import PSEUDO_TICKER_BLOCKLIST
+
+    expected = {"CEO", "UK", "US", "EU", "DOJ", "SEC", "GDP", "IPO", "BMV",
+                "FBI", "FED", "IMF", "AI", "CFO", "CTO", "USD", "EUR"}
+    assert expected.issubset(PSEUDO_TICKER_BLOCKLIST)
+
+
+def test_healthy_distribution_with_mixed_sources():
+    """With catalog + news mix, only news-backed symbols are actionable."""
+    from app.market.candidates import generate_external_candidates
+
+    catalog_syms = {f"SYM{i}" for i in range(100)}
+    news_syms = {"SYM0", "SYM1", "SYM2"}
+
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": set(),
+        "universe": catalog_syms,
+        "catalog_dynamic": catalog_syms,
+        "main_allowed": set(),
+        "external_allowed": catalog_syms,
+    }
+    news = [{"symbol": s, "reason": "Test news", "confidence": 0.7,
+             "event_type": "earnings", "impact": "positivo"} for s in news_syms]
+
+    candidates = generate_external_candidates(news, allowed, [])
+    actionable = [c for c in candidates if c["actionable_external"]]
+    observed = [c for c in candidates if not c["actionable_external"]]
+
+    # Only 3 news-backed should be actionable, rest observed
+    assert len(actionable) == 3
+    assert len(observed) == 97
+    assert {c["symbol"] for c in actionable} == news_syms
+
+
+def test_catalog_plus_news_ranks_higher_than_catalog_only():
+    """A candidate with news+catalog should rank above catalog-only."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": set(),
+        "universe": {"TSLA", "MELI"},
+        "catalog_dynamic": {"TSLA", "MELI"},
+        "main_allowed": set(),
+        "external_allowed": {"TSLA", "MELI"},
+    }
+    news = [{"symbol": "TSLA", "reason": "Tesla news", "confidence": 0.7,
+             "event_type": "earnings", "impact": "positivo"}]
+    candidates = generate_external_candidates(news, allowed, [])
+    tsla = next(c for c in candidates if c["symbol"] == "TSLA")
+    meli = next(c for c in candidates if c["symbol"] == "MELI")
+    assert tsla["priority_score"] > meli["priority_score"]
+    assert tsla["actionable_external"] is True
+    assert meli["actionable_external"] is False
