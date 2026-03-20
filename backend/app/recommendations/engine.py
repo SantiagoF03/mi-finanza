@@ -1,9 +1,23 @@
+import re
+
 from app.core.config import get_settings
 from app.market.candidates import PSEUDO_TICKER_BLOCKLIST
 from app.portfolio.profiles import get_profile_label, get_profile_thresholds, resolve_profile
 
 # Minimum signal_score to count as a meaningful hit (filters noise)
 _MIN_SIGNAL_SCORE = 0.35
+
+
+def _symbol_in_title(symbol: str, title: str) -> bool:
+    """Check if symbol appears as a whole word in the news title.
+
+    This is the MVP relevance gate: symbols mentioned in the title are
+    much more likely to be the *subject* of the news, not incidental mentions
+    (e.g. "según analistas de BAC" in the body).
+    """
+    if not title:
+        return False
+    return bool(re.search(r'\b' + re.escape(symbol) + r'\b', title))
 
 
 def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], max_move: float) -> dict:
@@ -56,9 +70,16 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
         if item_score < _MIN_SIGNAL_SCORE:
             continue
 
+        title = item.get("title") or ""
+
         for symbol in item.get("related_assets", []):
             if symbol in held_set or symbol in PSEUDO_TICKER_BLOCKLIST:
                 continue
+
+            # MVP relevance gate: does this symbol appear in the title?
+            # Symbols only in the body/summary are weakly associated
+            # (e.g. "según analistas de BAC" in a news about Amazon).
+            in_title = _symbol_in_title(symbol, title)
 
             entry = {
                 "symbol": symbol,
@@ -73,6 +94,7 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
                 "market_confirmation": (item.get("market_confirmation") or {}).get("status", "unconfirmed"),
                 "promoted_from_observed": item.get("promoted_from_observed", False),
                 "suppressed_by_contradiction": item.get("suppressed_by_contradiction", False),
+                "title_mention": in_title,
             }
 
             # Suppressed items go to their own list regardless of signal_class
@@ -80,8 +102,13 @@ def generate_recommendation(snapshot: dict, analysis: dict, news: list[dict], ma
                 suppressed_candidates.append(entry)
             elif signal_class == "observed_candidate":
                 observed_candidates.append(entry)
+            elif not in_title:
+                # Weak relevance: symbol not in title → downgrade to observed.
+                # The symbol is still tracked for discovery, but won't be
+                # promoted to external_opportunities (avoids BAC-for-Amazon cases).
+                observed_candidates.append(entry)
             else:
-                # external_opportunity, holding_opportunity (non-held asset), or legacy (no class)
+                # Strong relevance: symbol in title → external_opportunity
                 external_opportunities.append(entry)
 
     dedup_ops = []

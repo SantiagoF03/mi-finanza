@@ -327,7 +327,8 @@ def _build_decision_summary(
             {"symbol": i.get("symbol"), "effective_score": i.get("effective_score"),
              "signal_class": i.get("signal_class"), "market_confirmation": i.get("market_confirmation"),
              "reason": i.get("reason"), "source_types": i.get("source_types"),
-             "investable": i.get("investable"), "asset_type_status": i.get("asset_type_status")}
+             "investable": i.get("investable"), "asset_type_status": i.get("asset_type_status"),
+             "title_mention": i.get("title_mention")}
             for i in source[:n]
         ]
 
@@ -340,6 +341,7 @@ def _build_decision_summary(
         x.get("priority_score") or 0,
     )
     _observed_key = lambda x: (
+        1 if x.get("title_mention") else 0,
         1 if x.get("asset_type_status") == "known_valid" else 0,
         x.get("effective_score") or 0,
         x.get("priority_score") or 0,
@@ -584,6 +586,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         "asset_type_status", "asset_type", "source_types", "investable",
         "actionable_external", "priority_score", "tracking_status",
         "actionable_reason", "in_main_allowed", "asset_type_source",
+        "title_mention",
     )
     raw_observed = rec.get("observed_candidates", []) + observed_from_candidates
     seen_observed: dict[str, dict] = {}
