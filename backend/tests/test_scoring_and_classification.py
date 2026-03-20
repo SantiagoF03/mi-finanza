@@ -3230,3 +3230,152 @@ def test_counts_not_broken_by_sort_changes():
         assert "investable_count" in ds["candidates"]
         investable_actual = sum(1 for c in ext_ops if c.get("investable"))
         assert ds["candidates"]["investable_count"] == investable_actual
+
+
+# ===========================================================================
+# Sprint 19: Strict operable bucket — external_opportunities = investable only
+# ===========================================================================
+
+
+def test_non_investable_excluded_from_external_opportunities():
+    """Candidates with actionable_external=True but investable=False must NOT be in external_opportunities."""
+    from app.market.candidates import generate_external_candidates
+
+    # NVDA: known_valid CEDEAR, in watchlist → actionable=True
+    # But NOT in main_allowed (whitelist) → investable=False
+    allowed = {
+        "holdings": set(), "whitelist": set(), "watchlist": {"NVDA"},
+        "universe": set(), "catalog_dynamic": set(),
+        "main_allowed": set(),  # NVDA is NOT in whitelist
+        "external_allowed": {"NVDA"},
+    }
+    candidates = generate_external_candidates([], allowed, [])
+    nvda = next((c for c in candidates if c["symbol"] == "NVDA"), None)
+    assert nvda is not None
+    assert nvda["actionable_external"] is True  # watchlist + known_valid
+    assert nvda["investable"] is False  # not in main_allowed
+
+    # In the orchestrator split, NVDA would go to observed (not external_opportunities)
+    operable = [c for c in candidates if c.get("actionable_external") and c.get("investable")]
+    observed = [c for c in candidates if not (c.get("actionable_external") and c.get("investable"))]
+    assert "NVDA" not in {c["symbol"] for c in operable}
+    assert "NVDA" in {c["symbol"] for c in observed}
+
+
+def test_investable_stays_in_external_opportunities():
+    """Candidates with actionable_external=True AND investable=True stay in external_opportunities."""
+    from app.market.candidates import generate_external_candidates
+
+    allowed = {
+        "holdings": set(), "whitelist": {"TSLA"}, "watchlist": {"TSLA"},
+        "universe": set(), "catalog_dynamic": set(),
+        "main_allowed": {"TSLA"},
+        "external_allowed": {"TSLA"},
+    }
+    candidates = generate_external_candidates([], allowed, [])
+    tsla = next((c for c in candidates if c["symbol"] == "TSLA"), None)
+    assert tsla is not None
+    assert tsla["actionable_external"] is True
+    assert tsla["investable"] is True
+
+    operable = [c for c in candidates if c.get("actionable_external") and c.get("investable")]
+    assert "TSLA" in {c["symbol"] for c in operable}
+
+
+def test_orchestrator_strict_split_e2e():
+    """E2E: orchestrator splits external_opportunities = only investable items."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    ext_ops = meta.get("external_opportunities", [])
+    # Every item in external_opportunities must be investable
+    for item in ext_ops:
+        if "investable" in item:
+            assert item["investable"] is True, \
+                f"{item.get('symbol')} in external_opportunities but investable=False"
+
+
+def test_decision_summary_counts_after_strict_split():
+    """decision_summary counts must reflect strict split."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    ds = meta.get("decision_summary", {})
+    ext_ops = meta.get("external_opportunities", [])
+    obs_cands = meta.get("observed_candidates", [])
+
+    if ds:
+        assert ds["candidates"]["actionable_count"] == len(ext_ops)
+        assert ds["candidates"]["observed_count"] == len(obs_cands)
+        # With strict split, investable_count == actionable_count
+        assert ds["candidates"]["investable_count"] == len(ext_ops)
+
+
+def test_planner_no_regression_after_strict_split():
+    """Planner must still work correctly with strict external_opportunities."""
+    from unittest.mock import patch, MagicMock
+    from app.services.planner import generate_reallocation_plan
+
+    snapshot = {
+        "total_value": 100000, "cash": 20000,
+        "positions": [{"symbol": "AAPL", "asset_type": "CEDEAR", "quantity": 50, "market_value": 80000}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.80}}
+    # Only investable items in external_opportunities (post strict split)
+    external_opportunities = [
+        {
+            "symbol": "MSFT",
+            "asset_type": "CEDEAR",
+            "asset_type_status": "known_valid",
+            "priority_score": 0.7,
+            "source_types": ["news", "watchlist"],
+            "reason": "Valid opportunity",
+            "investable": True,
+            "actionable_external": True,
+        },
+    ]
+    allowed_assets = {"main_allowed": {"AAPL", "MSFT"}, "holdings": {"AAPL"}}
+
+    with patch("app.services.planner.get_settings") as mock_s:
+        s = MagicMock()
+        s.investor_profile_target = "moderate_aggressive"
+        s.investor_profile = "moderado"
+        s.max_movement_per_cycle = 0.10
+        mock_s.return_value = s
+
+        plan = generate_reallocation_plan(
+            snapshot=snapshot, analysis=analysis,
+            external_opportunities=external_opportunities,
+            allowed_assets=allowed_assets,
+        )
+
+    buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
+    assert "MSFT" in buy_symbols

@@ -572,10 +572,11 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         catalog_map=catalog_map,
     )
 
-    # Split: only truly actionable items stay in external_opportunities.
-    # Non-actionable (catalog/universe-only) merge into observed_candidates.
-    rec["external_opportunities"] = [c for c in all_candidates if c.get("actionable_external")]
-    observed_from_candidates = [c for c in all_candidates if not c.get("actionable_external")]
+    # Split: only truly operable items stay in external_opportunities.
+    # Operable = actionable_external AND investable (in whitelist + known_valid).
+    # Everything else (catalog-only, actionable-but-not-investable) → observed_candidates.
+    rec["external_opportunities"] = [c for c in all_candidates if c.get("actionable_external") and c.get("investable")]
+    observed_from_candidates = [c for c in all_candidates if not (c.get("actionable_external") and c.get("investable"))]
     # Merge engine-observed + candidate-observed, sort by effective_score so top_observed is useful
     merged_observed = rec.get("observed_candidates", []) + observed_from_candidates
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)

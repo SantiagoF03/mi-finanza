@@ -281,15 +281,17 @@ def test_full_cycle_with_candidate_sourcing():
     rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
     meta = rec.metadata_json or {}
 
-    # External opportunities should include watchlist/universe candidates
-    ext_symbols = {op["symbol"] for op in meta.get("external_opportunities", [])}
-    assert "TSLA" in ext_symbols or "NVDA" in ext_symbols or "MELI" in ext_symbols
+    # Watchlist/universe-only candidates are observed (not investable without whitelist).
+    # They should appear in observed_candidates or external_opportunities depending on investable.
+    all_symbols = {op["symbol"] for op in meta.get("external_opportunities", [])} | \
+                  {op["symbol"] for op in meta.get("observed_candidates", [])}
+    assert "TSLA" in all_symbols or "NVDA" in all_symbols or "MELI" in all_symbols
 
-    # Each opportunity should have the new fields
-    for op in meta.get("external_opportunities", []):
-        assert "source_types" in op
-        assert "actionable_external" in op
-        assert "priority_score" in op
+    # All candidates (both buckets) should have the new fields
+    for op in meta.get("external_opportunities", []) + meta.get("observed_candidates", []):
+        assert "source_types" in op or "signal_class" in op  # engine-observed has signal_class not source_types
+        if "actionable_external" in op:
+            assert "priority_score" in op
 
     # Recommendation should still be limited to holdings
     for action in rec.actions:
