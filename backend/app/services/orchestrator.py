@@ -7,7 +7,7 @@ from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.llm.explainer import explain_recommendation as llm_explain, summarize_news as llm_summarize
 from app.market.candidates import generate_external_candidates
-from app.market.assets import build_catalog_asset_type_map
+from app.market.assets import SYMBOL_COMPANY_NAMES, build_catalog_asset_type_map
 from app.market.discovery import build_catalog_price_map, fetch_fresh_quotes, get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import NewsEvent, PortfolioPosition, PortfolioSnapshot, Recommendation, RecommendationAction
 from app.news.ingestion import (
@@ -28,6 +28,26 @@ from app.services.logs import app_log
 from app.services.planner import generate_reallocation_plan
 
 _broker_singletons: dict[str, object] = {}
+
+
+def _has_causal_link(item: dict) -> bool:
+    """Check if a news signal has a defensible causal link to its symbol.
+
+    Returns True if:
+    1. The ticker appears in the news title (title_mention), OR
+    2. The company/issuer name appears in the news title (reason field).
+    """
+    if item.get("title_mention"):
+        return True
+    symbol = item.get("symbol", "")
+    reason = item.get("reason", "")
+    if not reason or not symbol:
+        return False
+    names = SYMBOL_COMPANY_NAMES.get(symbol)
+    if not names:
+        return False
+    reason_lower = reason.lower()
+    return any(name in reason_lower for name in names)
 
 
 def _get_broker():
@@ -646,9 +666,9 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             item["signal_quality"] = None
         # causal_link_strength: "strong" if news appears causally related to this symbol,
         # "weak" if the symbol has a signal but the causal link is vague/lateral.
-        # Primary heuristic: title_mention (symbol appears in news headline).
+        # Heuristics: (1) ticker in headline, (2) company name in headline.
         if has_signal:
-            item["causal_link_strength"] = "strong" if item.get("title_mention") else "weak"
+            item["causal_link_strength"] = "strong" if _has_causal_link(item) else "weak"
         else:
             item["causal_link_strength"] = None
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)

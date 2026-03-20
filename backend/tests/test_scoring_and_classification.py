@@ -5635,3 +5635,243 @@ def test_promotion_loop_directly():
     assert len(remaining_observed) == 3
     remaining_symbols = {i["symbol"] for i in remaining_observed}
     assert remaining_symbols == {"V", "GPU", "MA"}
+
+
+# ---------------------------------------------------------------------------
+# Sprint 27: company name matching for causal_link_strength
+# ---------------------------------------------------------------------------
+
+
+def test_has_causal_link_title_mention():
+    """title_mention=True → causal link detected (existing behavior preserved)."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {"symbol": "MELI", "title_mention": True, "reason": "Unrelated news"}
+    assert _has_causal_link(item) is True
+
+
+def test_has_causal_link_company_name_in_reason():
+    """Company name in reason (news title) → causal link detected."""
+    from app.services.orchestrator import _has_causal_link
+
+    # V: "Visa reports earnings" → should match
+    item = {"symbol": "V", "title_mention": False,
+            "reason": "Visa reports record quarterly earnings"}
+    assert _has_causal_link(item) is True
+
+
+def test_has_causal_link_company_name_case_insensitive():
+    """Company name matching is case-insensitive."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {"symbol": "MA", "title_mention": False,
+            "reason": "MASTERCARD expands into new markets"}
+    assert _has_causal_link(item) is True
+
+
+def test_has_causal_link_no_match():
+    """Neither ticker nor company name in reason → no causal link."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {"symbol": "V", "title_mention": False,
+            "reason": "U.S. stocks lower at close of trade; Dow Jones Industrial Average down 0.97%"}
+    assert _has_causal_link(item) is False
+
+
+def test_has_causal_link_unrelated_company_news():
+    """News about a different company → no causal link for this symbol."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {"symbol": "MA", "title_mention": False,
+            "reason": "Suncor's global head of market and trade risk management to depart, sources say"}
+    assert _has_causal_link(item) is False
+
+
+def test_has_causal_link_multiple_variants():
+    """Company with multiple name variants (e.g. JPM → 'jpmorgan', 'jp morgan')."""
+    from app.services.orchestrator import _has_causal_link
+
+    item1 = {"symbol": "JPM", "title_mention": False,
+             "reason": "JPMorgan beats expectations in Q4"}
+    assert _has_causal_link(item1) is True
+
+    item2 = {"symbol": "JPM", "title_mention": False,
+             "reason": "JP Morgan raises dividend after strong quarter"}
+    assert _has_causal_link(item2) is True
+
+
+def test_has_causal_link_unknown_symbol():
+    """Symbol not in SYMBOL_COMPANY_NAMES and no title_mention → no match."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {"symbol": "XYZ123", "title_mention": False,
+            "reason": "Some random news"}
+    assert _has_causal_link(item) is False
+
+
+def test_has_causal_link_empty_reason():
+    """Empty reason → no causal link (even with known symbol)."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {"symbol": "V", "title_mention": False, "reason": ""}
+    assert _has_causal_link(item) is False
+
+    item2 = {"symbol": "V", "title_mention": False, "reason": None}
+    assert _has_causal_link(item2) is False
+
+
+def test_visa_earnings_promotes_to_actionable():
+    """Real scenario: 'Visa reports earnings' → V gets causal strong → can promote."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {
+        "symbol": "V",
+        "title_mention": False,
+        "reason": "Visa reports record quarterly earnings, beats Wall Street estimates",
+        "effective_score": 0.65,
+        "signal_quality": "strong",
+        "investable": True,
+        "asset_type_status": "known_valid",
+    }
+    assert _has_causal_link(item) is True
+
+    # Simulate causal_link_strength computation
+    item["causal_link_strength"] = "strong" if _has_causal_link(item) else "weak"
+    assert item["causal_link_strength"] == "strong"
+
+    # Now it passes all 4 promotion gates
+    _PROMOTION_SCORE_THRESHOLD = 0.6
+    passes = (
+        item["signal_quality"] == "strong"
+        and item["causal_link_strength"] == "strong"
+        and item["effective_score"] >= _PROMOTION_SCORE_THRESHOLD
+        and item["investable"] is True
+    )
+    assert passes is True
+
+
+def test_mastercard_expands_promotes_to_actionable():
+    """Real scenario: 'Mastercard expands...' → MA gets causal strong."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {
+        "symbol": "MA",
+        "title_mention": False,
+        "reason": "Mastercard expands crypto capabilities with new partnership",
+        "effective_score": 0.6,
+        "signal_quality": "strong",
+        "investable": True,
+        "asset_type_status": "known_valid",
+    }
+    assert _has_causal_link(item) is True
+    item["causal_link_strength"] = "strong" if _has_causal_link(item) else "weak"
+    assert item["causal_link_strength"] == "strong"
+
+
+def test_generic_market_news_stays_weak():
+    """Generic market news → V stays causal weak (no Visa mention)."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {
+        "symbol": "V",
+        "title_mention": False,
+        "reason": "U.S. stocks lower at close of trade; Dow Jones Industrial Average down 0.97%",
+        "effective_score": 0.65,
+        "signal_quality": "strong",
+        "investable": True,
+    }
+    assert _has_causal_link(item) is False
+    item["causal_link_strength"] = "strong" if _has_causal_link(item) else "weak"
+    assert item["causal_link_strength"] == "weak"
+
+
+def test_suncor_news_stays_weak_for_ma():
+    """Suncor news → MA stays causal weak (no Mastercard mention)."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {
+        "symbol": "MA",
+        "title_mention": False,
+        "reason": "Suncor's global head of market and trade risk management to depart, sources say",
+    }
+    assert _has_causal_link(item) is False
+
+
+def test_company_name_in_decision_summary():
+    """Company name match flows through to decision_summary correctly."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        observed_candidates=[
+            # V: company name "Visa" in reason → should be causal strong
+            {"symbol": "V", "effective_score": 0.65, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "reason": "Visa reports record quarterly earnings",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "strong"},
+            # MA: no match → causal weak
+            {"symbol": "MA", "effective_score": 0.55, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "reason": "U.S. stocks fall amid trade fears",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "weak"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top_obs = summary["candidates"]["top_observed"]
+
+    # V (causal strong) ranks above MA (causal weak)
+    assert top_obs[0]["symbol"] == "V"
+    assert top_obs[0]["causal_link_strength"] == "strong"
+    assert top_obs[1]["symbol"] == "MA"
+    assert top_obs[1]["causal_link_strength"] == "weak"
+
+
+def test_no_regression_title_mention_still_works():
+    """title_mention=True still produces causal strong (backward compat)."""
+    from app.services.orchestrator import _has_causal_link
+
+    item = {"symbol": "MELI", "title_mention": True, "reason": ""}
+    assert _has_causal_link(item) is True
+
+
+def test_no_regression_signal_quality_unchanged():
+    """signal_quality is not affected by company name matching changes."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        observed_candidates=[
+            {"symbol": "V", "effective_score": 0.6,
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "observed_origin": "signal"},
+            {"symbol": "GPU", "effective_score": 0.5,
+             "signal_quality": "weak", "causal_link_strength": "weak",
+             "observed_origin": "signal"},
+            {"symbol": "AAPL", "effective_score": None,
+             "signal_quality": None, "causal_link_strength": None,
+             "observed_origin": "catalog"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["observed_with_signal_count"] == 1   # V
+    assert cands["observed_weak_signal_count"] == 1    # GPU
+    assert cands["observed_catalog_count"] == 1         # AAPL
+
+
+def test_argentine_company_names():
+    """Argentine company names in SYMBOL_COMPANY_NAMES match correctly."""
+    from app.services.orchestrator import _has_causal_link
+
+    # YPF
+    assert _has_causal_link({"symbol": "YPF", "title_mention": False,
+                             "reason": "YPF anuncia aumento de producción"}) is True
+    # GGAL
+    assert _has_causal_link({"symbol": "GGAL", "title_mention": False,
+                             "reason": "Banco Galicia reporta ganancias récord"}) is True
+    # PAMP
+    assert _has_causal_link({"symbol": "PAMP", "title_mention": False,
+                             "reason": "Pampa Energía expande capacidad eólica"}) is True
