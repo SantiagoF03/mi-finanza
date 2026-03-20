@@ -3063,3 +3063,170 @@ def test_no_regression_external_opportunities_planner():
     ext_symbols = {c["symbol"] for c in rec.get("external_opportunities", [])}
 
     assert "TSLA" in ext_symbols
+
+
+# ===========================================================================
+# Sprint 18: Fine semantic alignment — top_observed, investable visibility
+# ===========================================================================
+
+
+def test_top_observed_prefers_known_valid_over_unknown():
+    """top_observed must rank known_valid items above unknown items."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener", "actions": [], "rationale_reasons": [],
+        "rationale": "Estable",
+        "external_opportunities": [],
+        "observed_candidates": [
+            # Unknown type with high score (like FCC)
+            {"symbol": "FCC", "effective_score": 0.65, "signal_class": "observed_candidate",
+             "market_confirmation": "unconfirmed", "reason": "FCC regulation news",
+             "asset_type_status": "unknown", "priority_score": 0.4},
+            # Known valid with lower score (real discovery)
+            {"symbol": "MELI", "effective_score": 0.50, "signal_class": "observed_candidate",
+             "market_confirmation": "confirmed", "reason": "MELI expansion news",
+             "asset_type_status": "known_valid", "priority_score": 0.35},
+            # Another known valid
+            {"symbol": "GLOB", "effective_score": 0.45, "signal_class": "observed_candidate",
+             "market_confirmation": "unconfirmed", "reason": "GLOB quarterly results",
+             "asset_type_status": "known_valid", "priority_score": 0.30},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(
+        rec=rec, scored_news=[], scoring_summary={},
+        llm_input_meta={}, fresh_quote_meta={},
+        unchanged=False, unchanged_reason="",
+    )
+
+    top = summary["candidates"]["top_observed"]
+    # Known valid items must rank before unknown, regardless of score
+    assert top[0]["symbol"] == "MELI"
+    assert top[1]["symbol"] == "GLOB"
+    assert top[2]["symbol"] == "FCC"
+
+
+def test_top_actionable_prefers_investable():
+    """top_actionable must rank investable items above non-investable."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener", "actions": [], "rationale_reasons": [],
+        "rationale": "Estable",
+        "external_opportunities": [
+            # Actionable but NOT investable (like BP — not in whitelist)
+            {"symbol": "BP", "effective_score": 0.70, "signal_class": "external_opportunity",
+             "market_confirmation": "confirmed", "reason": "BP earnings beat",
+             "source_types": ["news", "catalog"], "investable": False,
+             "asset_type_status": "known_valid", "priority_score": 0.8},
+            # Actionable AND investable (in whitelist)
+            {"symbol": "TSLA", "effective_score": 0.60, "signal_class": "external_opportunity",
+             "market_confirmation": "confirmed", "reason": "TSLA news",
+             "source_types": ["news", "catalog"], "investable": True,
+             "asset_type_status": "known_valid", "priority_score": 0.75},
+        ],
+        "observed_candidates": [],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(
+        rec=rec, scored_news=[], scoring_summary={},
+        llm_input_meta={}, fresh_quote_meta={},
+        unchanged=False, unchanged_reason="",
+    )
+
+    top = summary["candidates"]["top_actionable"]
+    # Investable must rank first even with lower score
+    assert top[0]["symbol"] == "TSLA"
+    assert top[0]["investable"] is True
+    assert top[1]["symbol"] == "BP"
+    assert top[1]["investable"] is False
+
+
+def test_decision_summary_has_investable_count():
+    """decision_summary.candidates must include investable_count."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener", "actions": [], "rationale_reasons": [],
+        "rationale": "Estable",
+        "external_opportunities": [
+            {"symbol": "TSLA", "investable": True, "effective_score": 0.7},
+            {"symbol": "BP", "investable": False, "effective_score": 0.6},
+            {"symbol": "MELI", "investable": True, "effective_score": 0.5},
+        ],
+        "observed_candidates": [],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(
+        rec=rec, scored_news=[], scoring_summary={},
+        llm_input_meta={}, fresh_quote_meta={},
+        unchanged=False, unchanged_reason="",
+    )
+
+    assert summary["candidates"]["actionable_count"] == 3
+    assert summary["candidates"]["investable_count"] == 2
+
+
+def test_top_n_includes_investable_and_asset_type_status():
+    """_top_n output must include investable and asset_type_status fields."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener", "actions": [], "rationale_reasons": [],
+        "rationale": "Estable",
+        "external_opportunities": [
+            {"symbol": "TSLA", "investable": True, "asset_type_status": "known_valid",
+             "effective_score": 0.7, "signal_class": "external_opportunity",
+             "market_confirmation": "confirmed", "reason": "Tesla news",
+             "source_types": ["news"]},
+        ],
+        "observed_candidates": [],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(
+        rec=rec, scored_news=[], scoring_summary={},
+        llm_input_meta={}, fresh_quote_meta={},
+        unchanged=False, unchanged_reason="",
+    )
+
+    top = summary["candidates"]["top_actionable"][0]
+    assert "investable" in top
+    assert "asset_type_status" in top
+    assert top["investable"] is True
+    assert top["asset_type_status"] == "known_valid"
+
+
+def test_counts_not_broken_by_sort_changes():
+    """Sorting top_actionable/top_observed must not affect counts."""
+    from app.core.config import get_settings
+    from app.services.orchestrator import run_cycle
+
+    db = make_db()
+    settings = get_settings()
+    original_cooldown = settings.trigger_cooldown_seconds
+    settings.trigger_cooldown_seconds = 0
+
+    try:
+        result = run_cycle(db, source="test")
+    finally:
+        settings.trigger_cooldown_seconds = original_cooldown
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == result["recommendation_id"]).first()
+    meta = rec.metadata_json or {}
+
+    ds = meta.get("decision_summary", {})
+    ext_ops = meta.get("external_opportunities", [])
+    obs_cands = meta.get("observed_candidates", [])
+
+    if ds:
+        assert ds["candidates"]["actionable_count"] == len(ext_ops)
+        assert ds["candidates"]["observed_count"] == len(obs_cands)
+        assert "investable_count" in ds["candidates"]
+        investable_actual = sum(1 for c in ext_ops if c.get("investable"))
+        assert ds["candidates"]["investable_count"] == investable_actual

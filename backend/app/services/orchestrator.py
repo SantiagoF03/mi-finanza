@@ -326,16 +326,34 @@ def _build_decision_summary(
         return [
             {"symbol": i.get("symbol"), "effective_score": i.get("effective_score"),
              "signal_class": i.get("signal_class"), "market_confirmation": i.get("market_confirmation"),
-             "reason": i.get("reason"), "source_types": i.get("source_types")}
+             "reason": i.get("reason"), "source_types": i.get("source_types"),
+             "investable": i.get("investable"), "asset_type_status": i.get("asset_type_status")}
             for i in source[:n]
         ]
 
+    # Sort keys for quality ranking:
+    # top_actionable: investable first, then by effective_score
+    # top_observed: known_valid first, then by effective_score/priority_score
+    _actionable_key = lambda x: (
+        1 if x.get("investable") else 0,
+        x.get("effective_score") or 0,
+        x.get("priority_score") or 0,
+    )
+    _observed_key = lambda x: (
+        1 if x.get("asset_type_status") == "known_valid" else 0,
+        x.get("effective_score") or 0,
+        x.get("priority_score") or 0,
+    )
+
+    investable_items = [i for i in ext_ops if i.get("investable")]
+
     candidates = {
         "actionable_count": len(ext_ops),
+        "investable_count": len(investable_items),
         "observed_count": len(obs_cands),
         "suppressed_count": len(sup_cands),
-        "top_actionable": _top_n(ext_ops),
-        "top_observed": _top_n(obs_cands, sort_key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0)),
+        "top_actionable": _top_n(ext_ops, sort_key=_actionable_key),
+        "top_observed": _top_n(obs_cands, sort_key=_observed_key),
         "top_suppressed": _top_n(sup_cands),
     }
 
