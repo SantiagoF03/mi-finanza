@@ -329,7 +329,8 @@ def _build_decision_summary(
              "reason": i.get("reason"), "source_types": i.get("source_types"),
              "investable": i.get("investable"), "asset_type_status": i.get("asset_type_status"),
              "title_mention": i.get("title_mention"),
-             "observed_origin": i.get("observed_origin")}
+             "observed_origin": i.get("observed_origin"),
+             "signal_quality": i.get("signal_quality")}
             for i in source[:n]
         ]
 
@@ -342,7 +343,7 @@ def _build_decision_summary(
         x.get("priority_score") or 0,
     )
     _observed_key = lambda x: (
-        1 if x.get("observed_origin") == "signal" else 0,
+        2 if x.get("signal_quality") == "strong" else (1 if x.get("signal_quality") == "weak" else 0),
         1 if x.get("title_mention") else 0,
         1 if x.get("asset_type_status") == "known_valid" else 0,
         x.get("effective_score") or 0,
@@ -351,20 +352,22 @@ def _build_decision_summary(
 
     investable_items = [i for i in ext_ops if i.get("investable")]
 
-    # Split observed by origin for explainability
-    obs_signals = [i for i in obs_cands if i.get("observed_origin") == "signal"]
-    obs_catalog = [i for i in obs_cands if i.get("observed_origin") != "signal"]
+    # Split observed by signal_quality for explainability
+    obs_strong = [i for i in obs_cands if i.get("signal_quality") == "strong"]
+    obs_weak = [i for i in obs_cands if i.get("signal_quality") == "weak"]
+    obs_catalog = [i for i in obs_cands if i.get("signal_quality") is None]
 
     candidates = {
         "actionable_count": len(ext_ops),
         "investable_count": len(investable_items),
         "observed_count": len(obs_cands),
-        "observed_with_signal_count": len(obs_signals),
+        "observed_with_signal_count": len(obs_strong),
+        "observed_weak_signal_count": len(obs_weak),
         "observed_catalog_count": len(obs_catalog),
         "suppressed_count": len(sup_cands),
         "top_actionable": _top_n(ext_ops, sort_key=_actionable_key),
         "top_observed": _top_n(obs_cands, sort_key=_observed_key),
-        "top_observed_signals": _top_n(obs_signals, sort_key=_observed_key),
+        "top_observed_signals": _top_n(obs_strong, sort_key=_observed_key),
         "top_observed_catalog": _top_n(obs_catalog, sort_key=_observed_key),
         "top_suppressed": _top_n(sup_cands),
     }
@@ -626,6 +629,17 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     for item in merged_observed:
         has_signal = item.get("effective_score") is not None or item.get("signal_class") is not None
         item["observed_origin"] = "signal" if has_signal else "catalog"
+        # signal_quality: "strong" if the symbol is a known financial instrument,
+        # "weak" if it has a signal but is unrecognized (GPU, AWS, etc.)
+        if has_signal:
+            is_known = (
+                item.get("asset_type_status") == "known_valid"
+                or item.get("in_main_allowed") is True
+                or item.get("tracking_status") not in (None, "untracked")
+            )
+            item["signal_quality"] = "strong" if is_known else "weak"
+        else:
+            item["signal_quality"] = None
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
     rec["observed_candidates"] = merged_observed
 

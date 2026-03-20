@@ -4006,22 +4006,22 @@ def test_observed_origin_signal_vs_catalog():
         "rationale_reasons": [],
         "external_opportunities": [],
         "observed_candidates": [
-            # Signal-based: has effective_score and signal_class
+            # Signal-based + known_valid → strong
             {"symbol": "MA", "effective_score": 0.6, "signal_class": "external_opportunity",
              "title_mention": False, "asset_type_status": "known_valid",
-             "observed_origin": "signal"},
+             "observed_origin": "signal", "signal_quality": "strong"},
             {"symbol": "V", "effective_score": 0.55, "signal_class": "external_opportunity",
              "title_mention": False, "asset_type_status": "known_valid",
-             "observed_origin": "signal"},
+             "observed_origin": "signal", "signal_quality": "strong"},
             # Catalog-only: no signal data
             {"symbol": "AAPL", "effective_score": None, "signal_class": None,
              "title_mention": None, "asset_type_status": "known_valid",
              "source_types": ["catalog", "universe"], "priority_score": 0.35,
-             "observed_origin": "catalog"},
+             "observed_origin": "catalog", "signal_quality": None},
             {"symbol": "AMZN", "effective_score": None, "signal_class": None,
              "title_mention": None, "asset_type_status": "known_valid",
              "source_types": ["catalog"], "priority_score": 0.3,
-             "observed_origin": "catalog"},
+             "observed_origin": "catalog", "signal_quality": None},
         ],
         "suppressed_candidates": [],
     }
@@ -4032,20 +4032,21 @@ def test_observed_origin_signal_vs_catalog():
     # Total observed_count still correct
     assert cands["observed_count"] == 4
 
-    # New split counts
+    # Split counts
     assert cands["observed_with_signal_count"] == 2
     assert cands["observed_catalog_count"] == 2
 
-    # top_observed: signal items rank first (observed_origin="signal" boosts)
+    # top_observed: strong signal items rank first
     top_obs = cands["top_observed"]
     assert top_obs[0]["symbol"] in ("MA", "V")
     assert top_obs[0]["observed_origin"] == "signal"
+    assert top_obs[0]["signal_quality"] == "strong"
 
-    # top_observed_signals: only signal items
+    # top_observed_signals: only strong signal items
     top_sig = cands["top_observed_signals"]
     assert len(top_sig) == 2
     for item in top_sig:
-        assert item["observed_origin"] == "signal"
+        assert item["signal_quality"] == "strong"
 
     # top_observed_catalog: only catalog items
     top_cat = cands["top_observed_catalog"]
@@ -4073,11 +4074,11 @@ def test_top_observed_prioritizes_signal_over_catalog():
             {"symbol": "MSFT", "effective_score": None, "signal_class": None,
              "title_mention": None, "asset_type_status": "known_valid",
              "source_types": ["catalog", "watchlist"], "priority_score": 0.55,
-             "observed_origin": "catalog"},
-            # Signal-based with moderate score
+             "observed_origin": "catalog", "signal_quality": None},
+            # Signal-based with moderate score + known_valid → strong
             {"symbol": "MA", "effective_score": 0.45, "signal_class": "external_opportunity",
              "title_mention": False, "asset_type_status": "known_valid",
-             "observed_origin": "signal"},
+             "observed_origin": "signal", "signal_quality": "strong"},
         ],
         "suppressed_candidates": [],
     }
@@ -4085,15 +4086,15 @@ def test_top_observed_prioritizes_signal_over_catalog():
     summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
     top_obs = summary["candidates"]["top_observed"]
 
-    # MA (signal) must rank before MSFT (catalog) despite MSFT having higher priority_score
+    # MA (strong signal) must rank before MSFT (catalog) despite MSFT having higher priority_score
     assert top_obs[0]["symbol"] == "MA"
-    assert top_obs[0]["observed_origin"] == "signal"
+    assert top_obs[0]["signal_quality"] == "strong"
     assert top_obs[1]["symbol"] == "MSFT"
     assert top_obs[1]["observed_origin"] == "catalog"
 
 
 def test_counts_not_broken_by_observed_origin():
-    """observed_count = observed_with_signal_count + observed_catalog_count always."""
+    """observed_count = strong + weak + catalog always."""
     from app.services.orchestrator import _build_decision_summary
 
     rec = {
@@ -4112,11 +4113,12 @@ def test_counts_not_broken_by_observed_origin():
         ],
         "observed_candidates": [
             {"symbol": "MA", "effective_score": 0.5, "signal_class": "external_opportunity",
-             "observed_origin": "signal"},
+             "observed_origin": "signal", "signal_quality": "strong",
+             "asset_type_status": "known_valid"},
             {"symbol": "AAPL", "effective_score": None, "signal_class": None,
-             "observed_origin": "catalog"},
+             "observed_origin": "catalog", "signal_quality": None},
             {"symbol": "AMZN", "effective_score": None, "signal_class": None,
-             "observed_origin": "catalog"},
+             "observed_origin": "catalog", "signal_quality": None},
         ],
         "suppressed_candidates": [],
     }
@@ -4126,7 +4128,8 @@ def test_counts_not_broken_by_observed_origin():
 
     assert cands["actionable_count"] == 1
     assert cands["observed_count"] == 3
-    assert cands["observed_with_signal_count"] + cands["observed_catalog_count"] == cands["observed_count"]
+    total = cands["observed_with_signal_count"] + cands["observed_weak_signal_count"] + cands["observed_catalog_count"]
+    assert total == cands["observed_count"]
     assert cands["observed_with_signal_count"] == 1
     assert cands["observed_catalog_count"] == 2
 
@@ -4151,7 +4154,8 @@ def test_external_opportunities_not_affected_by_observed_origin():
         "rationale_reasons": [],
         "external_opportunities": ext_ops,
         "observed_candidates": [
-            {"symbol": "MA", "effective_score": 0.5, "observed_origin": "signal"},
+            {"symbol": "MA", "effective_score": 0.5, "observed_origin": "signal",
+             "signal_quality": "strong"},
         ],
         "suppressed_candidates": [],
     }
@@ -4210,7 +4214,7 @@ def test_planner_no_regression_with_observed_origin():
 
 
 def test_unchanged_not_affected_by_observed_origin():
-    """detect_unchanged still works with observed_origin present."""
+    """detect_unchanged still works with observed_origin and signal_quality present."""
     from app.recommendations.unchanged import detect_unchanged
 
     rec = {
@@ -4223,8 +4227,10 @@ def test_unchanged_not_affected_by_observed_origin():
         "actions": [],
         "external_opportunities": [],
         "observed_candidates": [
-            {"symbol": "MA", "effective_score": 0.5, "observed_origin": "signal"},
-            {"symbol": "AAPL", "effective_score": None, "observed_origin": "catalog"},
+            {"symbol": "MA", "effective_score": 0.5, "observed_origin": "signal",
+             "signal_quality": "strong"},
+            {"symbol": "AAPL", "effective_score": None, "observed_origin": "catalog",
+             "signal_quality": None},
         ],
         "_news_items": [],
     }
@@ -4237,7 +4243,7 @@ def test_unchanged_not_affected_by_observed_origin():
 
 
 def test_observed_origin_in_top_n_output():
-    """observed_origin field appears in _top_n output items."""
+    """observed_origin and signal_quality fields appear in _top_n output items."""
     from app.services.orchestrator import _build_decision_summary
 
     rec = {
@@ -4252,7 +4258,7 @@ def test_observed_origin_in_top_n_output():
         "external_opportunities": [],
         "observed_candidates": [
             {"symbol": "MA", "effective_score": 0.5, "signal_class": "external_opportunity",
-             "observed_origin": "signal"},
+             "observed_origin": "signal", "signal_quality": "strong"},
         ],
         "suppressed_candidates": [],
     }
@@ -4261,3 +4267,468 @@ def test_observed_origin_in_top_n_output():
     top_obs = summary["candidates"]["top_observed"]
     assert len(top_obs) == 1
     assert top_obs[0]["observed_origin"] == "signal"
+    assert top_obs[0]["signal_quality"] == "strong"
+
+
+# ---------------------------------------------------------------------------
+# Sprint 24: signal_quality — strong vs weak observed signals
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_aws_like_weak_symbols_get_signal_quality_weak():
+    """Symbols like GPU/AWS with signal but unknown asset type get signal_quality=weak."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # GPU: has signal but unknown asset type, untracked → weak
+            {"symbol": "GPU", "effective_score": 0.6, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "unknown",
+             "investable": False, "tracking_status": "untracked",
+             "in_main_allowed": False,
+             "observed_origin": "signal", "signal_quality": "weak"},
+            # AWS: same pattern → weak
+            {"symbol": "AWS", "effective_score": 0.55, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "unknown",
+             "investable": False, "tracking_status": "untracked",
+             "in_main_allowed": False,
+             "observed_origin": "signal", "signal_quality": "weak"},
+            # MA: known_valid → strong
+            {"symbol": "MA", "effective_score": 0.5, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "investable": True, "tracking_status": "catalog",
+             "in_main_allowed": True,
+             "observed_origin": "signal", "signal_quality": "strong"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    # GPU and AWS are weak, MA is strong
+    assert cands["observed_with_signal_count"] == 1  # only MA
+    assert cands["observed_weak_signal_count"] == 2  # GPU + AWS
+
+    # top_observed: strong ranks first despite lower effective_score
+    top_obs = cands["top_observed"]
+    assert top_obs[0]["symbol"] == "MA"
+    assert top_obs[0]["signal_quality"] == "strong"
+
+    # top_observed_signals: only strong (MA), NOT GPU/AWS
+    top_sig = cands["top_observed_signals"]
+    assert len(top_sig) == 1
+    assert top_sig[0]["symbol"] == "MA"
+
+    # GPU and AWS excluded from top_observed_signals
+    sig_symbols = {i["symbol"] for i in top_sig}
+    assert "GPU" not in sig_symbols
+    assert "AWS" not in sig_symbols
+
+
+def test_known_valid_but_weak_causal_still_strong():
+    """A known_valid symbol with title_mention=False still gets signal_quality=strong."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # MA: known_valid but title_mention=False → still strong (known instrument)
+            {"symbol": "MA", "effective_score": 0.5, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "investable": True, "tracking_status": "catalog",
+             "observed_origin": "signal", "signal_quality": "strong"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+    assert cands["observed_with_signal_count"] == 1
+    assert cands["top_observed_signals"][0]["symbol"] == "MA"
+    assert cands["top_observed_signals"][0]["signal_quality"] == "strong"
+
+
+def test_title_mention_true_not_sufficient_for_strong():
+    """title_mention=True alone does not make a signal strong if asset is unknown."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # GPU: title_mention=True but unknown → still weak
+            {"symbol": "GPU", "effective_score": 0.65, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "unknown",
+             "investable": False, "tracking_status": "untracked",
+             "in_main_allowed": False,
+             "observed_origin": "signal", "signal_quality": "weak"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+    assert cands["observed_with_signal_count"] == 0  # GPU is weak, not strong
+    assert cands["observed_weak_signal_count"] == 1
+    assert len(cands["top_observed_signals"]) == 0
+
+
+def test_tracked_symbol_with_signal_is_strong():
+    """A tracked symbol (e.g. watchlist/catalog) with signal is strong even if not known_valid."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # TSLA: unknown asset_type but tracked in watchlist → strong
+            {"symbol": "TSLA", "effective_score": 0.5, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "unknown",
+             "investable": False, "tracking_status": "watchlist",
+             "in_main_allowed": False,
+             "observed_origin": "signal", "signal_quality": "strong"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+    assert cands["observed_with_signal_count"] == 1
+    assert cands["top_observed_signals"][0]["symbol"] == "TSLA"
+    assert cands["top_observed_signals"][0]["signal_quality"] == "strong"
+
+
+def test_strong_ranks_above_weak_in_top_observed():
+    """Strong signal items rank above weak signal items even with lower effective_score."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # GPU: weak with high score
+            {"symbol": "GPU", "effective_score": 0.8, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "unknown",
+             "tracking_status": "untracked", "in_main_allowed": False,
+             "observed_origin": "signal", "signal_quality": "weak"},
+            # V: strong with lower score
+            {"symbol": "V", "effective_score": 0.4, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "tracking_status": "catalog", "in_main_allowed": True,
+             "observed_origin": "signal", "signal_quality": "strong"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top_obs = summary["candidates"]["top_observed"]
+
+    # V (strong, score=0.4) ranks above GPU (weak, score=0.8)
+    assert top_obs[0]["symbol"] == "V"
+    assert top_obs[0]["signal_quality"] == "strong"
+    assert top_obs[1]["symbol"] == "GPU"
+    assert top_obs[1]["signal_quality"] == "weak"
+
+
+def test_weak_still_ranks_above_catalog():
+    """Weak signal items rank above catalog items in top_observed."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # AAPL: catalog, no signal
+            {"symbol": "AAPL", "effective_score": None, "signal_class": None,
+             "priority_score": 0.6, "asset_type_status": "known_valid",
+             "observed_origin": "catalog", "signal_quality": None},
+            # GPU: weak signal
+            {"symbol": "GPU", "effective_score": 0.5, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "unknown",
+             "tracking_status": "untracked", "in_main_allowed": False,
+             "observed_origin": "signal", "signal_quality": "weak"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top_obs = summary["candidates"]["top_observed"]
+
+    # GPU (weak) ranks above AAPL (catalog) — signal still has informational value
+    assert top_obs[0]["symbol"] == "GPU"
+    assert top_obs[0]["signal_quality"] == "weak"
+    assert top_obs[1]["symbol"] == "AAPL"
+    assert top_obs[1]["signal_quality"] is None
+
+
+def test_counts_sum_correctly_with_three_tiers():
+    """observed_count = strong + weak + catalog always."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            {"symbol": "MA", "effective_score": 0.5, "signal_quality": "strong",
+             "observed_origin": "signal"},
+            {"symbol": "GPU", "effective_score": 0.6, "signal_quality": "weak",
+             "observed_origin": "signal"},
+            {"symbol": "AWS", "effective_score": 0.55, "signal_quality": "weak",
+             "observed_origin": "signal"},
+            {"symbol": "AAPL", "effective_score": None, "signal_quality": None,
+             "observed_origin": "catalog"},
+            {"symbol": "AMZN", "effective_score": None, "signal_quality": None,
+             "observed_origin": "catalog"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["observed_count"] == 5
+    assert cands["observed_with_signal_count"] == 1   # strong only
+    assert cands["observed_weak_signal_count"] == 2   # weak
+    assert cands["observed_catalog_count"] == 2        # catalog
+    total = cands["observed_with_signal_count"] + cands["observed_weak_signal_count"] + cands["observed_catalog_count"]
+    assert total == cands["observed_count"]
+
+
+def test_signal_quality_computed_in_orchestrator_merge():
+    """signal_quality is correctly computed from metadata during orchestrator merge."""
+    from app.recommendations.engine import generate_recommendation
+    from app.market.candidates import generate_external_candidates
+
+    # News with GPU (not a real ticker) and MELI (real ticker) in title
+    news = [
+        {
+            "title": "Nvidia GPU demand surges, MELI benefits from LatAm growth",
+            "summary": "AWS cloud services also see increased demand",
+            "related_assets": ["GPU", "MELI", "AWS"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "confidence": 0.8,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    # GPU and MELI should be in external_opportunities (title_mention=True)
+    ext = rec["external_opportunities"]
+    ext_symbols = {c["symbol"] for c in ext}
+    assert "GPU" in ext_symbols
+    assert "MELI" in ext_symbols
+
+    # Now run candidates like orchestrator does
+    allowed = {
+        "holdings": {"AAPL", "SPY"},
+        "whitelist": {"AAPL", "SPY", "MELI"},
+        "watchlist": set(),
+        "universe": set(),
+        "main_allowed": {"AAPL", "SPY", "MELI"},
+        "catalog_dynamic": set(),
+    }
+    positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"},
+                 {"symbol": "SPY", "asset_type": "ETF"}]
+
+    all_candidates = generate_external_candidates(
+        news_opportunities=ext, allowed_assets=allowed, positions=positions,
+    )
+
+    # Simulate orchestrator split
+    new_ext = [c for c in all_candidates if c.get("actionable_external") and c.get("investable")]
+    observed_from_cands = [c for c in all_candidates if not (c.get("actionable_external") and c.get("investable"))]
+
+    _ENRICH_KEYS = (
+        "asset_type_status", "asset_type", "source_types", "investable",
+        "actionable_external", "priority_score", "tracking_status",
+        "actionable_reason", "in_main_allowed", "asset_type_source",
+        "title_mention",
+    )
+    raw_observed = rec.get("observed_candidates", []) + observed_from_cands
+    seen_observed = {}
+    for item in raw_observed:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        if sym not in seen_observed:
+            seen_observed[sym] = item
+        else:
+            existing = seen_observed[sym]
+            new_score = item.get("effective_score") or 0
+            old_score = existing.get("effective_score") or 0
+            if new_score > old_score:
+                winner, loser = item, existing
+                seen_observed[sym] = winner
+            else:
+                winner, loser = existing, item
+            for key in _ENRICH_KEYS:
+                if winner.get(key) is None and loser.get(key) is not None:
+                    winner[key] = loser[key]
+
+    merged = list(seen_observed.values())
+
+    # Now simulate signal_quality computation like orchestrator does
+    for item in merged:
+        has_signal = item.get("effective_score") is not None or item.get("signal_class") is not None
+        item["observed_origin"] = "signal" if has_signal else "catalog"
+        if has_signal:
+            is_known = (
+                item.get("asset_type_status") == "known_valid"
+                or item.get("in_main_allowed") is True
+                or item.get("tracking_status") not in (None, "untracked")
+            )
+            item["signal_quality"] = "strong" if is_known else "weak"
+        else:
+            item["signal_quality"] = None
+
+    # GPU should be weak (unknown asset type, untracked)
+    gpu_items = [i for i in merged if i["symbol"] == "GPU"]
+    if gpu_items:
+        assert gpu_items[0]["signal_quality"] == "weak"
+
+    # AWS should be weak (same reasons)
+    aws_items = [i for i in merged if i["symbol"] == "AWS"]
+    if aws_items:
+        assert aws_items[0]["signal_quality"] == "weak"
+
+
+def test_planner_no_regression_with_signal_quality():
+    """Planner still works when external_opportunities carry signal_quality."""
+    from unittest.mock import MagicMock, patch
+    from app.services.planner import generate_reallocation_plan
+
+    snapshot = {
+        "total_value": 100_000, "cash": 20_000, "currency": "USD",
+        "positions": [{"symbol": "AAPL", "market_value": 80000}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.80}}
+    external_opportunities = [
+        {
+            "symbol": "MELI",
+            "asset_type": "CEDEAR",
+            "asset_type_status": "known_valid",
+            "priority_score": 0.7,
+            "source_types": ["news", "watchlist"],
+            "reason": "MELI reporta resultados récord",
+            "investable": True,
+            "actionable_external": True,
+            "title_mention": True,
+            "signal_quality": "strong",
+        },
+    ]
+    allowed_assets = {"main_allowed": {"AAPL", "MELI"}, "holdings": {"AAPL"}}
+
+    with patch("app.services.planner.get_settings") as mock_s:
+        s = MagicMock()
+        s.investor_profile_target = "moderate_aggressive"
+        s.investor_profile = "moderado"
+        s.max_movement_per_cycle = 0.10
+        mock_s.return_value = s
+
+        plan = generate_reallocation_plan(
+            snapshot=snapshot, analysis=analysis,
+            external_opportunities=external_opportunities,
+            allowed_assets=allowed_assets,
+        )
+
+    assert plan["planner_status"] in ("success", "proposed")
+    buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
+    assert "MELI" in buy_symbols
+
+
+def test_external_opportunities_unaffected_by_signal_quality():
+    """signal_quality does not change external_opportunities bucket logic."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [
+            {"symbol": "MELI", "investable": True, "actionable_external": True,
+             "effective_score": 0.7, "asset_type_status": "known_valid",
+             "title_mention": True, "signal_quality": "strong"},
+        ],
+        "observed_candidates": [
+            {"symbol": "GPU", "effective_score": 0.6, "signal_quality": "weak",
+             "observed_origin": "signal"},
+            {"symbol": "MA", "effective_score": 0.5, "signal_quality": "strong",
+             "observed_origin": "signal"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 1
+    assert cands["top_actionable"][0]["symbol"] == "MELI"
+    # observed counts correct
+    assert cands["observed_with_signal_count"] == 1  # MA only
+    assert cands["observed_weak_signal_count"] == 1  # GPU only
