@@ -25,6 +25,32 @@ EVENT_TYPE_KEYWORDS = {
     "ia": ["ai", "ia", "artificial intelligence"],
 }
 
+# Keywords that indicate a news item is company-specific (not just macro/market-wide).
+# Used by classify_news_relevance() to prioritize items more likely to produce
+# causal_link_strength=strong matches.
+COMPANY_SPECIFIC_KEYWORDS = [
+    # English corporate events
+    "earnings", "revenue", "profit", "quarterly", "annual results",
+    "guidance", "forecast", "outlook", "estimates",
+    "beats", "misses", "exceeds", "tops", "falls short",
+    "dividend", "buyback", "repurchase", "share repurchase",
+    "acquisition", "merger", "acquires", "merges", "takeover", "deal",
+    "ipo", "listing", "public offering",
+    "upgrade", "downgrade", "price target", "rating",
+    "ceo", "cfo", "executive", "appoints", "resigns", "departs",
+    "lawsuit", "settlement", "sec", "investigation", "fine", "penalty",
+    "partnership", "contract", "wins contract", "awarded",
+    "recall", "fda", "approval", "patent",
+    "stock split", "spin-off", "spinoff",
+    # Spanish corporate events
+    "ganancias", "ingresos", "resultados", "beneficio",
+    "dividendo", "recompra",
+    "adquisición", "adquisicion", "fusión", "fusion",
+    "demanda judicial", "multa",
+    "nombramiento", "renuncia",
+    "acuerdo", "contrato",
+]
+
 
 class NewsProvider(ABC):
     @abstractmethod
@@ -121,15 +147,25 @@ class RssNewsProvider(NewsProvider):
                     continue
             filtered.append(item)
 
-        filtered.sort(key=lambda x: x.get("created_at") or now, reverse=True)
+        # Prioritize company_specific news above macro_generic before truncation.
+        # Within each group, sort by recency (newest first).
+        filtered.sort(
+            key=lambda x: (
+                0 if x.get("news_relevance") == "company_specific" else 1,
+                -(x.get("created_at") or now).timestamp(),
+            ),
+        )
         deduped = deduplicate_news_items(filtered)
 
+        company_count = sum(1 for d in deduped if d.get("news_relevance") == "company_specific")
         self.last_fetch_stats = {
             "feeds_attempted": len(self.urls),
             "feeds_ok": sum(1 for f in feed_stats if f["status"] == "ok"),
             "total_raw": len(items),
             "after_recency_filter": len(filtered),
             "after_dedup": len(deduped),
+            "company_specific_count": company_count,
+            "macro_generic_count": len(deduped) - company_count,
             "returned": min(len(deduped), self.max_items),
             "feed_details": feed_stats,
         }
@@ -147,6 +183,23 @@ def extract_market_symbols(text: str) -> list[str]:
         if c not in out:
             out.append(c)
     return out
+
+
+def classify_news_relevance(title: str, summary: str) -> str:
+    """Classify a news item as 'company_specific' or 'macro_generic'.
+
+    Uses simple keyword matching on the title (primary) and summary (secondary).
+    Company-specific news is more likely to produce causal matches with symbols.
+    """
+    title_lower = title.lower()
+    # Title match is the strongest signal
+    if any(kw in title_lower for kw in COMPANY_SPECIFIC_KEYWORDS):
+        return "company_specific"
+    # Check summary only for high-confidence corporate event keywords
+    summary_lower = summary.lower()
+    if any(kw in summary_lower for kw in COMPANY_SPECIFIC_KEYWORDS[:20]):  # top 20 most reliable
+        return "company_specific"
+    return "macro_generic"
 
 
 def classify_news_event(title: str, summary: str, portfolio_symbols: list[str]) -> dict:
@@ -172,6 +225,12 @@ def classify_news_event(title: str, summary: str, portfolio_symbols: list[str]) 
         confidence += 0.15
     if impact != "neutro":
         confidence += 0.1
+
+    # Boost confidence for company-specific news
+    news_relevance = classify_news_relevance(title, summary)
+    if news_relevance == "company_specific":
+        confidence += 0.05
+
     confidence = round(min(0.95, confidence), 2)
 
     raw_text = f"{title} {summary}"
@@ -187,6 +246,7 @@ def classify_news_event(title: str, summary: str, portfolio_symbols: list[str]) 
         "impact": impact,
         "confidence": confidence,
         "related_assets": related_assets,
+        "news_relevance": news_relevance,
     }
 
 
@@ -223,6 +283,7 @@ def parse_rss_items(xml_text: str, portfolio_symbols: list[str]) -> list[dict]:
                 "impact": classified["impact"],
                 "confidence": classified["confidence"],
                 "related_assets": classified["related_assets"],
+                "news_relevance": classified.get("news_relevance", "macro_generic"),
                 "summary": summary[:1000],
                 "url": link,
                 "source": "",  # will be set by ingestion from feed URL

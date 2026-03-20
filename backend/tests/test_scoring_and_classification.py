@@ -5875,3 +5875,262 @@ def test_argentine_company_names():
     # PAMP
     assert _has_causal_link({"symbol": "PAMP", "title_mention": False,
                              "reason": "Pampa Energía expande capacidad eólica"}) is True
+
+
+# ---------------------------------------------------------------------------
+# Sprint 28: news quality — relevance classification & feed prioritization
+# ---------------------------------------------------------------------------
+
+
+def test_classify_news_relevance_earnings():
+    """Title with 'earnings' → company_specific."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("Visa reports record quarterly earnings", "") == "company_specific"
+
+
+def test_classify_news_relevance_acquisition():
+    """Title with 'acquisition' → company_specific."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("Microsoft completes acquisition of gaming studio", "") == "company_specific"
+
+
+def test_classify_news_relevance_dividend():
+    """Title with 'dividend' → company_specific."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("Apple announces special dividend for shareholders", "") == "company_specific"
+
+
+def test_classify_news_relevance_upgrade():
+    """Title with 'upgrade' → company_specific."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("Goldman Sachs upgrades Tesla to buy", "") == "company_specific"
+
+
+def test_classify_news_relevance_ceo():
+    """Title with 'CEO' → company_specific."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("Nike CEO resigns amid restructuring", "") == "company_specific"
+
+
+def test_classify_news_relevance_macro():
+    """Generic market headline → macro_generic."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("U.S. stocks lower at close of trade; Dow Jones down 0.97%", "") == "macro_generic"
+
+
+def test_classify_news_relevance_market_wide():
+    """Market-wide headline with no company keyword → macro_generic."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("Wall Street ends mixed as investors weigh economic data", "") == "macro_generic"
+
+
+def test_classify_news_relevance_spanish_earnings():
+    """Spanish title with 'resultados' → company_specific."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("YPF presenta resultados del tercer trimestre", "") == "company_specific"
+
+
+def test_classify_news_relevance_summary_fallback():
+    """Generic title but earnings keyword in summary → company_specific."""
+    from app.news.pipeline import classify_news_relevance
+    assert classify_news_relevance("Markets react to latest data", "Visa earnings beat estimates") == "company_specific"
+
+
+def test_classify_news_event_includes_relevance():
+    """classify_news_event returns news_relevance field."""
+    from app.news.pipeline import classify_news_event
+    result = classify_news_event("Visa reports record earnings", "", [])
+    assert "news_relevance" in result
+    assert result["news_relevance"] == "company_specific"
+
+
+def test_classify_news_event_macro_relevance():
+    """classify_news_event returns macro_generic for market news."""
+    from app.news.pipeline import classify_news_event
+    result = classify_news_event("U.S. stocks fall amid trade uncertainty", "", [])
+    assert result["news_relevance"] == "macro_generic"
+
+
+def test_company_specific_gets_confidence_boost():
+    """Company-specific news gets +0.05 confidence boost."""
+    from app.news.pipeline import classify_news_event
+
+    cs = classify_news_event("Visa reports record earnings", "", [])
+    mg = classify_news_event("U.S. stocks fall amid uncertainty", "", [])
+
+    # Both have same event_type match (earnings → +0.15), but CS gets extra +0.05
+    # earnings CS: 0.55 + 0.15 (event_type) + 0.05 (company_specific) = 0.75
+    # macro: 0.55 base (no event_type match, no company_specific)
+    assert cs["confidence"] > mg["confidence"]
+
+
+def test_parse_rss_includes_news_relevance():
+    """parse_rss_items includes news_relevance in output."""
+    from app.news.pipeline import parse_rss_items
+
+    xml = """<?xml version="1.0"?>
+    <rss><channel>
+        <item>
+            <title>Tesla reports record quarterly revenue</title>
+            <description>Tesla beats estimates</description>
+            <pubDate>Thu, 20 Mar 2026 10:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title>Wall Street ends mixed on economic data</title>
+            <description>Indexes close flat</description>
+            <pubDate>Thu, 20 Mar 2026 09:00:00 GMT</pubDate>
+        </item>
+    </channel></rss>"""
+
+    items = parse_rss_items(xml, ["TSLA"])
+    assert len(items) == 2
+    # Tesla earnings → company_specific
+    assert items[0]["news_relevance"] == "company_specific"
+    # Generic market → macro_generic
+    assert items[1]["news_relevance"] == "macro_generic"
+
+
+def test_rss_provider_prioritizes_company_specific():
+    """RssNewsProvider sorts company_specific items before macro_generic."""
+    from unittest.mock import patch, MagicMock
+    from app.news.pipeline import RssNewsProvider
+
+    xml = """<?xml version="1.0"?>
+    <rss><channel>
+        <item>
+            <title>Wall Street ends mixed on economic data</title>
+            <description>Indexes close flat</description>
+            <pubDate>Thu, 20 Mar 2026 12:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title>Visa reports record quarterly earnings</title>
+            <description>Beats estimates</description>
+            <pubDate>Thu, 20 Mar 2026 10:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title>Markets close higher on trade hopes</title>
+            <description>S&amp;P 500 up</description>
+            <pubDate>Thu, 20 Mar 2026 11:00:00 GMT</pubDate>
+        </item>
+    </channel></rss>"""
+
+    provider = RssNewsProvider(urls=["http://test.com/rss"], timeout_seconds=5, max_items=10)
+
+    mock_response = MagicMock()
+    mock_response.text = xml
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("httpx.Client") as mock_client:
+        mock_instance = MagicMock()
+        mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+        mock_instance.__exit__ = MagicMock(return_value=False)
+        mock_instance.get = MagicMock(return_value=mock_response)
+        mock_client.return_value = mock_instance
+
+        items = provider.get_recent_news([])
+
+    # Visa earnings (company_specific) should be first despite being older
+    assert items[0]["news_relevance"] == "company_specific"
+    assert "visa" in items[0]["title"].lower() or "earnings" in items[0]["title"].lower()
+
+    # Stats should show company_specific count
+    stats = provider.last_fetch_stats
+    assert stats["company_specific_count"] >= 1
+
+
+def test_rss_provider_stats_include_relevance_counts():
+    """last_fetch_stats includes company_specific_count and macro_generic_count."""
+    from unittest.mock import patch, MagicMock
+    from app.news.pipeline import RssNewsProvider
+
+    xml = """<?xml version="1.0"?>
+    <rss><channel>
+        <item>
+            <title>Apple reports Q4 earnings</title>
+            <description>Strong results</description>
+            <pubDate>Thu, 20 Mar 2026 10:00:00 GMT</pubDate>
+        </item>
+        <item>
+            <title>Markets fall on global uncertainty</title>
+            <description>Broad selloff</description>
+            <pubDate>Thu, 20 Mar 2026 09:00:00 GMT</pubDate>
+        </item>
+    </channel></rss>"""
+
+    provider = RssNewsProvider(urls=["http://test.com/rss"], timeout_seconds=5, max_items=10)
+
+    mock_response = MagicMock()
+    mock_response.text = xml
+    mock_response.raise_for_status = MagicMock()
+
+    with patch("httpx.Client") as mock_client:
+        mock_instance = MagicMock()
+        mock_instance.__enter__ = MagicMock(return_value=mock_instance)
+        mock_instance.__exit__ = MagicMock(return_value=False)
+        mock_instance.get = MagicMock(return_value=mock_response)
+        mock_client.return_value = mock_instance
+
+        provider.get_recent_news([])
+
+    stats = provider.last_fetch_stats
+    assert "company_specific_count" in stats
+    assert "macro_generic_count" in stats
+    assert stats["company_specific_count"] + stats["macro_generic_count"] == stats["after_dedup"]
+
+
+def test_no_regression_mock_provider():
+    """MockNewsProvider still works correctly."""
+    from app.news.pipeline import MockNewsProvider
+    provider = MockNewsProvider()
+    items = provider.get_recent_news(["AAPL", "SPY"])
+    assert len(items) == 3
+    assert all("title" in i for i in items)
+    assert all("event_type" in i for i in items)
+
+
+def test_no_regression_classify_news_event():
+    """classify_news_event still returns all required fields."""
+    from app.news.pipeline import classify_news_event
+    result = classify_news_event("Test headline", "Test summary", ["AAPL"])
+    assert "event_type" in result
+    assert "impact" in result
+    assert "confidence" in result
+    assert "related_assets" in result
+    assert "news_relevance" in result
+
+
+def test_no_regression_deduplicate():
+    """deduplicate_news_items still works correctly."""
+    from app.news.pipeline import deduplicate_news_items
+    items = [
+        {"title": "News A", "summary": "Sum A", "url": "http://a.com"},
+        {"title": "News A", "summary": "Sum A", "url": "http://a.com"},
+        {"title": "News B", "summary": "Sum B", "url": "http://b.com"},
+    ]
+    result = deduplicate_news_items(items)
+    assert len(result) == 2
+
+
+def test_default_rss_urls_include_yahoo_finance():
+    """Default RSS URLs include Yahoo Finance company-specific feed."""
+    from app.core.config import Settings
+    settings = Settings()
+    urls = settings.news_rss_urls
+    assert any("yahoo" in u.lower() for u in urls)
+
+
+def test_default_rss_urls_include_multiple_feeds():
+    """Default RSS URLs have multiple feeds for resilience."""
+    from app.core.config import Settings
+    settings = Settings()
+    assert len(settings.news_rss_urls) >= 3
+
+
+def test_company_specific_keywords_cover_key_events():
+    """COMPANY_SPECIFIC_KEYWORDS covers key corporate event types."""
+    from app.news.pipeline import COMPANY_SPECIFIC_KEYWORDS
+
+    essential = ["earnings", "dividend", "acquisition", "merger", "ipo",
+                 "upgrade", "downgrade", "ceo", "lawsuit", "guidance"]
+    for kw in essential:
+        assert kw in COMPANY_SPECIFIC_KEYWORDS, f"Missing keyword: {kw}"
