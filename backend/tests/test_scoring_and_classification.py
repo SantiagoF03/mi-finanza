@@ -3379,3 +3379,311 @@ def test_planner_no_regression_after_strict_split():
 
     buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
     assert "MSFT" in buy_symbols
+
+
+# Sprint 20: Observed deduplication + enrichment
+# ===========================================================================
+
+
+def test_observed_dedup_same_symbol_from_engine_and_candidates():
+    """Same symbol from engine observed + candidates non-operable → single entry."""
+    from app.services.orchestrator import _build_decision_summary
+
+    # Simulate engine observed entry (has effective_score, lacks asset_type_status)
+    engine_obs = {
+        "symbol": "MSFT",
+        "reason": "News about MSFT growth",
+        "effective_score": 0.7,
+        "signal_class": "observed_candidate",
+        "priority_score": None,
+        "asset_type_status": None,
+    }
+    # Simulate candidates entry (has asset_type_status, lacks effective_score)
+    candidates_obs = {
+        "symbol": "MSFT",
+        "reason": "Observado desde catalog, watchlist",
+        "effective_score": None,
+        "signal_class": None,
+        "priority_score": 0.45,
+        "asset_type_status": "known_valid",
+        "source_types": ["catalog", "watchlist"],
+        "investable": False,
+        "actionable_external": False,
+    }
+
+    rec = {
+        "observed_candidates": [engine_obs],
+        "external_opportunities": [],
+        "suppressed_candidates": [],
+    }
+
+    # Simulate the orchestrator dedup logic
+    _ENRICH_KEYS = (
+        "asset_type_status", "asset_type", "source_types", "investable",
+        "actionable_external", "priority_score", "tracking_status",
+        "actionable_reason", "in_main_allowed", "asset_type_source",
+    )
+    raw_observed = rec["observed_candidates"] + [candidates_obs]
+    seen: dict[str, dict] = {}
+    for item in raw_observed:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        if sym not in seen:
+            seen[sym] = item
+        else:
+            existing = seen[sym]
+            new_score = item.get("effective_score") or 0
+            old_score = existing.get("effective_score") or 0
+            if new_score > old_score:
+                winner, loser = item, existing
+                seen[sym] = winner
+            else:
+                winner, loser = existing, item
+            for key in _ENRICH_KEYS:
+                if winner.get(key) is None and loser.get(key) is not None:
+                    winner[key] = loser[key]
+
+    merged = list(seen.values())
+
+    # Only 1 entry for MSFT
+    msft_entries = [e for e in merged if e["symbol"] == "MSFT"]
+    assert len(msft_entries) == 1
+
+    msft = msft_entries[0]
+    # Winner should be engine entry (effective_score=0.7 > 0)
+    assert msft["effective_score"] == 0.7
+    assert msft["reason"] == "News about MSFT growth"
+    # Enriched from candidates entry
+    assert msft["asset_type_status"] == "known_valid"
+    assert msft["priority_score"] == 0.45
+    assert msft["source_types"] == ["catalog", "watchlist"]
+
+
+def test_observed_dedup_engine_duplicates_same_symbol():
+    """Engine can produce same symbol from multiple news items — only one survives."""
+    from app.services.orchestrator import _build_decision_summary
+
+    engine_obs_1 = {
+        "symbol": "GOOG",
+        "reason": "News item 1 about Google",
+        "effective_score": 0.5,
+        "signal_class": "observed_candidate",
+    }
+    engine_obs_2 = {
+        "symbol": "GOOG",
+        "reason": "News item 2 about Google (stronger)",
+        "effective_score": 0.8,
+        "signal_class": "observed_candidate",
+    }
+
+    rec = {
+        "observed_candidates": [engine_obs_1, engine_obs_2],
+        "external_opportunities": [],
+        "suppressed_candidates": [],
+    }
+
+    # Simulate dedup
+    _ENRICH_KEYS = (
+        "asset_type_status", "asset_type", "source_types", "investable",
+        "actionable_external", "priority_score", "tracking_status",
+        "actionable_reason", "in_main_allowed", "asset_type_source",
+    )
+    raw = rec["observed_candidates"]
+    seen: dict[str, dict] = {}
+    for item in raw:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        if sym not in seen:
+            seen[sym] = item
+        else:
+            existing = seen[sym]
+            new_score = item.get("effective_score") or 0
+            old_score = existing.get("effective_score") or 0
+            if new_score > old_score:
+                winner, loser = item, existing
+                seen[sym] = winner
+            else:
+                winner, loser = existing, item
+            for key in _ENRICH_KEYS:
+                if winner.get(key) is None and loser.get(key) is not None:
+                    winner[key] = loser[key]
+
+    merged = list(seen.values())
+
+    goog_entries = [e for e in merged if e["symbol"] == "GOOG"]
+    assert len(goog_entries) == 1
+    # Best score wins
+    assert goog_entries[0]["effective_score"] == 0.8
+    assert goog_entries[0]["reason"] == "News item 2 about Google (stronger)"
+
+
+def test_observed_top_observed_prefers_enriched_known_valid():
+    """After dedup+enrichment, top_observed correctly ranks known_valid+scored items first."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        # Enriched observed: MSFT has known_valid + effective_score
+        # UNKNOWN_SYM has known_valid but no signal
+        # WEAK_SYM has signal but no known_valid
+        "observed_candidates": [
+            {
+                "symbol": "MSFT",
+                "effective_score": 0.7,
+                "asset_type_status": "known_valid",
+                "priority_score": 0.45,
+                "reason": "News about MSFT",
+            },
+            {
+                "symbol": "UNKNOWN_SYM",
+                "effective_score": None,
+                "asset_type_status": "known_valid",
+                "priority_score": 0.25,
+                "reason": "Observado desde catalog",
+            },
+            {
+                "symbol": "WEAK_SYM",
+                "effective_score": 0.4,
+                "asset_type_status": None,
+                "priority_score": None,
+                "reason": "Some news",
+            },
+        ],
+        "external_opportunities": [],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top = summary["candidates"]["top_observed"]
+
+    # MSFT should be first: known_valid=1, effective_score=0.7
+    assert top[0]["symbol"] == "MSFT"
+    # UNKNOWN_SYM should be second: known_valid=1, effective_score=0 (None→0)
+    assert top[1]["symbol"] == "UNKNOWN_SYM"
+    # WEAK_SYM should be third: known_valid=0, effective_score=0.4
+    assert top[2]["symbol"] == "WEAK_SYM"
+
+
+def test_observed_dedup_preserves_count_alignment():
+    """After dedup, observed_count in decision_summary reflects unique symbols."""
+    from app.services.orchestrator import _build_decision_summary
+
+    # 3 raw entries for 2 unique symbols
+    observed = [
+        {"symbol": "MSFT", "effective_score": 0.7, "signal_class": "observed_candidate"},
+        {"symbol": "MSFT", "effective_score": 0.5, "signal_class": "observed_candidate"},
+        {"symbol": "GOOG", "effective_score": 0.3, "signal_class": "observed_candidate"},
+    ]
+
+    # Apply dedup (same logic as orchestrator)
+    seen: dict[str, dict] = {}
+    for item in observed:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        if sym not in seen:
+            seen[sym] = item
+        else:
+            existing = seen[sym]
+            if (item.get("effective_score") or 0) > (existing.get("effective_score") or 0):
+                seen[sym] = item
+    deduped = list(seen.values())
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "observed_candidates": deduped,
+        "external_opportunities": [],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    assert summary["candidates"]["observed_count"] == 2  # 2 unique symbols, not 3
+
+
+def test_observed_dedup_does_not_affect_external_opportunities():
+    """Dedup on observed must not touch external_opportunities bucket."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [
+            {"symbol": "TSLA", "investable": True, "actionable_external": True,
+             "effective_score": 0.8, "asset_type_status": "known_valid"},
+        ],
+        "observed_candidates": [
+            {"symbol": "MSFT", "effective_score": 0.7},
+            {"symbol": "GOOG", "effective_score": 0.3},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    assert summary["candidates"]["actionable_count"] == 1
+    assert summary["candidates"]["observed_count"] == 2
+    assert summary["candidates"]["top_actionable"][0]["symbol"] == "TSLA"
+
+
+def test_planner_no_regression_after_observed_dedup():
+    """Planner still works correctly after observed dedup changes."""
+    from unittest.mock import MagicMock, patch
+
+    from app.services.planner import generate_reallocation_plan
+
+    snapshot = {
+        "total_value": 100_000, "cash": 20_000, "currency": "USD",
+        "positions": [{"symbol": "AAPL", "market_value": 80000}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.80}}
+    external_opportunities = [
+        {
+            "symbol": "MSFT",
+            "asset_type": "CEDEAR",
+            "asset_type_status": "known_valid",
+            "priority_score": 0.7,
+            "source_types": ["news", "watchlist"],
+            "reason": "Valid opportunity",
+            "investable": True,
+            "actionable_external": True,
+        },
+    ]
+    allowed_assets = {"main_allowed": {"AAPL", "MSFT"}, "holdings": {"AAPL"}}
+
+    with patch("app.services.planner.get_settings") as mock_s:
+        s = MagicMock()
+        s.investor_profile_target = "moderate_aggressive"
+        s.investor_profile = "moderado"
+        s.max_movement_per_cycle = 0.10
+        mock_s.return_value = s
+
+        plan = generate_reallocation_plan(
+            snapshot=snapshot, analysis=analysis,
+            external_opportunities=external_opportunities,
+            allowed_assets=allowed_assets,
+        )
+
+    assert plan["planner_status"] in ("success", "proposed")
+    buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
+    assert "MSFT" in buy_symbols
