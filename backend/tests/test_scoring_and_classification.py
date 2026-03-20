@@ -4732,3 +4732,488 @@ def test_external_opportunities_unaffected_by_signal_quality():
     # observed counts correct
     assert cands["observed_with_signal_count"] == 1  # MA only
     assert cands["observed_weak_signal_count"] == 1  # GPU only
+
+
+# ---------------------------------------------------------------------------
+# Sprint 25: causal_link_strength — strong vs weak causal association
+# ---------------------------------------------------------------------------
+
+
+def test_title_mention_true_gives_causal_strong():
+    """Symbol with title_mention=True gets causal_link_strength=strong."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            {"symbol": "MELI", "effective_score": 0.6, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "known_valid",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "strong"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top = summary["candidates"]["top_observed"]
+    assert len(top) == 1
+    assert top[0]["causal_link_strength"] == "strong"
+    assert top[0]["title_mention"] is True
+
+
+def test_title_mention_false_gives_causal_weak():
+    """Symbol with title_mention=False gets causal_link_strength=weak (V/MA pattern)."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # V pattern: real instrument, strong signal_quality, but weak causal link
+            {"symbol": "V", "effective_score": 0.55, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "reason": "U.S. stocks lower at close of trade; Dow Jones Industrial Average down 0.97%",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "weak"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top = summary["candidates"]["top_observed"]
+    assert len(top) == 1
+    assert top[0]["causal_link_strength"] == "weak"
+    assert top[0]["signal_quality"] == "strong"  # instrument quality preserved
+
+
+def test_catalog_only_gives_causal_null():
+    """Catalog-only items have causal_link_strength=None."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            {"symbol": "AAPL", "effective_score": None, "signal_class": None,
+             "asset_type_status": "known_valid", "priority_score": 0.4,
+             "observed_origin": "catalog", "signal_quality": None,
+             "causal_link_strength": None},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top = summary["candidates"]["top_observed"]
+    assert top[0]["causal_link_strength"] is None
+
+
+def test_strong_causal_ranks_above_weak_causal_same_signal_quality():
+    """Within signal_quality=strong, causal_link_strength=strong ranks first."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # V: strong instrument, weak causal, HIGHER effective_score
+            {"symbol": "V", "effective_score": 0.65, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "reason": "U.S. stocks lower at close of trade",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "weak"},
+            # MELI: strong instrument, strong causal, LOWER effective_score
+            {"symbol": "MELI", "effective_score": 0.50, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "known_valid",
+             "reason": "MELI reporta resultados record en LatAm",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "strong"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top = summary["candidates"]["top_observed"]
+
+    # MELI (causal strong) ranks above V (causal weak) despite V having higher effective_score
+    assert top[0]["symbol"] == "MELI"
+    assert top[0]["causal_link_strength"] == "strong"
+    assert top[1]["symbol"] == "V"
+    assert top[1]["causal_link_strength"] == "weak"
+
+
+def test_top_observed_signals_includes_weak_causal_but_ranked_lower():
+    """top_observed_signals still includes weak-causal strong instruments, but ranked below."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # MA: strong instrument, weak causal
+            {"symbol": "MA", "effective_score": 0.55, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "reason": "Suncor's global head to depart",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "weak"},
+            # MELI: strong instrument, strong causal
+            {"symbol": "MELI", "effective_score": 0.50, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "known_valid",
+             "reason": "MELI reporta resultados record",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "strong"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top_sig = summary["candidates"]["top_observed_signals"]
+
+    # Both are strong signal_quality → both in top_observed_signals
+    assert len(top_sig) == 2
+    # But MELI (strong causal) ranks first
+    assert top_sig[0]["symbol"] == "MELI"
+    assert top_sig[0]["causal_link_strength"] == "strong"
+    assert top_sig[1]["symbol"] == "MA"
+    assert top_sig[1]["causal_link_strength"] == "weak"
+
+
+def test_macro_news_generic_reason_gets_weak_causal():
+    """Generic macro news with title_mention=False produces weak causal link."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # V: associated laterally with generic market news
+            {"symbol": "V", "effective_score": 0.55, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "reason": "U.S. stocks lower at close of trade; Dow Jones Industrial Average down 0.97%",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "weak"},
+            # MA: associated laterally with unrelated company news
+            {"symbol": "MA", "effective_score": 0.50, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "reason": "Suncor's global head of market and trade risk management to depart, sources say",
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "weak"},
+            # AAPL: catalog only
+            {"symbol": "AAPL", "effective_score": None, "signal_class": None,
+             "asset_type_status": "known_valid", "priority_score": 0.35,
+             "observed_origin": "catalog", "signal_quality": None,
+             "causal_link_strength": None},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top_obs = summary["candidates"]["top_observed"]
+
+    # All three present, V and MA have weak causal despite being strong instruments
+    assert top_obs[0]["causal_link_strength"] == "weak"  # V or MA (both weak causal)
+    assert top_obs[0]["signal_quality"] == "strong"
+
+
+def test_tracked_with_title_mention_false_still_weak_causal():
+    """Even a tracked symbol gets weak causal if title_mention=False."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            {"symbol": "TSLA", "effective_score": 0.5, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "tracking_status": "watchlist", "in_main_allowed": True,
+             "observed_origin": "signal", "signal_quality": "strong",
+             "causal_link_strength": "weak"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top = summary["candidates"]["top_observed"]
+    assert top[0]["signal_quality"] == "strong"
+    assert top[0]["causal_link_strength"] == "weak"
+
+
+def test_causal_link_strength_in_top_n_output():
+    """causal_link_strength appears in _top_n output items."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            {"symbol": "MA", "effective_score": 0.5, "signal_class": "external_opportunity",
+             "title_mention": True, "observed_origin": "signal",
+             "signal_quality": "strong", "causal_link_strength": "strong"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top = summary["candidates"]["top_observed"]
+    assert "causal_link_strength" in top[0]
+    assert top[0]["causal_link_strength"] == "strong"
+
+
+def test_no_regression_signal_quality_with_causal_link():
+    """signal_quality counts and splits remain correct with causal_link_strength added."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # Strong instrument, strong causal
+            {"symbol": "MELI", "effective_score": 0.6, "signal_quality": "strong",
+             "observed_origin": "signal", "causal_link_strength": "strong",
+             "title_mention": True},
+            # Strong instrument, weak causal
+            {"symbol": "V", "effective_score": 0.55, "signal_quality": "strong",
+             "observed_origin": "signal", "causal_link_strength": "weak",
+             "title_mention": False},
+            # Weak instrument (GPU), weak causal
+            {"symbol": "GPU", "effective_score": 0.5, "signal_quality": "weak",
+             "observed_origin": "signal", "causal_link_strength": "weak",
+             "title_mention": False},
+            # Catalog only
+            {"symbol": "AAPL", "effective_score": None, "signal_quality": None,
+             "observed_origin": "catalog", "causal_link_strength": None},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    # signal_quality counts unchanged
+    assert cands["observed_with_signal_count"] == 2   # MELI + V (strong instrument)
+    assert cands["observed_weak_signal_count"] == 1    # GPU
+    assert cands["observed_catalog_count"] == 1         # AAPL
+    assert cands["observed_count"] == 4
+
+    # top_observed: MELI first (strong+strong), then V (strong+weak), then GPU, then AAPL
+    top = cands["top_observed"]
+    assert top[0]["symbol"] == "MELI"
+    assert top[1]["symbol"] == "V"
+    assert top[2]["symbol"] == "GPU"
+
+
+def test_causal_link_computed_in_orchestrator_merge():
+    """causal_link_strength is correctly set from title_mention during orchestrator merge."""
+    from app.recommendations.engine import generate_recommendation
+    from app.market.candidates import generate_external_candidates
+
+    # News where MELI is in title but V is not (Visa only in related_assets)
+    news = [
+        {
+            "title": "MELI reporta resultados record en LatAm",
+            "summary": "Visa benefits tangentially from LatAm digital payments growth",
+            "related_assets": ["MELI", "V"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "confidence": 0.8,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    # MELI should be in external_opportunities (title mention)
+    ext = rec["external_opportunities"]
+    ext_symbols = {c["symbol"] for c in ext}
+    assert "MELI" in ext_symbols
+
+    # V should NOT be in external_opportunities (no title mention → observed)
+    assert "V" not in ext_symbols
+
+    # V should be in observed_candidates
+    obs_symbols = {c["symbol"] for c in rec["observed_candidates"]}
+    assert "V" in obs_symbols
+
+    # Simulate orchestrator merge for V
+    allowed = {
+        "holdings": {"AAPL", "SPY"},
+        "whitelist": {"AAPL", "SPY", "MELI", "V"},
+        "watchlist": set(),
+        "universe": set(),
+        "main_allowed": {"AAPL", "SPY", "MELI", "V"},
+        "catalog_dynamic": set(),
+    }
+    positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"},
+                 {"symbol": "SPY", "asset_type": "ETF"}]
+
+    all_candidates = generate_external_candidates(
+        news_opportunities=ext, allowed_assets=allowed, positions=positions,
+    )
+
+    observed_from_cands = [c for c in all_candidates if not (c.get("actionable_external") and c.get("investable"))]
+    raw_observed = rec.get("observed_candidates", []) + observed_from_cands
+
+    _ENRICH_KEYS = (
+        "asset_type_status", "asset_type", "source_types", "investable",
+        "actionable_external", "priority_score", "tracking_status",
+        "actionable_reason", "in_main_allowed", "asset_type_source",
+        "title_mention",
+    )
+    seen_observed = {}
+    for item in raw_observed:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        if sym not in seen_observed:
+            seen_observed[sym] = item
+        else:
+            existing = seen_observed[sym]
+            new_score = item.get("effective_score") or 0
+            old_score = existing.get("effective_score") or 0
+            if new_score > old_score:
+                winner, loser = item, existing
+                seen_observed[sym] = winner
+            else:
+                winner, loser = existing, item
+            for key in _ENRICH_KEYS:
+                if winner.get(key) is None and loser.get(key) is not None:
+                    winner[key] = loser[key]
+
+    merged = list(seen_observed.values())
+
+    for item in merged:
+        has_signal = item.get("effective_score") is not None or item.get("signal_class") is not None
+        item["observed_origin"] = "signal" if has_signal else "catalog"
+        if has_signal:
+            is_known = (
+                item.get("asset_type_status") == "known_valid"
+                or item.get("in_main_allowed") is True
+                or item.get("tracking_status") not in (None, "untracked")
+            )
+            item["signal_quality"] = "strong" if is_known else "weak"
+        else:
+            item["signal_quality"] = None
+        if has_signal:
+            item["causal_link_strength"] = "strong" if item.get("title_mention") else "weak"
+        else:
+            item["causal_link_strength"] = None
+
+    # V should have weak causal link (not in title)
+    v_items = [i for i in merged if i["symbol"] == "V"]
+    if v_items:
+        assert v_items[0]["causal_link_strength"] == "weak"
+        assert v_items[0]["title_mention"] is False
+
+
+def test_planner_no_regression_with_causal_link():
+    """Planner still works when external_opportunities carry causal_link_strength."""
+    from unittest.mock import MagicMock, patch
+    from app.services.planner import generate_reallocation_plan
+
+    snapshot = {
+        "total_value": 100_000, "cash": 20_000, "currency": "USD",
+        "positions": [{"symbol": "AAPL", "market_value": 80000}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.80}}
+    external_opportunities = [
+        {
+            "symbol": "MELI",
+            "asset_type": "CEDEAR",
+            "asset_type_status": "known_valid",
+            "priority_score": 0.7,
+            "source_types": ["news", "watchlist"],
+            "reason": "MELI reporta resultados récord",
+            "investable": True,
+            "actionable_external": True,
+            "title_mention": True,
+            "signal_quality": "strong",
+            "causal_link_strength": "strong",
+        },
+    ]
+    allowed_assets = {"main_allowed": {"AAPL", "MELI"}, "holdings": {"AAPL"}}
+
+    with patch("app.services.planner.get_settings") as mock_s:
+        s = MagicMock()
+        s.investor_profile_target = "moderate_aggressive"
+        s.investor_profile = "moderado"
+        s.max_movement_per_cycle = 0.10
+        mock_s.return_value = s
+
+        plan = generate_reallocation_plan(
+            snapshot=snapshot, analysis=analysis,
+            external_opportunities=external_opportunities,
+            allowed_assets=allowed_assets,
+        )
+
+    assert plan["planner_status"] in ("success", "proposed")
+    buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
+    assert "MELI" in buy_symbols

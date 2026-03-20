@@ -330,7 +330,8 @@ def _build_decision_summary(
              "investable": i.get("investable"), "asset_type_status": i.get("asset_type_status"),
              "title_mention": i.get("title_mention"),
              "observed_origin": i.get("observed_origin"),
-             "signal_quality": i.get("signal_quality")}
+             "signal_quality": i.get("signal_quality"),
+             "causal_link_strength": i.get("causal_link_strength")}
             for i in source[:n]
         ]
 
@@ -344,7 +345,7 @@ def _build_decision_summary(
     )
     _observed_key = lambda x: (
         2 if x.get("signal_quality") == "strong" else (1 if x.get("signal_quality") == "weak" else 0),
-        1 if x.get("title_mention") else 0,
+        1 if x.get("causal_link_strength") == "strong" else 0,
         1 if x.get("asset_type_status") == "known_valid" else 0,
         x.get("effective_score") or 0,
         x.get("priority_score") or 0,
@@ -640,6 +641,13 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             item["signal_quality"] = "strong" if is_known else "weak"
         else:
             item["signal_quality"] = None
+        # causal_link_strength: "strong" if news appears causally related to this symbol,
+        # "weak" if the symbol has a signal but the causal link is vague/lateral.
+        # Primary heuristic: title_mention (symbol appears in news headline).
+        if has_signal:
+            item["causal_link_strength"] = "strong" if item.get("title_mention") else "weak"
+        else:
+            item["causal_link_strength"] = None
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
     rec["observed_candidates"] = merged_observed
 
