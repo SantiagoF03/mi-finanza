@@ -338,3 +338,307 @@ def test_main_recommendation_limited_to_holdings():
     # Reset
     s.watchlist_assets = []
     s.market_universe_assets = []
+
+
+# ---------------------------------------------------------------------------
+# Part E: title_mention propagation through candidates
+# ---------------------------------------------------------------------------
+
+
+def test_title_mention_propagated_from_news_opportunity():
+    """title_mention from engine news_opportunities flows through to candidate output."""
+    allowed = {
+        "holdings": {"AAPL"},
+        "whitelist": {"AAPL", "MELI"},
+        "watchlist": set(),
+        "universe": set(),
+        "main_allowed": {"AAPL", "MELI"},
+        "external_allowed": {"MELI"},
+    }
+    positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"}]
+    news_ops = [
+        {
+            "symbol": "MELI",
+            "reason": "MELI reporta resultados récord",
+            "confidence": 0.8,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "title_mention": True,
+        },
+    ]
+
+    candidates = generate_external_candidates(news_ops, allowed, positions)
+    meli = next(c for c in candidates if c["symbol"] == "MELI")
+    assert meli["title_mention"] is True
+
+
+def test_title_mention_false_propagated():
+    """title_mention=False from engine also propagates (not just True)."""
+    allowed = {
+        "holdings": {"AAPL"},
+        "whitelist": {"AAPL", "BAC"},
+        "watchlist": set(),
+        "universe": set(),
+        "main_allowed": {"AAPL", "BAC"},
+        "external_allowed": {"BAC"},
+    }
+    positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"}]
+    news_ops = [
+        {
+            "symbol": "BAC",
+            "reason": "Según analistas de BAC",
+            "confidence": 0.5,
+            "event_type": "otro",
+            "impact": "neutro",
+            "signal_class": "observed_candidate",
+            "signal_score": 0.4,
+            "effective_score": 0.4,
+            "title_mention": False,
+        },
+    ]
+
+    candidates = generate_external_candidates(news_ops, allowed, positions)
+    bac = next(c for c in candidates if c["symbol"] == "BAC")
+    assert bac["title_mention"] is False
+
+
+def test_title_mention_none_for_non_news_candidates():
+    """Candidates sourced only from watchlist/universe have title_mention=None."""
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": {"TSLA"},
+        "universe": {"NVDA"},
+        "main_allowed": set(),
+        "external_allowed": {"TSLA", "NVDA"},
+    }
+    candidates = generate_external_candidates([], allowed, [])
+    for c in candidates:
+        assert c["title_mention"] is None
+
+
+def test_title_mention_any_true_wins_across_signals():
+    """If a symbol has multiple news signals, title_mention=True if ANY signal has it."""
+    allowed = {
+        "holdings": {"AAPL"},
+        "whitelist": {"AAPL", "MELI"},
+        "watchlist": set(),
+        "universe": set(),
+        "main_allowed": {"AAPL", "MELI"},
+        "external_allowed": {"MELI"},
+    }
+    positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"}]
+    news_ops = [
+        {
+            "symbol": "MELI",
+            "reason": "Analistas mencionan MELI de pasada",
+            "confidence": 0.5,
+            "event_type": "otro",
+            "impact": "neutro",
+            "signal_class": "external_opportunity",
+            "signal_score": 0.5,
+            "effective_score": 0.5,
+            "title_mention": False,
+        },
+        {
+            "symbol": "MELI",
+            "reason": "MELI reporta resultados récord",
+            "confidence": 0.8,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "title_mention": True,
+        },
+    ]
+
+    candidates = generate_external_candidates(news_ops, allowed, positions)
+    meli = next(c for c in candidates if c["symbol"] == "MELI")
+    # True wins because at least one signal has title_mention=True
+    assert meli["title_mention"] is True
+
+
+def test_title_mention_in_candidate_output_field_always_present():
+    """title_mention key exists in all candidate dicts regardless of source."""
+    allowed = {
+        "holdings": set(),
+        "whitelist": set(),
+        "watchlist": {"TSLA"},
+        "universe": {"NVDA"},
+        "main_allowed": set(),
+        "external_allowed": {"TSLA", "NVDA"},
+    }
+    news_ops = [
+        {
+            "symbol": "MELI",
+            "reason": "MELI news",
+            "confidence": 0.7,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "title_mention": True,
+        },
+    ]
+    candidates = generate_external_candidates(news_ops, allowed, [])
+    for c in candidates:
+        assert "title_mention" in c
+
+
+def test_counts_not_broken_by_title_mention_propagation():
+    """Adding title_mention to candidates does not alter counts or priority ordering."""
+    allowed = {
+        "holdings": {"AAPL"},
+        "whitelist": {"AAPL", "MELI", "TSLA"},
+        "watchlist": {"TSLA"},
+        "universe": set(),
+        "main_allowed": {"AAPL", "MELI", "TSLA"},
+        "external_allowed": {"MELI", "TSLA"},
+    }
+    positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"}]
+    news_ops = [
+        {
+            "symbol": "MELI",
+            "reason": "MELI resultados",
+            "confidence": 0.8,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "title_mention": True,
+        },
+    ]
+
+    candidates = generate_external_candidates(news_ops, allowed, positions)
+    symbols = {c["symbol"] for c in candidates}
+    assert "MELI" in symbols
+    assert "TSLA" in symbols
+    assert len(candidates) == 2
+
+    # MELI (news+) should have higher priority than TSLA (watchlist only)
+    meli = next(c for c in candidates if c["symbol"] == "MELI")
+    tsla = next(c for c in candidates if c["symbol"] == "TSLA")
+    assert meli["priority_score"] > tsla["priority_score"]
+
+
+def test_end_to_end_title_mention_engine_to_decision_summary():
+    """Full propagation: engine -> candidates -> orchestrator decision_summary."""
+    from app.recommendations.engine import generate_recommendation
+    from app.services.orchestrator import _build_decision_summary
+
+    news = [
+        {
+            "title": "MELI reporta crecimiento récord en LatAm",
+            "summary": "Analistas de BAC recomiendan compra",
+            "related_assets": ["MELI", "BAC"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "confidence": 0.8,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = {
+        "total_value": 100_000,
+        "cash": 10_000,
+        "currency": "USD",
+        "positions": [{"symbol": "AAPL", "market_value": 90000, "asset_type": "CEDEAR", "pnl_pct": 0.01}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.9, "CASH": 0.1}, "rebalance_deviation": {}, "overlap_alerts": []}
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    # Engine sets title_mention correctly
+    ext = rec["external_opportunities"]
+    obs = rec["observed_candidates"]
+    ext_symbols = {c["symbol"] for c in ext}
+    obs_symbols = {c["symbol"] for c in obs}
+    assert "MELI" in ext_symbols  # in title
+    assert "BAC" in obs_symbols   # not in title
+
+    meli_engine = next(c for c in ext if c["symbol"] == "MELI")
+    bac_engine = next(c for c in obs if c["symbol"] == "BAC")
+    assert meli_engine["title_mention"] is True
+    assert bac_engine["title_mention"] is False
+
+    # Now simulate orchestrator candidate enrichment
+    allowed = {
+        "holdings": {"AAPL"},
+        "whitelist": {"AAPL", "MELI"},
+        "watchlist": set(),
+        "universe": set(),
+        "main_allowed": {"AAPL", "MELI"},
+        "catalog_dynamic": set(),
+    }
+    positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"}]
+
+    all_candidates = generate_external_candidates(
+        news_opportunities=ext,
+        allowed_assets=allowed,
+        positions=positions,
+    )
+
+    # Candidate should carry title_mention
+    meli_cand = next((c for c in all_candidates if c["symbol"] == "MELI"), None)
+    assert meli_cand is not None
+    assert meli_cand["title_mention"] is True
+
+    # Rebuild rec like orchestrator does
+    rec["external_opportunities"] = [c for c in all_candidates if c.get("actionable_external") and c.get("investable")]
+    observed_from_candidates = [c for c in all_candidates if not (c.get("actionable_external") and c.get("investable"))]
+
+    # Merge observed
+    _ENRICH_KEYS = (
+        "asset_type_status", "asset_type", "source_types", "investable",
+        "actionable_external", "priority_score", "tracking_status",
+        "actionable_reason", "in_main_allowed", "asset_type_source",
+        "title_mention",
+    )
+    raw_observed = rec.get("observed_candidates", []) + observed_from_candidates
+    seen_observed = {}
+    for item in raw_observed:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        if sym not in seen_observed:
+            seen_observed[sym] = item
+        else:
+            existing = seen_observed[sym]
+            new_score = item.get("effective_score") or 0
+            old_score = existing.get("effective_score") or 0
+            if new_score > old_score:
+                winner, loser = item, existing
+                seen_observed[sym] = winner
+            else:
+                winner, loser = existing, item
+            for key in _ENRICH_KEYS:
+                if winner.get(key) is None and loser.get(key) is not None:
+                    winner[key] = loser[key]
+    rec["observed_candidates"] = list(seen_observed.values())
+
+    # Build decision summary
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+
+    # title_mention visible in top_actionable
+    top_act = summary["candidates"]["top_actionable"]
+    if top_act:
+        meli_top = next((t for t in top_act if t["symbol"] == "MELI"), None)
+        if meli_top:
+            assert meli_top["title_mention"] is True
+
+    # title_mention visible in top_observed
+    top_obs = summary["candidates"]["top_observed"]
+    bac_top = next((t for t in top_obs if t["symbol"] == "BAC"), None)
+    if bac_top:
+        assert bac_top["title_mention"] is False
+
+    # Counts aligned
+    cands = summary["candidates"]
+    assert cands["actionable_count"] == len(rec["external_opportunities"])
+    assert cands["observed_count"] == len(rec["observed_candidates"])

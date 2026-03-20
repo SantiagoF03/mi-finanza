@@ -83,6 +83,7 @@ def generate_external_candidates(
             "signal_score": op.get("signal_score"),
             "effective_score": op.get("effective_score"),
             "market_confirmation": op.get("market_confirmation"),
+            "title_mention": op.get("title_mention"),
         })
 
     # 2. Catalog candidates (PRIMARY external source — dynamic from IOL discovery)
@@ -196,6 +197,8 @@ def generate_external_candidates(
             "effective_score": best_news.get("effective_score") if best_news else None,
             "signal_class": best_news.get("signal_class") if best_news else None,
             "market_confirmation": best_news.get("market_confirmation") if best_news else None,
+            # Propagate title_mention: True if symbol appeared in ANY news title
+            "title_mention": any(s.get("title_mention") for s in c["news_signals"]) if c["news_signals"] else None,
         })
 
     # Sort by priority descending
