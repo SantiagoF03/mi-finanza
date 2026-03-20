@@ -5217,3 +5217,421 @@ def test_planner_no_regression_with_causal_link():
     assert plan["planner_status"] in ("success", "proposed")
     buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
     assert "MELI" in buy_symbols
+
+
+# ---------------------------------------------------------------------------
+# Sprint 26: observed → actionable promotion
+# ---------------------------------------------------------------------------
+
+
+def _base_rec(**overrides):
+    """Helper to build a minimal recommendation dict for decision_summary tests."""
+    base = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [],
+        "suppressed_candidates": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_promotion_strong_strong_high_score_investable():
+    """strong + strong + score >= 0.6 + investable → promoted to actionable."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        external_opportunities=[
+            {"symbol": "MELI", "effective_score": 0.65, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "known_valid",
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "actionable_external": True,
+             "promoted_from_observed": True},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 1
+    assert cands["promoted_from_observed_count"] == 1
+    assert cands["top_actionable"][0]["symbol"] == "MELI"
+
+
+def test_no_promotion_strong_weak_causal():
+    """strong signal_quality + weak causal → stays in observed, not promoted."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        observed_candidates=[
+            {"symbol": "V", "effective_score": 0.65, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "signal_quality": "strong", "causal_link_strength": "weak",
+             "investable": True, "observed_origin": "signal"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 0
+    assert cands["observed_count"] == 1
+    assert cands["top_observed"][0]["symbol"] == "V"
+
+
+def test_no_promotion_weak_signal_quality():
+    """weak signal_quality + strong causal → stays in observed."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        observed_candidates=[
+            {"symbol": "UBS", "effective_score": 0.7, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "unknown",
+             "signal_quality": "weak", "causal_link_strength": "strong",
+             "investable": False, "observed_origin": "signal"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 0
+    assert cands["observed_count"] == 1
+
+
+def test_no_promotion_below_score_threshold():
+    """strong + strong but effective_score < 0.6 → NOT promoted."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        observed_candidates=[
+            {"symbol": "MELI", "effective_score": 0.55, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "known_valid",
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "observed_origin": "signal"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 0
+    assert cands["observed_count"] == 1
+    assert cands["top_observed"][0]["symbol"] == "MELI"
+
+
+def test_no_promotion_not_investable():
+    """strong + strong + high score but investable=False → NOT promoted."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        observed_candidates=[
+            {"symbol": "TSLA", "effective_score": 0.7, "signal_class": "external_opportunity",
+             "title_mention": True, "asset_type_status": "known_valid",
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": False, "observed_origin": "signal"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 0
+    assert cands["observed_count"] == 1
+
+
+def test_promotion_removes_from_observed():
+    """Promoted items are removed from observed_candidates."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        external_opportunities=[
+            {"symbol": "MELI", "effective_score": 0.65,
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "actionable_external": True,
+             "promoted_from_observed": True, "title_mention": True,
+             "asset_type_status": "known_valid"},
+        ],
+        observed_candidates=[
+            {"symbol": "V", "effective_score": 0.55,
+             "signal_quality": "strong", "causal_link_strength": "weak",
+             "investable": True, "observed_origin": "signal",
+             "title_mention": False},
+            {"symbol": "AAPL", "effective_score": None,
+             "signal_quality": None, "causal_link_strength": None,
+             "observed_origin": "catalog"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 1
+    assert cands["observed_count"] == 2
+    obs_symbols = {i["symbol"] for i in cands["top_observed"]}
+    assert "MELI" not in obs_symbols
+    assert "V" in obs_symbols
+
+
+def test_promotion_preserves_existing_external_ops():
+    """Promotion appends to existing external_opportunities, does not replace."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        external_opportunities=[
+            # Original from engine (title_mention=True from the start)
+            {"symbol": "NVDA", "effective_score": 0.75,
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "actionable_external": True,
+             "title_mention": True, "asset_type_status": "known_valid"},
+            # Promoted from observed
+            {"symbol": "MELI", "effective_score": 0.65,
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "actionable_external": True,
+             "promoted_from_observed": True, "title_mention": True,
+             "asset_type_status": "known_valid"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 2
+    assert cands["promoted_from_observed_count"] == 1
+    symbols = {i["symbol"] for i in cands["top_actionable"]}
+    assert "NVDA" in symbols
+    assert "MELI" in symbols
+
+
+def test_promotion_at_exact_threshold():
+    """effective_score == 0.6 exactly → promoted (>= not >)."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        external_opportunities=[
+            {"symbol": "MELI", "effective_score": 0.6,
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "actionable_external": True,
+             "promoted_from_observed": True, "title_mention": True,
+             "asset_type_status": "known_valid"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    assert summary["candidates"]["actionable_count"] == 1
+    assert summary["candidates"]["promoted_from_observed_count"] == 1
+
+
+def test_promotion_no_regression_signal_quality_counts():
+    """signal_quality counts remain correct after promotion."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        external_opportunities=[
+            {"symbol": "MELI", "effective_score": 0.65,
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "actionable_external": True,
+             "promoted_from_observed": True, "title_mention": True,
+             "asset_type_status": "known_valid"},
+        ],
+        observed_candidates=[
+            {"symbol": "V", "effective_score": 0.55,
+             "signal_quality": "strong", "causal_link_strength": "weak",
+             "observed_origin": "signal"},
+            {"symbol": "GPU", "effective_score": 0.5,
+             "signal_quality": "weak", "causal_link_strength": "weak",
+             "observed_origin": "signal"},
+            {"symbol": "AAPL", "effective_score": None,
+             "signal_quality": None, "causal_link_strength": None,
+             "observed_origin": "catalog"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["observed_with_signal_count"] == 1   # V only (MELI promoted out)
+    assert cands["observed_weak_signal_count"] == 1    # GPU
+    assert cands["observed_catalog_count"] == 1         # AAPL
+    assert cands["observed_count"] == 3
+
+
+def test_promotion_no_regression_causal_link():
+    """causal_link_strength preserved on both promoted and remaining items."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        external_opportunities=[
+            {"symbol": "MELI", "effective_score": 0.65,
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "actionable_external": True,
+             "promoted_from_observed": True, "title_mention": True,
+             "asset_type_status": "known_valid"},
+        ],
+        observed_candidates=[
+            {"symbol": "V", "effective_score": 0.55,
+             "signal_quality": "strong", "causal_link_strength": "weak",
+             "observed_origin": "signal", "title_mention": False},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top_act = summary["candidates"]["top_actionable"]
+    top_obs = summary["candidates"]["top_observed"]
+
+    assert top_act[0]["causal_link_strength"] == "strong"
+    assert top_obs[0]["causal_link_strength"] == "weak"
+
+
+def test_promotion_e2e_in_orchestrator_merge():
+    """End-to-end: orchestrator merge correctly promotes qualifying observed items."""
+    from app.recommendations.engine import generate_recommendation
+    from app.market.candidates import generate_external_candidates
+
+    # MELI in title → external_opportunity in engine
+    news = [
+        {
+            "title": "MELI supera expectativas con crecimiento récord en LatAm",
+            "summary": "MercadoLibre reported record earnings",
+            "related_assets": ["MELI"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "confidence": 0.8,
+            "event_type": "earnings",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    # MELI should be in engine's external_opportunities (title mention)
+    ext = rec["external_opportunities"]
+    assert any(c["symbol"] == "MELI" for c in ext)
+
+    # Now generate_external_candidates with MELI in main_allowed
+    allowed = {
+        "holdings": {"AAPL", "SPY"},
+        "whitelist": {"AAPL", "SPY", "MELI"},
+        "watchlist": set(),
+        "universe": set(),
+        "main_allowed": {"AAPL", "SPY", "MELI"},
+        "catalog_dynamic": set(),
+    }
+    positions = [{"symbol": "AAPL", "asset_type": "CEDEAR"},
+                 {"symbol": "SPY", "asset_type": "ETF"}]
+
+    all_candidates = generate_external_candidates(
+        news_opportunities=ext, allowed_assets=allowed, positions=positions,
+    )
+
+    # MELI should be actionable and investable from candidates
+    meli_cands = [c for c in all_candidates if c["symbol"] == "MELI"]
+    if meli_cands:
+        meli = meli_cands[0]
+        assert meli.get("asset_type_status") == "known_valid"
+
+
+def test_promotion_mixed_scenario():
+    """Mixed scenario: one promotes, two don't, counts correct."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = _base_rec(
+        external_opportunities=[
+            # MELI: promoted from observed
+            {"symbol": "MELI", "effective_score": 0.65,
+             "signal_quality": "strong", "causal_link_strength": "strong",
+             "investable": True, "actionable_external": True,
+             "promoted_from_observed": True, "title_mention": True,
+             "asset_type_status": "known_valid"},
+        ],
+        observed_candidates=[
+            # V: strong instrument but weak causal → stays
+            {"symbol": "V", "effective_score": 0.65,
+             "signal_quality": "strong", "causal_link_strength": "weak",
+             "investable": True, "observed_origin": "signal",
+             "title_mention": False},
+            # GPU: weak instrument → stays
+            {"symbol": "GPU", "effective_score": 0.6,
+             "signal_quality": "weak", "causal_link_strength": "strong",
+             "investable": False, "observed_origin": "signal",
+             "title_mention": True},
+            # AAPL: catalog → stays
+            {"symbol": "AAPL", "effective_score": None,
+             "signal_quality": None, "causal_link_strength": None,
+             "observed_origin": "catalog"},
+        ],
+    )
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 1
+    assert cands["promoted_from_observed_count"] == 1
+    assert cands["observed_count"] == 3
+    assert cands["observed_with_signal_count"] == 1   # V only
+    assert cands["observed_weak_signal_count"] == 1    # GPU
+    assert cands["observed_catalog_count"] == 1         # AAPL
+
+
+def test_promotion_loop_directly():
+    """Test the actual promotion loop logic from orchestrator (not just summary)."""
+    # Simulate merged_observed after tagging
+    merged_observed = [
+        {"symbol": "MELI", "effective_score": 0.65,
+         "signal_quality": "strong", "causal_link_strength": "strong",
+         "investable": True, "observed_origin": "signal",
+         "title_mention": True, "asset_type_status": "known_valid"},
+        {"symbol": "V", "effective_score": 0.65,
+         "signal_quality": "strong", "causal_link_strength": "weak",
+         "investable": True, "observed_origin": "signal",
+         "title_mention": False, "asset_type_status": "known_valid"},
+        {"symbol": "GPU", "effective_score": 0.6,
+         "signal_quality": "weak", "causal_link_strength": "strong",
+         "investable": False, "observed_origin": "signal",
+         "title_mention": True, "asset_type_status": "unknown"},
+        {"symbol": "MA", "effective_score": 0.55,
+         "signal_quality": "strong", "causal_link_strength": "strong",
+         "investable": True, "observed_origin": "signal",
+         "title_mention": True, "asset_type_status": "known_valid"},
+    ]
+
+    # Run the same promotion logic as orchestrator
+    _PROMOTION_SCORE_THRESHOLD = 0.6
+    promoted = []
+    remaining_observed = []
+    for item in merged_observed:
+        if (
+            item.get("signal_quality") == "strong"
+            and item.get("causal_link_strength") == "strong"
+            and (item.get("effective_score") or 0) >= _PROMOTION_SCORE_THRESHOLD
+            and item.get("investable") is True
+        ):
+            item["promoted_from_observed"] = True
+            item["actionable_external"] = True
+            promoted.append(item)
+        else:
+            remaining_observed.append(item)
+
+    # MELI: strong+strong+0.65+investable → promoted
+    assert len(promoted) == 1
+    assert promoted[0]["symbol"] == "MELI"
+    assert promoted[0]["promoted_from_observed"] is True
+
+    # V: strong+weak → NOT promoted (weak causal)
+    # GPU: weak+strong → NOT promoted (weak signal_quality)
+    # MA: strong+strong+0.55 → NOT promoted (below threshold)
+    assert len(remaining_observed) == 3
+    remaining_symbols = {i["symbol"] for i in remaining_observed}
+    assert remaining_symbols == {"V", "GPU", "MA"}

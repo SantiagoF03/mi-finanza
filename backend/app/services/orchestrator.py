@@ -358,9 +358,12 @@ def _build_decision_summary(
     obs_weak = [i for i in obs_cands if i.get("signal_quality") == "weak"]
     obs_catalog = [i for i in obs_cands if i.get("signal_quality") is None]
 
+    promoted_from_observed = [i for i in ext_ops if i.get("promoted_from_observed")]
+
     candidates = {
         "actionable_count": len(ext_ops),
         "investable_count": len(investable_items),
+        "promoted_from_observed_count": len(promoted_from_observed),
         "observed_count": len(obs_cands),
         "observed_with_signal_count": len(obs_strong),
         "observed_weak_signal_count": len(obs_weak),
@@ -649,7 +652,29 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         else:
             item["causal_link_strength"] = None
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
-    rec["observed_candidates"] = merged_observed
+
+    # --- Observed → Actionable promotion ---
+    # Promote observed candidates that meet ALL quality gates to external_opportunities.
+    # This allows high-quality signals to become actionable even if they arrived
+    # via the observed path (e.g. catalog-discovered symbols with strong news signals).
+    # Gate: strong instrument + strong causal link + high score + investable.
+    _PROMOTION_SCORE_THRESHOLD = 0.6
+    promoted = []
+    remaining_observed = []
+    for item in merged_observed:
+        if (
+            item.get("signal_quality") == "strong"
+            and item.get("causal_link_strength") == "strong"
+            and (item.get("effective_score") or 0) >= _PROMOTION_SCORE_THRESHOLD
+            and item.get("investable") is True
+        ):
+            item["promoted_from_observed"] = True
+            item["actionable_external"] = True
+            promoted.append(item)
+        else:
+            remaining_observed.append(item)
+    rec["external_opportunities"] = rec.get("external_opportunities", []) + promoted
+    rec["observed_candidates"] = remaining_observed
 
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
 
