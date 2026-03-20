@@ -2902,7 +2902,7 @@ def test_engine_filters_pseudo_tickers_from_external():
 
     news = [
         {
-            "title": "SEC announces new regulation on HHS",
+            "title": "SEC announces new regulation affecting MELI and HHS",
             "related_assets": ["SEC", "HHS", "MELI"],
             "signal_class": "external_opportunity",
             "signal_score": 0.6,
@@ -3687,3 +3687,300 @@ def test_planner_no_regression_after_observed_dedup():
     assert plan["planner_status"] in ("success", "proposed")
     buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
     assert "MSFT" in buy_symbols
+
+
+# Sprint 21: Symbol-news relevance gate (title_mention)
+# ===========================================================================
+
+
+def test_weak_association_not_promoted_to_external():
+    """Symbol only in summary (not title) must NOT go to external_opportunities."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "Amazon regresa al mercado de smartphones",
+            "summary": "Según analistas de BAC, el movimiento podría impactar al sector tech",
+            "related_assets": ["AMZN", "BAC"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.65,
+            "effective_score": 0.65,
+            "confidence": 0.7,
+            "event_type": "lanzamiento",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    ext_symbols = {c["symbol"] for c in rec.get("external_opportunities", [])}
+    obs_symbols = {c["symbol"] for c in rec.get("observed_candidates", [])}
+
+    # BAC is NOT in the title → should be in observed, not external
+    assert "BAC" not in ext_symbols
+    assert "BAC" in obs_symbols
+    # BAC entry should have title_mention=False
+    bac_entry = next(c for c in rec["observed_candidates"] if c["symbol"] == "BAC")
+    assert bac_entry["title_mention"] is False
+
+
+def test_strong_association_promoted_to_external():
+    """Symbol IN title must be promoted to external_opportunities normally."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "MELI reporta resultados trimestrales récord",
+            "summary": "MercadoLibre supera expectativas con crecimiento del 40%",
+            "related_assets": ["MELI"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.7,
+            "effective_score": 0.7,
+            "confidence": 0.8,
+            "event_type": "resultado",
+            "impact": "positivo",
+            "source_count": 3,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    ext_symbols = {c["symbol"] for c in rec.get("external_opportunities", [])}
+
+    assert "MELI" in ext_symbols
+    meli = next(c for c in rec["external_opportunities"] if c["symbol"] == "MELI")
+    assert meli["title_mention"] is True
+
+
+def test_mixed_relevance_splits_correctly():
+    """News with multiple symbols: title-mentioned stays external, others go to observed."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "TSLA anuncia nueva fábrica en México",
+            "summary": "Analistas de MA y DIS ven impacto sectorial positivo",
+            "related_assets": ["TSLA", "MA", "DIS"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.65,
+            "effective_score": 0.65,
+            "confidence": 0.7,
+            "event_type": "expansion",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    ext_symbols = {c["symbol"] for c in rec.get("external_opportunities", [])}
+    obs_symbols = {c["symbol"] for c in rec.get("observed_candidates", [])}
+
+    # TSLA in title → external
+    assert "TSLA" in ext_symbols
+    # MA and DIS only in summary → observed
+    assert "MA" in obs_symbols
+    assert "DIS" in obs_symbols
+    assert "MA" not in ext_symbols
+    assert "DIS" not in ext_symbols
+
+
+def test_observed_candidates_still_capture_weak_discovery():
+    """Symbols downgraded from external still appear in observed for discovery tracking."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "UBS revisa perspectivas del S&P 500",
+            "summary": "El análisis incluye impacto potencial en MA, GOOG y NVDA",
+            "related_assets": ["MA", "GOOG", "NVDA"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.55,
+            "effective_score": 0.55,
+            "confidence": 0.6,
+            "event_type": "analisis",
+            "impact": "positivo",
+            "source_count": 1,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+    obs_symbols = {c["symbol"] for c in rec.get("observed_candidates", [])}
+
+    # All 3 are NOT in title → all in observed
+    assert "MA" in obs_symbols
+    assert "GOOG" in obs_symbols
+    assert "NVDA" in obs_symbols
+    # None in external
+    assert len(rec.get("external_opportunities", [])) == 0
+
+
+def test_holdings_not_affected_by_title_gate():
+    """Holdings signals work regardless of title mention — gate only applies to externals."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "Resultados sectoriales positivos en tech",
+            "summary": "AAPL y SPY se benefician del ciclo de crecimiento",
+            "related_assets": ["AAPL", "SPY"],
+            "signal_class": "holding_opportunity",
+            "signal_score": 0.65,
+            "effective_score": 0.65,
+            "confidence": 0.7,
+            "event_type": "resultado",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    # Holdings should still trigger action regardless of title mention
+    # (AAPL and SPY are in held_set, so they're handled in the
+    #  positive_hits path, not the related_assets external loop)
+    assert rec["action"] in ("aumentar posición", "mantener")
+    # No external_opportunities for held symbols
+    ext_symbols = {c["symbol"] for c in rec.get("external_opportunities", [])}
+    assert "AAPL" not in ext_symbols
+    assert "SPY" not in ext_symbols
+
+
+def test_title_mention_visible_in_top_actionable():
+    """title_mention field must appear in decision_summary top_actionable and top_observed."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [
+            {"symbol": "MELI", "investable": True, "actionable_external": True,
+             "effective_score": 0.7, "asset_type_status": "known_valid",
+             "title_mention": True},
+        ],
+        "observed_candidates": [
+            {"symbol": "BAC", "effective_score": 0.5, "title_mention": False,
+             "asset_type_status": "known_valid"},
+            {"symbol": "TSLA", "effective_score": 0.6, "title_mention": True,
+             "asset_type_status": "known_valid"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+
+    # title_mention visible in top_actionable
+    assert summary["candidates"]["top_actionable"][0]["title_mention"] is True
+    assert summary["candidates"]["top_actionable"][0]["symbol"] == "MELI"
+
+    # top_observed should prefer title_mention=True
+    top_obs = summary["candidates"]["top_observed"]
+    assert top_obs[0]["symbol"] == "TSLA"  # title_mention=True ranks first
+    assert top_obs[0]["title_mention"] is True
+    assert top_obs[1]["symbol"] == "BAC"
+    assert top_obs[1]["title_mention"] is False
+
+
+def test_counts_and_buckets_preserved_with_title_gate():
+    """Title gate changes bucket placement but counts remain aligned."""
+    from app.recommendations.engine import generate_recommendation
+
+    news = [
+        {
+            "title": "MELI y GLOB lideran crecimiento en LatAm",
+            "summary": "Analistas de BAC recomiendan compra. MA también se beneficia.",
+            "related_assets": ["MELI", "GLOB", "BAC", "MA"],
+            "signal_class": "external_opportunity",
+            "signal_score": 0.65,
+            "effective_score": 0.65,
+            "confidence": 0.7,
+            "event_type": "resultado",
+            "impact": "positivo",
+            "source_count": 2,
+        },
+    ]
+
+    snapshot = _mock_snapshot()
+    analysis = _mock_analysis()
+
+    rec = generate_recommendation(snapshot, analysis, news, 0.10)
+
+    ext = rec.get("external_opportunities", [])
+    obs = rec.get("observed_candidates", [])
+
+    # MELI and GLOB in title → external
+    ext_symbols = {c["symbol"] for c in ext}
+    assert "MELI" in ext_symbols
+    assert "GLOB" in ext_symbols
+
+    # BAC and MA not in title → observed
+    obs_symbols = {c["symbol"] for c in obs}
+    assert "BAC" in obs_symbols
+    assert "MA" in obs_symbols
+
+    # Total unique symbols = 4 (no loss)
+    all_symbols = ext_symbols | obs_symbols
+    assert len(all_symbols) == 4
+
+
+def test_planner_no_regression_with_title_gate():
+    """Planner works correctly when external_opportunities have title-validated symbols."""
+    from unittest.mock import MagicMock, patch
+
+    from app.services.planner import generate_reallocation_plan
+
+    snapshot = {
+        "total_value": 100_000, "cash": 20_000, "currency": "USD",
+        "positions": [{"symbol": "AAPL", "market_value": 80000}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.80}}
+    external_opportunities = [
+        {
+            "symbol": "MELI",
+            "asset_type": "CEDEAR",
+            "asset_type_status": "known_valid",
+            "priority_score": 0.7,
+            "source_types": ["news", "watchlist"],
+            "reason": "MELI reporta resultados récord",
+            "investable": True,
+            "actionable_external": True,
+            "title_mention": True,
+        },
+    ]
+    allowed_assets = {"main_allowed": {"AAPL", "MELI"}, "holdings": {"AAPL"}}
+
+    with patch("app.services.planner.get_settings") as mock_s:
+        s = MagicMock()
+        s.investor_profile_target = "moderate_aggressive"
+        s.investor_profile = "moderado"
+        s.max_movement_per_cycle = 0.10
+        mock_s.return_value = s
+
+        plan = generate_reallocation_plan(
+            snapshot=snapshot, analysis=analysis,
+            external_opportunities=external_opportunities,
+            allowed_assets=allowed_assets,
+        )
+
+    assert plan["planner_status"] in ("success", "proposed")
+    buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
+    assert "MELI" in buy_symbols
