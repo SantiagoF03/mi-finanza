@@ -577,8 +577,36 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     # Everything else (catalog-only, actionable-but-not-investable) → observed_candidates.
     rec["external_opportunities"] = [c for c in all_candidates if c.get("actionable_external") and c.get("investable")]
     observed_from_candidates = [c for c in all_candidates if not (c.get("actionable_external") and c.get("investable"))]
-    # Merge engine-observed + candidate-observed, sort by effective_score so top_observed is useful
-    merged_observed = rec.get("observed_candidates", []) + observed_from_candidates
+    # Merge engine-observed + candidate-observed, deduplicate by symbol.
+    # Policy: keep the entry with the best effective_score per symbol,
+    # enrich the winner with metadata fields from the loser(s).
+    _ENRICH_KEYS = (
+        "asset_type_status", "asset_type", "source_types", "investable",
+        "actionable_external", "priority_score", "tracking_status",
+        "actionable_reason", "in_main_allowed", "asset_type_source",
+    )
+    raw_observed = rec.get("observed_candidates", []) + observed_from_candidates
+    seen_observed: dict[str, dict] = {}
+    for item in raw_observed:
+        sym = item.get("symbol")
+        if not sym:
+            continue
+        if sym not in seen_observed:
+            seen_observed[sym] = item
+        else:
+            existing = seen_observed[sym]
+            new_score = item.get("effective_score") or 0
+            old_score = existing.get("effective_score") or 0
+            if new_score > old_score:
+                winner, loser = item, existing
+                seen_observed[sym] = winner
+            else:
+                winner, loser = existing, item
+            # Enrich winner with non-None fields from loser
+            for key in _ENRICH_KEYS:
+                if winner.get(key) is None and loser.get(key) is not None:
+                    winner[key] = loser[key]
+    merged_observed = list(seen_observed.values())
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
     rec["observed_candidates"] = merged_observed
 
