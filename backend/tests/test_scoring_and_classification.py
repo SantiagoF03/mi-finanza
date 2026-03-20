@@ -3984,3 +3984,280 @@ def test_planner_no_regression_with_title_gate():
     assert plan["planner_status"] in ("success", "proposed")
     buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
     assert "MELI" in buy_symbols
+
+
+# ---------------------------------------------------------------------------
+# Sprint 23: observed_origin separation (signal vs catalog)
+# ---------------------------------------------------------------------------
+
+
+def test_observed_origin_signal_vs_catalog():
+    """observed_origin correctly tags signal-based vs catalog-only items."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # Signal-based: has effective_score and signal_class
+            {"symbol": "MA", "effective_score": 0.6, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "observed_origin": "signal"},
+            {"symbol": "V", "effective_score": 0.55, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "observed_origin": "signal"},
+            # Catalog-only: no signal data
+            {"symbol": "AAPL", "effective_score": None, "signal_class": None,
+             "title_mention": None, "asset_type_status": "known_valid",
+             "source_types": ["catalog", "universe"], "priority_score": 0.35,
+             "observed_origin": "catalog"},
+            {"symbol": "AMZN", "effective_score": None, "signal_class": None,
+             "title_mention": None, "asset_type_status": "known_valid",
+             "source_types": ["catalog"], "priority_score": 0.3,
+             "observed_origin": "catalog"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    # Total observed_count still correct
+    assert cands["observed_count"] == 4
+
+    # New split counts
+    assert cands["observed_with_signal_count"] == 2
+    assert cands["observed_catalog_count"] == 2
+
+    # top_observed: signal items rank first (observed_origin="signal" boosts)
+    top_obs = cands["top_observed"]
+    assert top_obs[0]["symbol"] in ("MA", "V")
+    assert top_obs[0]["observed_origin"] == "signal"
+
+    # top_observed_signals: only signal items
+    top_sig = cands["top_observed_signals"]
+    assert len(top_sig) == 2
+    for item in top_sig:
+        assert item["observed_origin"] == "signal"
+
+    # top_observed_catalog: only catalog items
+    top_cat = cands["top_observed_catalog"]
+    assert len(top_cat) == 2
+    for item in top_cat:
+        assert item["observed_origin"] == "catalog"
+
+
+def test_top_observed_prioritizes_signal_over_catalog():
+    """Signal-observed items always rank above catalog-observed in top_observed."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            # Catalog with high priority_score but no signal
+            {"symbol": "MSFT", "effective_score": None, "signal_class": None,
+             "title_mention": None, "asset_type_status": "known_valid",
+             "source_types": ["catalog", "watchlist"], "priority_score": 0.55,
+             "observed_origin": "catalog"},
+            # Signal-based with moderate score
+            {"symbol": "MA", "effective_score": 0.45, "signal_class": "external_opportunity",
+             "title_mention": False, "asset_type_status": "known_valid",
+             "observed_origin": "signal"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top_obs = summary["candidates"]["top_observed"]
+
+    # MA (signal) must rank before MSFT (catalog) despite MSFT having higher priority_score
+    assert top_obs[0]["symbol"] == "MA"
+    assert top_obs[0]["observed_origin"] == "signal"
+    assert top_obs[1]["symbol"] == "MSFT"
+    assert top_obs[1]["observed_origin"] == "catalog"
+
+
+def test_counts_not_broken_by_observed_origin():
+    """observed_count = observed_with_signal_count + observed_catalog_count always."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [
+            {"symbol": "MELI", "investable": True, "actionable_external": True,
+             "effective_score": 0.7, "asset_type_status": "known_valid",
+             "title_mention": True},
+        ],
+        "observed_candidates": [
+            {"symbol": "MA", "effective_score": 0.5, "signal_class": "external_opportunity",
+             "observed_origin": "signal"},
+            {"symbol": "AAPL", "effective_score": None, "signal_class": None,
+             "observed_origin": "catalog"},
+            {"symbol": "AMZN", "effective_score": None, "signal_class": None,
+             "observed_origin": "catalog"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    assert cands["actionable_count"] == 1
+    assert cands["observed_count"] == 3
+    assert cands["observed_with_signal_count"] + cands["observed_catalog_count"] == cands["observed_count"]
+    assert cands["observed_with_signal_count"] == 1
+    assert cands["observed_catalog_count"] == 2
+
+
+def test_external_opportunities_not_affected_by_observed_origin():
+    """observed_origin changes do not alter external_opportunities."""
+    from app.services.orchestrator import _build_decision_summary
+
+    ext_ops = [
+        {"symbol": "MELI", "investable": True, "actionable_external": True,
+         "effective_score": 0.7, "asset_type_status": "known_valid",
+         "title_mention": True},
+    ]
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": ext_ops,
+        "observed_candidates": [
+            {"symbol": "MA", "effective_score": 0.5, "observed_origin": "signal"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    cands = summary["candidates"]
+
+    # external_opportunities unaffected
+    assert cands["actionable_count"] == 1
+    assert cands["top_actionable"][0]["symbol"] == "MELI"
+
+
+def test_planner_no_regression_with_observed_origin():
+    """Planner still works when observed_candidates have observed_origin."""
+    from unittest.mock import MagicMock, patch
+
+    from app.services.planner import generate_reallocation_plan
+
+    snapshot = {
+        "total_value": 100_000, "cash": 20_000, "currency": "USD",
+        "positions": [{"symbol": "AAPL", "market_value": 80000}],
+    }
+    analysis = {"weights_by_asset": {"AAPL": 0.80}}
+    external_opportunities = [
+        {
+            "symbol": "MELI",
+            "asset_type": "CEDEAR",
+            "asset_type_status": "known_valid",
+            "priority_score": 0.7,
+            "source_types": ["news", "watchlist"],
+            "reason": "MELI reporta resultados récord",
+            "investable": True,
+            "actionable_external": True,
+            "title_mention": True,
+            "observed_origin": None,
+        },
+    ]
+    allowed_assets = {"main_allowed": {"AAPL", "MELI"}, "holdings": {"AAPL"}}
+
+    with patch("app.services.planner.get_settings") as mock_s:
+        s = MagicMock()
+        s.investor_profile_target = "moderate_aggressive"
+        s.investor_profile = "moderado"
+        s.max_movement_per_cycle = 0.10
+        mock_s.return_value = s
+
+        plan = generate_reallocation_plan(
+            snapshot=snapshot, analysis=analysis,
+            external_opportunities=external_opportunities,
+            allowed_assets=allowed_assets,
+        )
+
+    assert plan["planner_status"] in ("success", "proposed")
+    buy_symbols = {b["symbol"] for b in plan["buys_proposed"]}
+    assert "MELI" in buy_symbols
+
+
+def test_unchanged_not_affected_by_observed_origin():
+    """detect_unchanged still works with observed_origin present."""
+    from app.recommendations.unchanged import detect_unchanged
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "Cartera estable.",
+        "risks": "Riesgo moderado.",
+        "executive_summary": "test",
+        "actions": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            {"symbol": "MA", "effective_score": 0.5, "observed_origin": "signal"},
+            {"symbol": "AAPL", "effective_score": None, "observed_origin": "catalog"},
+        ],
+        "_news_items": [],
+    }
+
+    analysis = {"alerts": [], "weights_by_asset": {}}
+
+    # No previous rec → unchanged=False
+    unchanged, reason = detect_unchanged(rec, None, analysis)
+    assert unchanged is False
+
+
+def test_observed_origin_in_top_n_output():
+    """observed_origin field appears in _top_n output items."""
+    from app.services.orchestrator import _build_decision_summary
+
+    rec = {
+        "action": "mantener",
+        "suggested_pct": 0,
+        "confidence": 0.5,
+        "rationale": "test",
+        "risks": "test",
+        "executive_summary": "test",
+        "actions": [],
+        "rationale_reasons": [],
+        "external_opportunities": [],
+        "observed_candidates": [
+            {"symbol": "MA", "effective_score": 0.5, "signal_class": "external_opportunity",
+             "observed_origin": "signal"},
+        ],
+        "suppressed_candidates": [],
+    }
+
+    summary = _build_decision_summary(rec, [], {}, {}, {}, False, "")
+    top_obs = summary["candidates"]["top_observed"]
+    assert len(top_obs) == 1
+    assert top_obs[0]["observed_origin"] == "signal"
