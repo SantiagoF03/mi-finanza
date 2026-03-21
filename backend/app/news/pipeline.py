@@ -119,7 +119,11 @@ class RssNewsProvider(NewsProvider):
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         feed_stats: list[dict] = []
 
-        with httpx.Client(timeout=self.timeout_seconds) as client:
+        with httpx.Client(
+            timeout=self.timeout_seconds,
+            follow_redirects=True,
+            headers={"User-Agent": "MiFinanza/1.0 (RSS Reader)"},
+        ) as client:
             for url in self.urls:
                 try:
                     resp = client.get(url)

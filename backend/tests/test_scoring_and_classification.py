@@ -6111,12 +6111,12 @@ def test_no_regression_deduplicate():
     assert len(result) == 2
 
 
-def test_default_rss_urls_include_yahoo_finance():
-    """Default RSS URLs include Yahoo Finance company-specific feed."""
+def test_default_rss_urls_include_cnbc():
+    """Default RSS URLs include CNBC business feed (replaced deprecated Yahoo)."""
     from app.core.config import Settings
     settings = Settings()
     urls = settings.news_rss_urls
-    assert any("yahoo" in u.lower() for u in urls)
+    assert any("cnbc" in u.lower() for u in urls)
 
 
 def test_default_rss_urls_include_multiple_feeds():

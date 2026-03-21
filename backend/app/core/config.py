@@ -21,11 +21,11 @@ class Settings(BaseSettings):
     news_provider: str = "mock"  # mock | rss
     news_rss_urls: List[str] = Field(
         default_factory=lambda: [
-            # Company/business specific
-            "https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,V,MA,MELI,JPM,BA,NFLX,DIS,KO,PFE,XOM&region=US&lang=en-US",
+            # CNBC business news (company-specific, earnings, deals)
+            "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10001147",
             # Investing.com stock market news (more company-focused than news_25)
             "https://www.investing.com/rss/news_301.rss",
-            # MarketWatch top stories
+            # MarketWatch top stories (requires follow_redirects=True in httpx)
             "https://feeds.marketwatch.com/marketwatch/topstories/",
             # Investing.com general market (kept as fallback)
             "https://www.investing.com/rss/news_25.rss",
