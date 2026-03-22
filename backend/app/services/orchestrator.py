@@ -381,6 +381,7 @@ def _build_decision_summary(
 
     # Split observed by value tier for operational clarity
     obs_high = [i for i in obs_cands if i.get("observed_value_tier") == "high"]
+    obs_medium = [i for i in obs_cands if i.get("observed_value_tier") == "medium"]
     obs_low = [i for i in obs_cands if i.get("observed_value_tier") == "low"]
 
     promoted_from_observed = [i for i in ext_ops if i.get("promoted_from_observed")]
@@ -394,11 +395,13 @@ def _build_decision_summary(
         "observed_weak_signal_count": len(obs_weak),
         "observed_catalog_count": len(obs_catalog),
         "observed_high_value_count": len(obs_high),
+        "observed_medium_value_count": len(obs_medium),
         "observed_low_value_count": len(obs_low),
         "suppressed_count": len(sup_cands),
         "top_actionable": _top_n(ext_ops, sort_key=_actionable_key),
         "top_observed": _top_n(obs_cands, sort_key=_observed_key),
         "top_observed_signals": _top_n(obs_strong, sort_key=_observed_key),
+        "top_observed_medium": _top_n(obs_medium, sort_key=_observed_key),
         "top_observed_weak": _top_n(obs_weak, sort_key=_observed_key),
         "top_observed_catalog": _top_n(obs_catalog, sort_key=_observed_key),
         "top_suppressed": _top_n(sup_cands),
@@ -680,20 +683,23 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         else:
             item["causal_link_strength"] = None
         # observed_value_tier: actionable summary of how useful this observed item is.
-        # "high" = real instrument with a meaningful signal (worth human attention)
-        # "low"  = has a signal but weak instrument/causal (noise, not worth acting on)
+        # "high"    = known instrument + strong causal link (real news about this company)
+        # "medium"  = known instrument + weak causal but investable (contextual, not noise)
+        # "low"     = weak instrument OR (known but weak causal + not investable)
         # "catalog" = pure inventory, no news signal at all
         if not has_signal:
             item["observed_value_tier"] = "catalog"
         elif (
             item.get("signal_quality") == "strong"
-            and (
-                item.get("causal_link_strength") == "strong"
-                or item.get("investable") is True
-                or (item.get("effective_score") or 0) >= 0.4
-            )
+            and item.get("causal_link_strength") == "strong"
         ):
             item["observed_value_tier"] = "high"
+        elif (
+            item.get("signal_quality") == "strong"
+            and item.get("causal_link_strength") == "weak"
+            and item.get("investable") is True
+        ):
+            item["observed_value_tier"] = "medium"
         else:
             item["observed_value_tier"] = "low"
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
