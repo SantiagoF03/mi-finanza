@@ -5994,23 +5994,30 @@ def test_rss_provider_prioritizes_company_specific():
     """RssNewsProvider sorts company_specific items before macro_generic."""
     from unittest.mock import patch, MagicMock
     from app.news.pipeline import RssNewsProvider
+    from datetime import datetime, timedelta, timezone
 
-    xml = """<?xml version="1.0"?>
+    # Use relative dates to avoid recency filter expiration
+    now = datetime.now(timezone.utc)
+    d1 = (now - timedelta(hours=2)).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    d2 = (now - timedelta(hours=4)).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    d3 = (now - timedelta(hours=3)).strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+    xml = f"""<?xml version="1.0"?>
     <rss><channel>
         <item>
             <title>Wall Street ends mixed on economic data</title>
             <description>Indexes close flat</description>
-            <pubDate>Thu, 20 Mar 2026 12:00:00 GMT</pubDate>
+            <pubDate>{d1}</pubDate>
         </item>
         <item>
             <title>Visa reports record quarterly earnings</title>
             <description>Beats estimates</description>
-            <pubDate>Thu, 20 Mar 2026 10:00:00 GMT</pubDate>
+            <pubDate>{d2}</pubDate>
         </item>
         <item>
             <title>Markets close higher on trade hopes</title>
             <description>S&amp;P 500 up</description>
-            <pubDate>Thu, 20 Mar 2026 11:00:00 GMT</pubDate>
+            <pubDate>{d3}</pubDate>
         </item>
     </channel></rss>"""
 
@@ -6042,18 +6049,23 @@ def test_rss_provider_stats_include_relevance_counts():
     """last_fetch_stats includes company_specific_count and macro_generic_count."""
     from unittest.mock import patch, MagicMock
     from app.news.pipeline import RssNewsProvider
+    from datetime import datetime, timedelta, timezone
 
-    xml = """<?xml version="1.0"?>
+    now = datetime.now(timezone.utc)
+    d1 = (now - timedelta(hours=2)).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    d2 = (now - timedelta(hours=3)).strftime("%a, %d %b %Y %H:%M:%S +0000")
+
+    xml = f"""<?xml version="1.0"?>
     <rss><channel>
         <item>
             <title>Apple reports Q4 earnings</title>
             <description>Strong results</description>
-            <pubDate>Thu, 20 Mar 2026 10:00:00 GMT</pubDate>
+            <pubDate>{d1}</pubDate>
         </item>
         <item>
             <title>Markets fall on global uncertainty</title>
             <description>Broad selloff</description>
-            <pubDate>Thu, 20 Mar 2026 09:00:00 GMT</pubDate>
+            <pubDate>{d2}</pubDate>
         </item>
     </channel></rss>"""
 
