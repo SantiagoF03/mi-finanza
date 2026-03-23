@@ -352,16 +352,21 @@ def _build_decision_summary(
              "observed_origin": i.get("observed_origin"),
              "signal_quality": i.get("signal_quality"),
              "causal_link_strength": i.get("causal_link_strength"),
-             "observed_value_tier": i.get("observed_value_tier")}
+             "observed_value_tier": i.get("observed_value_tier"),
+             "opportunity_quality": i.get("opportunity_quality"),
+             "opportunity_rank_reason": i.get("opportunity_rank_reason")}
             for i in source[:n]
         ]
 
     # Sort keys for quality ranking:
-    # top_actionable: investable first, then by effective_score
+    # top_actionable: causal strength → title mention → effective_score → source diversity → priority
     # top_observed: known_valid first, then by effective_score/priority_score
     _actionable_key = lambda x: (
         1 if x.get("investable") else 0,
+        1 if x.get("causal_link_strength") == "strong" else 0,
+        1 if x.get("title_mention") else 0,
         x.get("effective_score") or 0,
+        len(x.get("source_types") or []),
         x.get("priority_score") or 0,
     )
     _observed_key = lambda x: (
@@ -726,6 +731,33 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             remaining_observed.append(item)
     rec["external_opportunities"] = rec.get("external_opportunities", []) + promoted
     rec["observed_candidates"] = remaining_observed
+
+    # --- Opportunity quality & rank reason enrichment ---
+    # Tag each external_opportunity with explainability fields BEFORE enforce_rules
+    # so they survive into the final output and decision_summary.
+    for opp in rec.get("external_opportunities", []):
+        # opportunity_quality: "top" if strong causal evidence, "standard" otherwise
+        has_strong_causal = opp.get("causal_link_strength") == "strong"
+        has_title = opp.get("title_mention") is True
+        opp["opportunity_quality"] = "top" if (has_strong_causal and has_title) else "standard"
+
+        # opportunity_rank_reason: human-readable explanation of ranking signals
+        reasons = []
+        if has_title:
+            reasons.append("ticker en título")
+        if has_strong_causal:
+            reasons.append("causalidad fuerte")
+        elif opp.get("causal_link_strength") == "weak":
+            reasons.append("causalidad débil")
+        score = opp.get("effective_score")
+        if score is not None:
+            reasons.append(f"score {score:.2f}")
+        src = opp.get("source_types") or []
+        if len(src) >= 2:
+            reasons.append(f"{len(src)} fuentes")
+        if opp.get("promoted_from_observed"):
+            reasons.append("promovido desde observed")
+        opp["opportunity_rank_reason"] = "; ".join(reasons) if reasons else "sin señales destacadas"
 
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
 
