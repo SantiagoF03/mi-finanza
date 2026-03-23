@@ -392,7 +392,8 @@ def _build_decision_summary(
              "observed_value_tier": i.get("observed_value_tier"),
              "opportunity_quality": i.get("opportunity_quality"),
              "opportunity_rank_reason": i.get("opportunity_rank_reason"),
-             "market_confirmation_reason": i.get("market_confirmation_reason")}
+             "market_confirmation_reason": i.get("market_confirmation_reason"),
+             "operational_status": i.get("operational_status")}
             for i in source[:n]
         ]
 
@@ -427,6 +428,12 @@ def _build_decision_summary(
     obs_medium = [i for i in obs_cands if i.get("observed_value_tier") == "medium"]
     obs_low = [i for i in obs_cands if i.get("observed_value_tier") == "low"]
 
+    # Relevant non-investable: strong signals the user can't operate yet
+    obs_relevant_non_investable = [
+        i for i in obs_cands
+        if i.get("operational_status") == "relevant_not_investable"
+    ]
+
     promoted_from_observed = [i for i in ext_ops if i.get("promoted_from_observed")]
 
     candidates = {
@@ -440,8 +447,10 @@ def _build_decision_summary(
         "observed_high_value_count": len(obs_high),
         "observed_medium_value_count": len(obs_medium),
         "observed_low_value_count": len(obs_low),
+        "relevant_non_investable_count": len(obs_relevant_non_investable),
         "suppressed_count": len(sup_cands),
         "top_actionable": _top_n(ext_ops, sort_key=_actionable_key),
+        "top_relevant_non_investable": _top_n(obs_relevant_non_investable, sort_key=_observed_key),
         "top_observed": _top_n(obs_cands, sort_key=_observed_key),
         "top_observed_signals": _top_n(obs_strong, sort_key=_observed_key),
         "top_observed_medium": _top_n(obs_medium, sort_key=_observed_key),
@@ -745,6 +754,15 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             item["observed_value_tier"] = "medium"
         else:
             item["observed_value_tier"] = "low"
+        # operational_status: honest product-level classification
+        # "relevant_not_investable" = strong signal + strong causal but NOT investable
+        # (real opportunity the user can't operate with current config)
+        if (
+            item.get("signal_quality") == "strong"
+            and item.get("causal_link_strength") == "strong"
+            and item.get("investable") is not True
+        ):
+            item["operational_status"] = "relevant_not_investable"
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
 
     # --- Observed → Actionable promotion ---
@@ -774,6 +792,7 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     # Tag each external_opportunity with explainability fields BEFORE enforce_rules
     # so they survive into the final output and decision_summary.
     for opp in rec.get("external_opportunities", []):
+        opp["operational_status"] = "actionable"
         # opportunity_quality: "top" if strong causal evidence, "standard" otherwise
         has_strong_causal = opp.get("causal_link_strength") == "strong"
         has_title = opp.get("title_mention") is True
