@@ -423,6 +423,17 @@ def _build_decision_summary(
     obs_weak = [i for i in obs_cands if i.get("signal_quality") == "weak"]
     obs_catalog = [i for i in obs_cands if i.get("signal_quality") is None]
 
+    # Split by observed_origin: signal (has news data) vs catalog (pure inventory).
+    # Resilient: if observed_origin not set, infer from effective_score/signal_class.
+    def _is_signal(i):
+        origin = i.get("observed_origin")
+        if origin is not None:
+            return origin == "signal"
+        return i.get("effective_score") is not None or i.get("signal_class") is not None
+
+    obs_signals_real = [i for i in obs_cands if _is_signal(i)]
+    obs_catalog_only = [i for i in obs_cands if not _is_signal(i)]
+
     # Split observed by value tier for operational clarity
     obs_high = [i for i in obs_cands if i.get("observed_value_tier") == "high"]
     obs_medium = [i for i in obs_cands if i.get("observed_value_tier") == "medium"]
@@ -441,6 +452,8 @@ def _build_decision_summary(
         "investable_count": len(investable_items),
         "promoted_from_observed_count": len(promoted_from_observed),
         "observed_count": len(obs_cands),
+        "observed_signal_count": len(obs_signals_real),
+        "observed_catalog_only_count": len(obs_catalog_only),
         "observed_with_signal_count": len(obs_strong),
         "observed_weak_signal_count": len(obs_weak),
         "observed_catalog_count": len(obs_catalog),
@@ -452,10 +465,11 @@ def _build_decision_summary(
         "top_actionable": _top_n(ext_ops, sort_key=_actionable_key),
         "top_relevant_non_investable": _top_n(obs_relevant_non_investable, sort_key=_observed_key),
         "top_observed": _top_n(obs_cands, sort_key=_observed_key),
+        "top_observed_signals_real": _top_n(obs_signals_real, sort_key=_observed_key),
         "top_observed_signals": _top_n(obs_strong, sort_key=_observed_key),
         "top_observed_medium": _top_n(obs_medium, sort_key=_observed_key),
         "top_observed_weak": _top_n(obs_weak, sort_key=_observed_key),
-        "top_observed_catalog": _top_n(obs_catalog, sort_key=_observed_key),
+        "top_observed_catalog": _top_n(obs_catalog_only, sort_key=_observed_key),
         "top_suppressed": _top_n(sup_cands),
     }
 
