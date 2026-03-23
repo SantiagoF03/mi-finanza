@@ -453,8 +453,10 @@ def _build_decision_summary(
         "promoted_from_observed_count": len(promoted_from_observed),
         "observed_count": len(obs_cands),
         "observed_signal_count": len(obs_signals_real),
+        "observed_signal_strong_count": len(obs_strong),
         "observed_catalog_only_count": len(obs_catalog_only),
-        "observed_with_signal_count": len(obs_strong),
+        # Backward-compat aliases (same values, old names consumers may depend on):
+        "observed_with_signal_count": len(obs_strong),   # = observed_signal_strong_count
         "observed_weak_signal_count": len(obs_weak),
         "observed_catalog_count": len(obs_catalog),
         "observed_high_value_count": len(obs_high),
@@ -466,6 +468,8 @@ def _build_decision_summary(
         "top_relevant_non_investable": _top_n(obs_relevant_non_investable, sort_key=_observed_key),
         "top_observed": _top_n(obs_cands, sort_key=_observed_key),
         "top_observed_signals_real": _top_n(obs_signals_real, sort_key=_observed_key),
+        "top_observed_signals_strong": _top_n(obs_strong, sort_key=_observed_key),
+        # Backward-compat alias (same value, old name consumers may depend on):
         "top_observed_signals": _top_n(obs_strong, sort_key=_observed_key),
         "top_observed_medium": _top_n(obs_medium, sort_key=_observed_key),
         "top_observed_weak": _top_n(obs_weak, sort_key=_observed_key),
