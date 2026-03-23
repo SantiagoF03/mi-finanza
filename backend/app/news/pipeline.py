@@ -184,9 +184,46 @@ def extract_market_symbols(text: str) -> list[str]:
     for c in candidates:
         if c in blacklist:
             continue
+        if c in AMBIGUOUS_TICKERS:
+            continue
         if c not in out:
             out.append(c)
     return out
+
+
+# Tickers that are common English words or abbreviations.
+# These produce rampant false positives when matched by regex alone.
+# They are ONLY included in related_assets via held_mentions (portfolio match)
+# with word-boundary matching, never from raw text extraction.
+AMBIGUOUS_TICKERS = frozenset({
+    "ALL",   # Allstate — but "ALL" is an English word
+    "AN",    # AutoNation — but "AN" is extremely common
+    "ARE",   # Alexandria Real Estate — English verb
+    "BAC",   # Bank of America — matches "back", abbreviations
+    "BIG",   # Big Lots — English word
+    "CAT",   # Caterpillar — English word
+    "CAN",   # not a real ticker but common word
+    "DIS",   # Disney — but "DIS" appears in "dis-", "discuss", etc.
+    "ED",    # Consolidated Edison — common name/word
+    "FOR",   # not a real ticker but common word
+    "HD",    # Home Depot — common abbreviation (high definition)
+    "HAS",   # Hasbro — English verb
+    "IT",    # Gartner — English pronoun (also in PSEUDO_TICKER_BLOCKLIST)
+    "LOW",   # Lowe's — English word
+    "MA",    # Mastercard — common abbreviation (Massachusetts, etc.)
+    "MAN",   # ManpowerGroup — English word
+    "MAR",   # Marriott — common word (Spanish month)
+    "NOW",   # ServiceNow — English word
+    "ON",    # ON Semiconductor — English preposition
+    "PG",    # Procter & Gamble — common abbreviation (parental guidance)
+    "RE",    # Everest Group — English prefix
+    "SO",    # Southern Company — English word
+    "SU",    # Suncor — Spanish possessive pronoun
+    "TWO",   # Two Harbors — English number word
+    "V",     # Visa — single letter (only 1 char, won't regex-match, but in held_mentions)
+    "WAS",   # not a real ticker but matched via held_mentions
+    "X",     # US Steel — single letter
+})
 
 
 def classify_news_relevance(title: str, summary: str) -> str:
@@ -239,7 +276,12 @@ def classify_news_event(title: str, summary: str, portfolio_symbols: list[str]) 
 
     raw_text = f"{title} {summary}"
     detected = extract_market_symbols(raw_text)
-    held_mentions = [s for s in portfolio_symbols if s.lower() in text]
+    # Word-boundary matching for portfolio symbols — prevents "V" matching
+    # every text containing the letter "v", or "MA" matching "market".
+    held_mentions = [
+        s for s in portfolio_symbols
+        if re.search(r'\b' + re.escape(s) + r'\b', text, re.IGNORECASE)
+    ]
     related_assets = []
     for s in held_mentions + detected:
         if s not in related_assets:
