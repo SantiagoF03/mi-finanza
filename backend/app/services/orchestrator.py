@@ -50,6 +50,43 @@ def _has_causal_link(item: dict) -> bool:
     return any(name in reason_lower for name in names)
 
 
+def _enrich_market_confirmation(opportunities: list[dict]) -> None:
+    """Enrich market_confirmation for external_opportunities in-place.
+
+    Upgrades "unconfirmed" → "quote_available" when the instrument has real market
+    evidence (in catalog, known_valid, or tracked) but no directional price confirmation.
+    Also adds market_confirmation_reason (human-readable).
+
+    SAFE: effective_score only reacts to "confirmed"/"contradicted";
+    "quote_available" behaves identically to "unconfirmed" in scoring.
+    """
+    for opp in opportunities:
+        conf = opp.get("market_confirmation")
+        in_catalog = "catalog" in (opp.get("source_types") or [])
+        is_known = opp.get("asset_type_status") == "known_valid"
+        is_tracked = opp.get("tracking_status") not in (None, "untracked")
+
+        # Upgrade: real instrument with market presence but no directional signal
+        if conf in ("unconfirmed", None) and is_known and (in_catalog or is_tracked):
+            opp["market_confirmation"] = "quote_available"
+
+        # Build human-readable reason
+        conf_now = opp.get("market_confirmation")
+        if conf_now == "confirmed":
+            opp["market_confirmation_reason"] = "movimiento de precio confirma el evento"
+        elif conf_now == "contradicted":
+            opp["market_confirmation_reason"] = "movimiento de precio contradice el evento"
+        elif conf_now == "quote_available":
+            detail = "cotización disponible en mercado"
+            if in_catalog:
+                detail += "; presente en catálogo IOL"
+            if is_tracked:
+                detail += f"; tracking: {opp.get('tracking_status')}"
+            opp["market_confirmation_reason"] = detail
+        else:
+            opp["market_confirmation_reason"] = "sin datos de mercado disponibles"
+
+
 def _get_broker():
     settings = get_settings()
     if settings.broker_mode == "mock":
@@ -354,7 +391,8 @@ def _build_decision_summary(
              "causal_link_strength": i.get("causal_link_strength"),
              "observed_value_tier": i.get("observed_value_tier"),
              "opportunity_quality": i.get("opportunity_quality"),
-             "opportunity_rank_reason": i.get("opportunity_rank_reason")}
+             "opportunity_rank_reason": i.get("opportunity_rank_reason"),
+             "market_confirmation_reason": i.get("market_confirmation_reason")}
             for i in source[:n]
         ]
 
@@ -758,6 +796,9 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         if opp.get("promoted_from_observed"):
             reasons.append("promovido desde observed")
         opp["opportunity_rank_reason"] = "; ".join(reasons) if reasons else "sin señales destacadas"
+
+    # --- Market confirmation enrichment for external_opportunities ---
+    _enrich_market_confirmation(rec.get("external_opportunities", []))
 
     rec = enforce_rules(rec, settings.whitelist_assets, settings.max_movement_per_cycle, holdings=allowed_assets["holdings"])
 
