@@ -50,6 +50,115 @@ def _has_causal_link(item: dict) -> bool:
     return any(name in reason_lower for name in names)
 
 
+def _annotate_observed_candidate(item: dict) -> dict:
+    """Enrich an observed candidate with explainability fields.
+
+    This keeps the existing JSON contract stable while making the signal-vs-noise
+    distinction explicit before ranking/promotion.
+    """
+    has_signal = item.get("effective_score") is not None or item.get("signal_class") is not None
+    item["observed_origin"] = "signal" if has_signal else "catalog"
+
+    if has_signal:
+        is_known = (
+            item.get("asset_type_status") == "known_valid"
+            or item.get("in_main_allowed") is True
+            or item.get("tracking_status") not in (None, "untracked")
+        )
+        item["signal_quality"] = "strong" if is_known else "weak"
+        item["causal_link_strength"] = "strong" if _has_causal_link(item) else "weak"
+    else:
+        item["signal_quality"] = None
+        item["causal_link_strength"] = None
+
+    if not has_signal:
+        item["observed_value_tier"] = "catalog"
+    elif (
+        item.get("signal_quality") == "strong"
+        and item.get("causal_link_strength") == "strong"
+    ):
+        item["observed_value_tier"] = "high"
+    elif (
+        item.get("signal_quality") == "strong"
+        and item.get("causal_link_strength") == "weak"
+        and item.get("investable") is True
+    ):
+        item["observed_value_tier"] = "medium"
+    else:
+        item["observed_value_tier"] = "low"
+
+    if (
+        item.get("signal_quality") == "strong"
+        and item.get("causal_link_strength") == "strong"
+        and item.get("investable") is not True
+    ):
+        item["operational_status"] = "relevant_not_investable"
+
+    return item
+
+
+def _is_defensible_observed_candidate(item: dict) -> bool:
+    """Filter weak observed signals that are hard to defend in product output.
+
+    Keep all catalog-only observations for backward-compatible inventory reporting.
+    For signal-backed observed items, strong causal evidence always survives.
+    Weak-causal observed items survive only if they still look like a real tracked
+    instrument with a meaningful score. This removes marginal foreign/index-style
+    symbols while preserving legitimate opportunities that just missed promotion.
+    """
+    if item.get("observed_origin") != "signal":
+        return True
+
+    if not item.get("symbol"):
+        return False
+
+    if item.get("causal_link_strength") == "strong" or item.get("title_mention") is True:
+        return True
+
+    if item.get("signal_quality") != "strong":
+        return False
+
+    effective_score = float(item.get("effective_score") or 0)
+    return effective_score >= 0.55
+
+
+def _get_observed_suppression_reason(item: dict) -> str | None:
+    """Return an explicit discard reason for weak observed signals."""
+    if item.get("observed_origin") != "signal":
+        return None
+
+    if not item.get("symbol"):
+        return "weak_signal_no_causal_support"
+
+    if item.get("causal_link_strength") == "strong" or item.get("title_mention") is True:
+        return None
+
+    if item.get("signal_quality") != "strong":
+        return "weak_signal_not_tracked"
+
+    effective_score = float(item.get("effective_score") or 0)
+    if effective_score < 0.55:
+        return "weak_signal_low_score"
+
+    return None
+
+
+def _split_observed_candidates_by_defensibility(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split observed candidates into kept vs suppressed by defensibility filter."""
+    kept = []
+    suppressed = []
+    for item in items:
+        suppression_reason = _get_observed_suppression_reason(item)
+        if suppression_reason:
+            suppressed_item = dict(item)
+            suppressed_item["suppression_reason"] = suppression_reason
+            suppressed_item["suppressed_by_defensibility_filter"] = True
+            suppressed.append(suppressed_item)
+        else:
+            kept.append(item)
+    return kept, suppressed
+
+
 def _enrich_market_confirmation(opportunities: list[dict]) -> None:
     """Enrich market_confirmation for external_opportunities in-place.
 
@@ -390,6 +499,8 @@ def _build_decision_summary(
              "signal_quality": i.get("signal_quality"),
              "causal_link_strength": i.get("causal_link_strength"),
              "observed_value_tier": i.get("observed_value_tier"),
+             "suppression_reason": i.get("suppression_reason"),
+             "suppressed_by_defensibility_filter": i.get("suppressed_by_defensibility_filter"),
              "opportunity_quality": i.get("opportunity_quality"),
              "opportunity_rank_reason": i.get("opportunity_rank_reason"),
              "market_confirmation_reason": i.get("market_confirmation_reason"),
@@ -481,7 +592,7 @@ def _build_decision_summary(
     refinement = fresh_quote_meta.get("refinement", {})
     promotion_events = {
         "promoted_count": scoring_summary.get("promoted_count", 0),
-        "suppressed_count": scoring_summary.get("suppressed_count", 0),
+        "suppressed_count": len(sup_cands),
         "fresh_promoted": refinement.get("promotions", 0),
         "fresh_demoted": refinement.get("demotions", 0),
     }
@@ -728,60 +839,18 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
                 if winner.get(key) is None and loser.get(key) is not None:
                     winner[key] = loser[key]
     merged_observed = list(seen_observed.values())
-    # Tag each observed with its origin for explainability:
-    # "signal" = has a real news signal (effective_score present)
-    # "catalog" = pure catalog/universe/watchlist discovery (no signal data)
     for item in merged_observed:
-        has_signal = item.get("effective_score") is not None or item.get("signal_class") is not None
-        item["observed_origin"] = "signal" if has_signal else "catalog"
-        # signal_quality: "strong" if the symbol is a known financial instrument,
-        # "weak" if it has a signal but is unrecognized (GPU, AWS, etc.)
-        if has_signal:
-            is_known = (
-                item.get("asset_type_status") == "known_valid"
-                or item.get("in_main_allowed") is True
-                or item.get("tracking_status") not in (None, "untracked")
-            )
-            item["signal_quality"] = "strong" if is_known else "weak"
-        else:
-            item["signal_quality"] = None
-        # causal_link_strength: "strong" if news appears causally related to this symbol,
-        # "weak" if the symbol has a signal but the causal link is vague/lateral.
-        # Heuristics: (1) ticker in headline, (2) company name in headline.
-        if has_signal:
-            item["causal_link_strength"] = "strong" if _has_causal_link(item) else "weak"
-        else:
-            item["causal_link_strength"] = None
-        # observed_value_tier: actionable summary of how useful this observed item is.
-        # "high"    = known instrument + strong causal link (real news about this company)
-        # "medium"  = known instrument + weak causal but investable (contextual, not noise)
-        # "low"     = weak instrument OR (known but weak causal + not investable)
-        # "catalog" = pure inventory, no news signal at all
-        if not has_signal:
-            item["observed_value_tier"] = "catalog"
-        elif (
-            item.get("signal_quality") == "strong"
-            and item.get("causal_link_strength") == "strong"
-        ):
-            item["observed_value_tier"] = "high"
-        elif (
-            item.get("signal_quality") == "strong"
-            and item.get("causal_link_strength") == "weak"
-            and item.get("investable") is True
-        ):
-            item["observed_value_tier"] = "medium"
-        else:
-            item["observed_value_tier"] = "low"
-        # operational_status: honest product-level classification
-        # "relevant_not_investable" = strong signal + strong causal but NOT investable
-        # (real opportunity the user can't operate with current config)
-        if (
-            item.get("signal_quality") == "strong"
-            and item.get("causal_link_strength") == "strong"
-            and item.get("investable") is not True
-        ):
-            item["operational_status"] = "relevant_not_investable"
+        _annotate_observed_candidate(item)
+    merged_observed, suppressed_by_defensibility = _split_observed_candidates_by_defensibility(merged_observed)
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
+
+    if suppressed_by_defensibility:
+        rec["suppressed_candidates"] = rec.get("suppressed_candidates", []) + suppressed_by_defensibility
+        scoring_summary["suppressed_count"] = scoring_summary.get("suppressed_count", 0) + len(suppressed_by_defensibility)
+        scoring_summary["observed_filter_suppressed_count"] = len(suppressed_by_defensibility)
+    else:
+        rec["suppressed_candidates"] = rec.get("suppressed_candidates", [])
+        scoring_summary["observed_filter_suppressed_count"] = 0
 
     # --- Observed → Actionable promotion ---
     # Promote observed candidates that meet ALL quality gates to external_opportunities.
