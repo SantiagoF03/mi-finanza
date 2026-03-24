@@ -8,8 +8,11 @@ Goal:
 
 from app.services.orchestrator import (
     _annotate_observed_candidate,
+    _build_decision_summary,
+    _get_observed_suppression_reason,
     _has_causal_link,
     _is_defensible_observed_candidate,
+    _split_observed_candidates_by_defensibility,
 )
 
 
@@ -79,6 +82,29 @@ def test_generic_foreign_index_signal_is_filtered_out():
     assert item["signal_quality"] == "weak"
     assert item["causal_link_strength"] == "weak"
     assert _is_defensible_observed_candidate(item) is False
+    assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+
+def test_filtered_weak_signal_appears_in_suppressed_bucket():
+    """Discarded weak observed signals should be traceable in suppressed_candidates."""
+    item = _observed_item(
+        "MOEX",
+        reason="Moscow Exchange index edges higher as global investors assess rates",
+        effective_score=0.61,
+        title_mention=False,
+        asset_type_status="unknown",
+        investable=False,
+        tracking_status="untracked",
+    )
+
+    _annotate_observed_candidate(item)
+    kept, suppressed = _split_observed_candidates_by_defensibility([item])
+
+    assert kept == []
+    assert len(suppressed) == 1
+    assert suppressed[0]["symbol"] == "MOEX"
+    assert suppressed[0]["suppression_reason"] == "weak_signal_not_tracked"
+    assert suppressed[0]["suppressed_by_defensibility_filter"] is True
 
 
 def test_known_tracked_weak_signal_can_still_survive_if_score_is_meaningful():
@@ -98,6 +124,27 @@ def test_known_tracked_weak_signal_can_still_survive_if_score_is_meaningful():
     assert item["signal_quality"] == "strong"
     assert item["causal_link_strength"] == "weak"
     assert _is_defensible_observed_candidate(item) is True
+    assert _get_observed_suppression_reason(item) is None
+
+
+def test_low_score_weak_signal_gets_explicit_reason():
+    """Tracked weak signals below threshold should be suppressed as low score."""
+    item = _observed_item(
+        "MA",
+        reason="Payments stocks rise after stronger consumer spending data",
+        effective_score=0.54,
+        title_mention=False,
+        asset_type_status="known_valid",
+        investable=True,
+        tracking_status="watchlist",
+    )
+
+    _annotate_observed_candidate(item)
+
+    assert item["signal_quality"] == "strong"
+    assert item["causal_link_strength"] == "weak"
+    assert _is_defensible_observed_candidate(item) is False
+    assert _get_observed_suppression_reason(item) == "weak_signal_low_score"
 
 
 def test_observed_promotion_gate_not_regressed():
@@ -123,6 +170,65 @@ def test_observed_promotion_gate_not_regressed():
         and item["investable"] is True
     )
     assert should_promote is True
+
+
+def test_defensible_signal_does_not_appear_in_suppressed_bucket():
+    """Strong causal observed items should not leak into suppressed_candidates."""
+    item = _observed_item(
+        "MELI",
+        reason="MercadoLibre raises guidance after strong quarter",
+        effective_score=0.65,
+        title_mention=False,
+        asset_type_status="known_valid",
+        investable=True,
+        tracking_status="watchlist",
+    )
+
+    _annotate_observed_candidate(item)
+    kept, suppressed = _split_observed_candidates_by_defensibility([item])
+
+    assert len(kept) == 1
+    assert suppressed == []
+
+
+def test_decision_summary_reflects_defensibility_suppression():
+    """decision_summary top_suppressed should expose the filter discard reason."""
+    suppressed_item = {
+        "symbol": "MOEX",
+        "reason": "Moscow Exchange index edges higher as global investors assess rates",
+        "effective_score": 0.61,
+        "signal_class": "observed_candidate",
+        "signal_quality": "weak",
+        "causal_link_strength": "weak",
+        "observed_origin": "signal",
+        "observed_value_tier": "low",
+        "suppression_reason": "weak_signal_not_tracked",
+        "suppressed_by_defensibility_filter": True,
+    }
+
+    summary = _build_decision_summary(
+        rec={
+            "action": "mantener",
+            "actions": [],
+            "rationale_reasons": [],
+            "rationale": "Test",
+            "external_opportunities": [],
+            "observed_candidates": [],
+            "suppressed_candidates": [suppressed_item],
+        },
+        scored_news=[],
+        scoring_summary={"suppressed_count": 1},
+        llm_input_meta={},
+        fresh_quote_meta={},
+        unchanged=False,
+        unchanged_reason="",
+    )
+
+    candidates = summary["candidates"]
+    assert candidates["suppressed_count"] == 1
+    assert candidates["top_suppressed"][0]["symbol"] == "MOEX"
+    assert candidates["top_suppressed"][0]["suppression_reason"] == "weak_signal_not_tracked"
+    assert candidates["top_suppressed"][0]["suppressed_by_defensibility_filter"] is True
 
 
 def test_ambiguous_ticker_mapping_fix_not_regressed():
