@@ -50,44 +50,127 @@ def _has_causal_link(item: dict) -> bool:
     return any(name in reason_lower for name in names)
 
 
-def _get_observed_suppression_reason(item: dict, score_threshold: float = 0.4) -> str | None:
-    """Return suppression reason if observed signal is weak and non-defensible.
+def _annotate_observed_candidate(item: dict) -> None:
+    """Enrich an observed candidate with signal_quality, causal_link_strength,
+    observed_value_tier, observed_origin, and operational_status — in-place.
 
-    Returns "weak_non_defensible" when ALL of:
-    - observed_origin == "signal" (has news data, not pure catalog)
-    - causal_link_strength == "weak" (no title/company name match)
-    - signal_quality == "weak" (unrecognized instrument)
-    - effective_score < score_threshold (low confidence)
-
-    Returns None if the item should NOT be suppressed.
+    This is the single annotation point for all observed items before
+    defensibility filtering and promotion gates.
     """
-    if (
-        item.get("observed_origin") == "signal"
-        and item.get("causal_link_strength") == "weak"
-        and item.get("signal_quality") == "weak"
-        and (item.get("effective_score") or 0) < score_threshold
+    has_signal = item.get("effective_score") is not None or item.get("signal_class") is not None
+
+    # observed_origin: "signal" (has news data) vs "catalog" (pure inventory)
+    item["observed_origin"] = "signal" if has_signal else "catalog"
+
+    # signal_quality: "strong" if recognized instrument, "weak" if unrecognized, None if catalog
+    if has_signal:
+        is_known = (
+            item.get("asset_type_status") == "known_valid"
+            or item.get("in_main_allowed") is True
+            or item.get("tracking_status") not in (None, "untracked")
+        )
+        item["signal_quality"] = "strong" if is_known else "weak"
+    else:
+        item["signal_quality"] = None
+
+    # causal_link_strength: "strong" if title/company match, "weak" otherwise
+    if has_signal:
+        item["causal_link_strength"] = "strong" if _has_causal_link(item) else "weak"
+    else:
+        item["causal_link_strength"] = None
+
+    # observed_value_tier
+    if not has_signal:
+        item["observed_value_tier"] = "catalog"
+    elif (
+        item.get("signal_quality") == "strong"
+        and item.get("causal_link_strength") == "strong"
     ):
-        return "weak_non_defensible"
-    return None
+        item["observed_value_tier"] = "high"
+    elif (
+        item.get("signal_quality") == "strong"
+        and item.get("causal_link_strength") == "weak"
+        and item.get("investable") is True
+    ):
+        item["observed_value_tier"] = "medium"
+    else:
+        item["observed_value_tier"] = "low"
+
+    # operational_status: "relevant_not_investable" for strong+causal but not investable
+    if (
+        item.get("signal_quality") == "strong"
+        and item.get("causal_link_strength") == "strong"
+        and item.get("investable") is not True
+    ):
+        item["operational_status"] = "relevant_not_investable"
 
 
-def _split_observed_by_defensibility(
-    observed: list[dict], score_threshold: float = 0.4,
+# --- Defensibility scoring thresholds ---
+_WEAK_SCORE_THRESHOLD = 0.55  # weak-causal strong-quality items below this are not defensible
+
+def _is_defensible_observed_candidate(item: dict) -> bool:
+    """Return True if an observed signal is worth keeping (not noise).
+
+    Defensible when ANY of:
+    - catalog item (no signal to judge)
+    - signal_quality == "strong" AND causal_link_strength == "strong"
+    - signal_quality == "strong" AND causal_link_strength == "weak" AND effective_score >= threshold
+    """
+    if item.get("observed_origin") != "signal":
+        return True  # catalog → always keep
+    if item.get("signal_quality") == "strong" and item.get("causal_link_strength") == "strong":
+        return True
+    if (
+        item.get("signal_quality") == "strong"
+        and item.get("causal_link_strength") == "weak"
+        and (item.get("effective_score") or 0) >= _WEAK_SCORE_THRESHOLD
+    ):
+        return True
+    return False
+
+
+def _get_observed_suppression_reason(item: dict) -> str | None:
+    """Return suppression reason for a non-defensible observed signal.
+
+    Returns:
+    - "weak_signal_not_tracked": weak instrument + weak causal (MOEX-like noise)
+    - "weak_signal_low_score": known instrument + weak causal + low score
+    - None: item is defensible, should not be suppressed
+    """
+    if item.get("observed_origin") != "signal":
+        return None  # catalog → never suppress
+
+    if _is_defensible_observed_candidate(item):
+        return None
+
+    # Not defensible — determine specific reason
+    if item.get("signal_quality") == "weak":
+        return "weak_signal_not_tracked"
+    return "weak_signal_low_score"
+
+
+def _split_observed_candidates_by_defensibility(
+    observed: list[dict],
 ) -> tuple[list[dict], list[dict]]:
     """Split observed candidates into (defensible, suppressed).
 
-    Suppressed items get a "suppression_reason" field for traceability.
+    Suppressed items get suppression_reason and suppressed_by_defensibility_filter fields.
     """
     defensible = []
     suppressed = []
     for item in observed:
-        reason = _get_observed_suppression_reason(item, score_threshold)
+        reason = _get_observed_suppression_reason(item)
         if reason:
             item["suppression_reason"] = reason
+            item["suppressed_by_defensibility_filter"] = True
             suppressed.append(item)
         else:
             defensible.append(item)
     return defensible, suppressed
+
+
+# Keep old name as alias for backward compatibility in tests
+_split_observed_by_defensibility = _split_observed_candidates_by_defensibility
 
 
 def _enrich_market_confirmation(opportunities: list[dict]) -> None:
@@ -435,8 +518,7 @@ def _build_decision_summary(
              "opportunity_quality": i.get("opportunity_quality"),
              "opportunity_rank_reason": i.get("opportunity_rank_reason"),
              "market_confirmation_reason": i.get("market_confirmation_reason"),
-             "operational_status": i.get("operational_status"),
-             "suppression_reason": i.get("suppression_reason")}
+             "operational_status": i.get("operational_status")}
             for i in source[:n]
         ]
 
@@ -771,16 +853,19 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
                 if winner.get(key) is None and loser.get(key) is not None:
                     winner[key] = loser[key]
     merged_observed = list(seen_observed.values())
+
+    # 1. Annotate: tag each observed with signal_quality, causal_link_strength, etc.
     for item in merged_observed:
         _annotate_observed_candidate(item)
-    merged_observed, suppressed_by_defensibility = _split_observed_candidates_by_defensibility(merged_observed)
-    merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
 
-    # --- Defensibility filter: suppress weak non-defensible observed signals ---
-    # Moves noise (weak causal + weak instrument + low score) to suppressed_candidates.
-    # Full traceability: visible in top_suppressed with suppression_reason.
-    merged_observed, newly_suppressed = _split_observed_by_defensibility(merged_observed)
-    rec.setdefault("suppressed_candidates", []).extend(newly_suppressed)
+    # 2. Defensibility filter: suppress weak non-defensible signals.
+    #    Suppressed items get suppression_reason + suppressed_by_defensibility_filter
+    #    for full traceability in top_suppressed.
+    merged_observed, suppressed_by_defensibility = _split_observed_candidates_by_defensibility(merged_observed)
+    rec.setdefault("suppressed_candidates", []).extend(suppressed_by_defensibility)
+
+    # 3. Sort by quality for downstream consumers
+    merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
 
     # --- Observed → Actionable promotion ---
     # Promote observed candidates that meet ALL quality gates to external_opportunities.

@@ -8,8 +8,11 @@ Validates that weak non-defensible observed signals:
 
 Root cause addressed: suppressed_candidates was always [] because the only
 suppression path was `suppressed_by_contradiction` (market price contradicts).
-Sprint 37 adds a second path: `weak_non_defensible` for signals with no causal
-link, unrecognized instrument, and low score.
+Sprint 37 adds a second path via _split_observed_candidates_by_defensibility.
+
+Suppression reasons:
+- "weak_signal_not_tracked": weak instrument + weak causal (MOEX-like noise)
+- "weak_signal_low_score": known instrument + weak causal + score below threshold
 """
 
 import pytest
@@ -93,141 +96,176 @@ def _build(observed=None, ext=None, suppressed=None):
 
 class TestSuppressionReason:
 
-    def test_weak_signal_below_threshold_suppressed(self):
+    def test_weak_signal_not_tracked_suppressed(self):
+        """Weak quality + weak causal → suppressed as weak_signal_not_tracked."""
         from app.services.orchestrator import _get_observed_suppression_reason
         item = _make_weak_signal("MOEX", effective_score=0.35)
-        assert _get_observed_suppression_reason(item) == "weak_non_defensible"
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
 
-    def test_weak_signal_at_threshold_not_suppressed(self):
+    def test_weak_signal_high_score_still_suppressed(self):
+        """Weak quality items are suppressed regardless of score (instrument not tracked)."""
         from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("MOEX", effective_score=0.4)
+        item = _make_weak_signal("MOEX", effective_score=0.8)
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    def test_strong_quality_strong_causal_not_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = _make_strong_signal("META")
         assert _get_observed_suppression_reason(item) is None
 
-    def test_weak_signal_above_threshold_not_suppressed(self):
+    def test_strong_quality_weak_causal_high_score_not_suppressed(self):
+        """Known instrument + weak causal + high score → defensible."""
         from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("MOEX", effective_score=0.55)
+        item = _make_weak_signal("MA", effective_score=0.57, signal_quality="strong",
+                                 asset_type_status="known_valid")
         assert _get_observed_suppression_reason(item) is None
 
-    def test_strong_signal_quality_not_suppressed(self):
+    def test_strong_quality_weak_causal_low_score_suppressed(self):
+        """Known instrument + weak causal + low score → weak_signal_low_score."""
         from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("AAPL", effective_score=0.2, signal_quality="strong")
-        assert _get_observed_suppression_reason(item) is None
-
-    def test_strong_causal_not_suppressed(self):
-        from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("AAPL", effective_score=0.2, causal_link_strength="strong")
-        assert _get_observed_suppression_reason(item) is None
+        item = _make_weak_signal("MA", effective_score=0.54, signal_quality="strong",
+                                 asset_type_status="known_valid")
+        assert _get_observed_suppression_reason(item) == "weak_signal_low_score"
 
     def test_catalog_not_suppressed(self):
         from app.services.orchestrator import _get_observed_suppression_reason
         item = _make_catalog("CAT1")
         assert _get_observed_suppression_reason(item) is None
 
-    def test_none_score_treated_as_zero(self):
-        """effective_score=None → treated as 0, below threshold → suppress."""
+    def test_none_score_weak_signal_suppressed(self):
+        """effective_score=None → treated as 0, weak quality → suppress."""
         from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("X", effective_score=None)
-        # Override to ensure None
+        item = _make_weak_signal("X")
         item["effective_score"] = None
-        assert _get_observed_suppression_reason(item) == "weak_non_defensible"
-
-    def test_custom_threshold(self):
-        from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("X", effective_score=0.5)
-        assert _get_observed_suppression_reason(item, score_threshold=0.6) == "weak_non_defensible"
-        assert _get_observed_suppression_reason(item, score_threshold=0.5) is None
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
 
 
 # ---------------------------------------------------------------------------
-# Test 2: _split_observed_by_defensibility
+# Test 2: _is_defensible_observed_candidate
+# ---------------------------------------------------------------------------
+
+class TestIsDefensible:
+
+    def test_strong_quality_strong_causal_defensible(self):
+        from app.services.orchestrator import _is_defensible_observed_candidate
+        item = _make_strong_signal("META")
+        assert _is_defensible_observed_candidate(item) is True
+
+    def test_catalog_always_defensible(self):
+        from app.services.orchestrator import _is_defensible_observed_candidate
+        item = _make_catalog("SPY")
+        assert _is_defensible_observed_candidate(item) is True
+
+    def test_weak_quality_not_defensible(self):
+        from app.services.orchestrator import _is_defensible_observed_candidate
+        item = _make_weak_signal("MOEX", effective_score=0.8)
+        assert _is_defensible_observed_candidate(item) is False
+
+    def test_strong_quality_weak_causal_high_score_defensible(self):
+        from app.services.orchestrator import _is_defensible_observed_candidate
+        item = _make_weak_signal("MA", effective_score=0.57, signal_quality="strong",
+                                 asset_type_status="known_valid")
+        assert _is_defensible_observed_candidate(item) is True
+
+    def test_strong_quality_weak_causal_low_score_not_defensible(self):
+        from app.services.orchestrator import _is_defensible_observed_candidate
+        item = _make_weak_signal("MA", effective_score=0.54, signal_quality="strong",
+                                 asset_type_status="known_valid")
+        assert _is_defensible_observed_candidate(item) is False
+
+
+# ---------------------------------------------------------------------------
+# Test 3: _split_observed_candidates_by_defensibility
 # ---------------------------------------------------------------------------
 
 class TestSplitByDefensibility:
 
     def test_empty_list(self):
-        from app.services.orchestrator import _split_observed_by_defensibility
-        d, s = _split_observed_by_defensibility([])
+        from app.services.orchestrator import _split_observed_candidates_by_defensibility
+        d, s = _split_observed_candidates_by_defensibility([])
         assert d == []
         assert s == []
 
     def test_all_defensible(self):
-        from app.services.orchestrator import _split_observed_by_defensibility
+        from app.services.orchestrator import _split_observed_candidates_by_defensibility
         items = [_make_strong_signal("META"), _make_catalog("C1")]
-        d, s = _split_observed_by_defensibility(items)
+        d, s = _split_observed_candidates_by_defensibility(items)
         assert len(d) == 2
         assert len(s) == 0
 
     def test_all_suppressed(self):
-        from app.services.orchestrator import _split_observed_by_defensibility
+        from app.services.orchestrator import _split_observed_candidates_by_defensibility
         items = [_make_weak_signal("X1", 0.1), _make_weak_signal("X2", 0.2)]
-        d, s = _split_observed_by_defensibility(items)
+        d, s = _split_observed_candidates_by_defensibility(items)
         assert len(d) == 0
         assert len(s) == 2
-        assert all(i["suppression_reason"] == "weak_non_defensible" for i in s)
+        assert all(i["suppression_reason"] == "weak_signal_not_tracked" for i in s)
+        assert all(i["suppressed_by_defensibility_filter"] is True for i in s)
 
     def test_mixed_split(self):
-        from app.services.orchestrator import _split_observed_by_defensibility
+        from app.services.orchestrator import _split_observed_candidates_by_defensibility
         items = [
             _make_strong_signal("META"),
             _make_weak_signal("MOEX", 0.35),
             _make_catalog("C1"),
             _make_weak_signal("ABC", 0.1),
         ]
-        d, s = _split_observed_by_defensibility(items)
+        d, s = _split_observed_candidates_by_defensibility(items)
         assert len(d) == 2  # META + C1
         assert len(s) == 2  # MOEX + ABC
         assert {i["symbol"] for i in d} == {"META", "C1"}
         assert {i["symbol"] for i in s} == {"MOEX", "ABC"}
 
-    def test_suppressed_items_have_reason(self):
-        from app.services.orchestrator import _split_observed_by_defensibility
+    def test_suppressed_items_have_reason_and_flag(self):
+        from app.services.orchestrator import _split_observed_candidates_by_defensibility
         items = [_make_weak_signal("X", 0.1)]
-        _, s = _split_observed_by_defensibility(items)
-        assert s[0]["suppression_reason"] == "weak_non_defensible"
+        _, s = _split_observed_candidates_by_defensibility(items)
+        assert s[0]["suppression_reason"] == "weak_signal_not_tracked"
+        assert s[0]["suppressed_by_defensibility_filter"] is True
 
     def test_defensible_items_no_reason(self):
-        from app.services.orchestrator import _split_observed_by_defensibility
+        from app.services.orchestrator import _split_observed_candidates_by_defensibility
         items = [_make_strong_signal("META")]
-        d, _ = _split_observed_by_defensibility(items)
+        d, _ = _split_observed_candidates_by_defensibility(items)
         assert "suppression_reason" not in d[0]
+        assert "suppressed_by_defensibility_filter" not in d[0]
 
 
 # ---------------------------------------------------------------------------
-# Test 3: End-to-end through decision_summary
+# Test 4: End-to-end through decision_summary
 # ---------------------------------------------------------------------------
 
 class TestDecisionSummarySuppression:
 
     def test_suppressed_items_in_suppressed_count(self):
-        """Suppressed items contribute to suppressed_count."""
         suppressed = [_make_weak_signal("MOEX", 0.3)]
-        suppressed[0]["suppression_reason"] = "weak_non_defensible"
+        suppressed[0]["suppression_reason"] = "weak_signal_not_tracked"
+        suppressed[0]["suppressed_by_defensibility_filter"] = True
         ds = _build(observed=[], suppressed=suppressed)
         c = ds["candidates"]
         assert c["suppressed_count"] == 1
 
     def test_suppressed_items_in_top_suppressed(self):
-        """Suppressed items appear in top_suppressed."""
         suppressed = [_make_weak_signal("MOEX", 0.3)]
-        suppressed[0]["suppression_reason"] = "weak_non_defensible"
+        suppressed[0]["suppression_reason"] = "weak_signal_not_tracked"
+        suppressed[0]["suppressed_by_defensibility_filter"] = True
         ds = _build(observed=[], suppressed=suppressed)
         c = ds["candidates"]
         assert len(c["top_suppressed"]) == 1
         assert c["top_suppressed"][0]["symbol"] == "MOEX"
-        assert c["top_suppressed"][0]["suppression_reason"] == "weak_non_defensible"
+        assert c["top_suppressed"][0]["suppression_reason"] == "weak_signal_not_tracked"
+        assert c["top_suppressed"][0]["suppressed_by_defensibility_filter"] is True
 
     def test_suppressed_not_in_observed_count(self):
-        """Suppressed items don't inflate observed_count."""
         strong = _make_strong_signal("META")
         suppressed = [_make_weak_signal("MOEX", 0.3)]
-        suppressed[0]["suppression_reason"] = "weak_non_defensible"
+        suppressed[0]["suppression_reason"] = "weak_signal_not_tracked"
         ds = _build(observed=[strong], suppressed=suppressed)
         c = ds["candidates"]
         assert c["observed_count"] == 1  # only META
         assert c["suppressed_count"] == 1  # MOEX
 
     def test_mixed_observed_and_suppressed(self):
-        """Combined scenario: strong observed + catalog + suppressed weak."""
         obs = [
             _make_strong_signal("META"),
             _make_catalog("C1"),
@@ -235,7 +273,7 @@ class TestDecisionSummarySuppression:
         ]
         sup = [_make_weak_signal("MOEX", 0.2), _make_weak_signal("XYZ", 0.15)]
         for s in sup:
-            s["suppression_reason"] = "weak_non_defensible"
+            s["suppression_reason"] = "weak_signal_not_tracked"
         ds = _build(observed=obs, suppressed=sup)
         c = ds["candidates"]
         assert c["observed_count"] == 3
@@ -246,44 +284,39 @@ class TestDecisionSummarySuppression:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Boundary conditions
+# Test 5: Boundary conditions
 # ---------------------------------------------------------------------------
 
 class TestBoundaryConditions:
 
-    def test_weak_causal_strong_quality_not_suppressed(self):
-        """Known instrument + weak causal → NOT suppressed (still useful to track)."""
+    def test_weak_causal_strong_quality_high_score_not_suppressed(self):
+        """Known instrument + weak causal + score >= 0.55 → defensible."""
         from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("V", effective_score=0.35, signal_quality="strong")
+        item = _make_weak_signal("V", effective_score=0.55, signal_quality="strong",
+                                 asset_type_status="known_valid")
         assert _get_observed_suppression_reason(item) is None
 
-    def test_strong_causal_weak_quality_not_suppressed(self):
-        """Title mention + unknown instrument → NOT suppressed (causal link is real)."""
+    def test_weak_causal_strong_quality_low_score_suppressed(self):
+        """Known instrument + weak causal + score < 0.55 → weak_signal_low_score."""
         from app.services.orchestrator import _get_observed_suppression_reason
+        item = _make_weak_signal("V", effective_score=0.54, signal_quality="strong",
+                                 asset_type_status="known_valid")
+        assert _get_observed_suppression_reason(item) == "weak_signal_low_score"
+
+    def test_strong_causal_weak_quality_not_suppressed_false(self):
+        """Title mention + unknown instrument → still suppressed (weak quality dominates)."""
+        from app.services.orchestrator import _is_defensible_observed_candidate
         item = _make_weak_signal("GPU", effective_score=0.35, causal_link_strength="strong")
-        assert _get_observed_suppression_reason(item) is None
-
-    def test_score_exactly_at_boundary(self):
-        """effective_score == 0.4 (threshold) → NOT suppressed."""
-        from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("X", effective_score=0.4)
-        assert _get_observed_suppression_reason(item) is None
-
-    def test_score_just_below_boundary(self):
-        """effective_score == 0.39 → suppressed."""
-        from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("X", effective_score=0.39)
-        assert _get_observed_suppression_reason(item) == "weak_non_defensible"
+        assert _is_defensible_observed_candidate(item) is False
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Backward compatibility — old suppression_by_contradiction still works
+# Test 6: Backward compatibility — contradiction + defensibility coexist
 # ---------------------------------------------------------------------------
 
 class TestBackwardCompat:
 
     def test_contradiction_suppressed_still_counted(self):
-        """Items suppressed by contradiction still appear in suppressed_candidates."""
         contradicted = _make_strong_signal("AAPL")
         contradicted["suppressed_by_contradiction"] = True
         ds = _build(observed=[], suppressed=[contradicted])
@@ -291,11 +324,11 @@ class TestBackwardCompat:
         assert c["suppressed_count"] == 1
 
     def test_both_suppression_paths_combined(self):
-        """Contradiction + defensibility both contribute to suppressed_count."""
         s1 = _make_strong_signal("AAPL")
         s1["suppressed_by_contradiction"] = True
         s2 = _make_weak_signal("MOEX", 0.2)
-        s2["suppression_reason"] = "weak_non_defensible"
+        s2["suppression_reason"] = "weak_signal_not_tracked"
+        s2["suppressed_by_defensibility_filter"] = True
         ds = _build(observed=[], suppressed=[s1, s2])
         c = ds["candidates"]
         assert c["suppressed_count"] == 2
@@ -303,13 +336,57 @@ class TestBackwardCompat:
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Real-world calibration
+# Test 7: _annotate_observed_candidate
+# ---------------------------------------------------------------------------
+
+class TestAnnotateObservedCandidate:
+
+    def test_signal_item_gets_all_fields(self):
+        from app.services.orchestrator import _annotate_observed_candidate
+        item = {"symbol": "META", "effective_score": 0.6, "signal_class": "observed_candidate",
+                "title_mention": True, "reason": "Meta earnings beat", "asset_type_status": "known_valid"}
+        _annotate_observed_candidate(item)
+        assert item["observed_origin"] == "signal"
+        assert item["signal_quality"] == "strong"
+        assert item["causal_link_strength"] == "strong"
+        assert item["observed_value_tier"] == "high"
+
+    def test_catalog_item_gets_none_fields(self):
+        from app.services.orchestrator import _annotate_observed_candidate
+        item = {"symbol": "SPY", "effective_score": None, "signal_class": None,
+                "source_types": ["catalog"]}
+        _annotate_observed_candidate(item)
+        assert item["observed_origin"] == "catalog"
+        assert item["signal_quality"] is None
+        assert item["causal_link_strength"] is None
+        assert item["observed_value_tier"] == "catalog"
+
+    def test_weak_instrument_gets_low_tier(self):
+        from app.services.orchestrator import _annotate_observed_candidate
+        item = {"symbol": "MOEX", "effective_score": 0.5, "signal_class": "observed_candidate",
+                "title_mention": False, "reason": "Market news", "asset_type_status": "unknown"}
+        _annotate_observed_candidate(item)
+        assert item["observed_origin"] == "signal"
+        assert item["signal_quality"] == "weak"
+        assert item["causal_link_strength"] == "weak"
+        assert item["observed_value_tier"] == "low"
+
+    def test_relevant_not_investable_status(self):
+        from app.services.orchestrator import _annotate_observed_candidate
+        item = {"symbol": "MELI", "effective_score": 0.7, "signal_class": "observed_candidate",
+                "title_mention": True, "reason": "MercadoLibre guidance",
+                "asset_type_status": "known_valid", "investable": False}
+        _annotate_observed_candidate(item)
+        assert item["operational_status"] == "relevant_not_investable"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Real-world calibration
 # ---------------------------------------------------------------------------
 
 class TestRealWorldCalibration:
 
     def test_moex_weak_unconfirmed_suppressed(self):
-        """MOEX: weak signal, weak causal, low score → suppressed."""
         from app.services.orchestrator import _get_observed_suppression_reason
         moex = {
             "symbol": "MOEX", "reason": "Market volatility news",
@@ -317,10 +394,9 @@ class TestRealWorldCalibration:
             "causal_link_strength": "weak", "effective_score": 0.38,
             "market_confirmation": "unconfirmed",
         }
-        assert _get_observed_suppression_reason(moex) == "weak_non_defensible"
+        assert _get_observed_suppression_reason(moex) == "weak_signal_not_tracked"
 
     def test_meta_strong_not_suppressed(self):
-        """META: strong signal, strong causal → never suppressed."""
         from app.services.orchestrator import _get_observed_suppression_reason
         meta = {
             "symbol": "META", "reason": "Meta reports earnings beat",
@@ -331,13 +407,12 @@ class TestRealWorldCalibration:
         assert _get_observed_suppression_reason(meta) is None
 
     def test_catalog_spy_not_suppressed(self):
-        """SPY from catalog → never suppressed (no signal to judge)."""
         from app.services.orchestrator import _get_observed_suppression_reason
         spy = _make_catalog("SPY")
         assert _get_observed_suppression_reason(spy) is None
 
-    def test_weak_quality_but_high_score_not_suppressed(self):
-        """Unknown instrument with high score → keep it (score saves it)."""
+    def test_weak_quality_any_score_suppressed(self):
+        """Unknown instrument → always suppressed regardless of score."""
         from app.services.orchestrator import _get_observed_suppression_reason
-        item = _make_weak_signal("CRYPTO", effective_score=0.55)
-        assert _get_observed_suppression_reason(item) is None
+        item = _make_weak_signal("CRYPTO", effective_score=0.9)
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"

@@ -4,6 +4,12 @@ Goal:
 - keep real observed opportunities when causal evidence is clear
 - drop weak/untracked observed noise
 - preserve promotion and ambiguous ticker protections
+
+Tests aligned to the unified API:
+- _annotate_observed_candidate (enrichment)
+- _is_defensible_observed_candidate (predicate)
+- _get_observed_suppression_reason (reason)
+- _split_observed_candidates_by_defensibility (split)
 """
 
 from app.services.orchestrator import (
@@ -107,8 +113,8 @@ def test_filtered_weak_signal_appears_in_suppressed_bucket():
     assert suppressed[0]["suppressed_by_defensibility_filter"] is True
 
 
-def test_known_tracked_weak_signal_can_still_survive_if_score_is_meaningful():
-    """Weak causal observed items still survive when they are real tracked instruments."""
+def test_known_tracked_weak_causal_survives_if_score_is_meaningful():
+    """Weak causal observed items still survive when they are real tracked instruments with good score."""
     item = _observed_item(
         "MA",
         reason="Payments stocks rise after stronger consumer spending data",
@@ -127,8 +133,8 @@ def test_known_tracked_weak_signal_can_still_survive_if_score_is_meaningful():
     assert _get_observed_suppression_reason(item) is None
 
 
-def test_low_score_weak_signal_gets_explicit_reason():
-    """Tracked weak signals below threshold should be suppressed as low score."""
+def test_low_score_weak_causal_gets_explicit_reason():
+    """Tracked weak-causal signals below threshold should be suppressed as low score."""
     item = _observed_item(
         "MA",
         reason="Payments stocks rise after stronger consumer spending data",
