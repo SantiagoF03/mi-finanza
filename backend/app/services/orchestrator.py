@@ -50,6 +50,46 @@ def _has_causal_link(item: dict) -> bool:
     return any(name in reason_lower for name in names)
 
 
+def _get_observed_suppression_reason(item: dict, score_threshold: float = 0.4) -> str | None:
+    """Return suppression reason if observed signal is weak and non-defensible.
+
+    Returns "weak_non_defensible" when ALL of:
+    - observed_origin == "signal" (has news data, not pure catalog)
+    - causal_link_strength == "weak" (no title/company name match)
+    - signal_quality == "weak" (unrecognized instrument)
+    - effective_score < score_threshold (low confidence)
+
+    Returns None if the item should NOT be suppressed.
+    """
+    if (
+        item.get("observed_origin") == "signal"
+        and item.get("causal_link_strength") == "weak"
+        and item.get("signal_quality") == "weak"
+        and (item.get("effective_score") or 0) < score_threshold
+    ):
+        return "weak_non_defensible"
+    return None
+
+
+def _split_observed_by_defensibility(
+    observed: list[dict], score_threshold: float = 0.4,
+) -> tuple[list[dict], list[dict]]:
+    """Split observed candidates into (defensible, suppressed).
+
+    Suppressed items get a "suppression_reason" field for traceability.
+    """
+    defensible = []
+    suppressed = []
+    for item in observed:
+        reason = _get_observed_suppression_reason(item, score_threshold)
+        if reason:
+            item["suppression_reason"] = reason
+            suppressed.append(item)
+        else:
+            defensible.append(item)
+    return defensible, suppressed
+
+
 def _enrich_market_confirmation(opportunities: list[dict]) -> None:
     """Enrich market_confirmation for external_opportunities in-place.
 
@@ -393,7 +433,8 @@ def _build_decision_summary(
              "opportunity_quality": i.get("opportunity_quality"),
              "opportunity_rank_reason": i.get("opportunity_rank_reason"),
              "market_confirmation_reason": i.get("market_confirmation_reason"),
-             "operational_status": i.get("operational_status")}
+             "operational_status": i.get("operational_status"),
+             "suppression_reason": i.get("suppression_reason")}
             for i in source[:n]
         ]
 
@@ -782,6 +823,12 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         ):
             item["operational_status"] = "relevant_not_investable"
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
+
+    # --- Defensibility filter: suppress weak non-defensible observed signals ---
+    # Moves noise (weak causal + weak instrument + low score) to suppressed_candidates.
+    # Full traceability: visible in top_suppressed with suppression_reason.
+    merged_observed, newly_suppressed = _split_observed_by_defensibility(merged_observed)
+    rec.setdefault("suppressed_candidates", []).extend(newly_suppressed)
 
     # --- Observed → Actionable promotion ---
     # Promote observed candidates that meet ALL quality gates to external_opportunities.
