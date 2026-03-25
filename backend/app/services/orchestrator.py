@@ -651,6 +651,20 @@ def _build_decision_summary(
         "top_observed_weak": _top_n(obs_weak, sort_key=_observed_key),
         "top_observed_catalog": _top_n(obs_catalog_only, sort_key=_observed_key),
         "top_suppressed": _top_n(sup_cands),
+        # --- Watchlist layer: signal-bearing items only, prioritized for human review ---
+        # Combines all observed items that have real news signal (strong + weak + relevant_not_investable).
+        # Excludes catalog-only. Ordered by _observed_key (quality first). Max 10.
+        "watchlist": _top_n(obs_signals_real, n=10, sort_key=_observed_key),
+        "watchlist_count": len(obs_signals_real),
+        # --- Catalog summary: compact stats, not full list ---
+        "catalog_summary": {
+            "count": len(obs_catalog_only),
+            "top_by_priority": _top_n(
+                obs_catalog_only, n=3,
+                sort_key=lambda x: (x.get("priority_score") or 0,),
+            ),
+            "hidden_by_default": True,
+        },
     }
 
     # --- Promotion events ---

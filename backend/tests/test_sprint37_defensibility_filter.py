@@ -822,3 +822,144 @@ class TestPipelineCounts:
         assert pc["actionable_count"] == 1
         assert pc["observed_count"] == 0
         assert pc["promoted_from_observed_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Watchlist layer and catalog compaction (Sprint 38b)
+# ---------------------------------------------------------------------------
+
+class TestWatchlistLayer:
+    """Validates that the watchlist layer surfaces signal-bearing items first
+    and catalog-only items are compacted into catalog_summary.
+    """
+
+    def _make_weak_causal_strong(self, symbol, effective_score=0.5):
+        return {
+            "symbol": symbol, "reason": f"{symbol} deal",
+            "signal_class": "observed_candidate", "effective_score": effective_score,
+            "signal_quality": "weak", "causal_link_strength": "strong",
+            "observed_value_tier": "low", "observed_origin": "signal",
+            "title_mention": True, "operational_status": "relevant_not_investable",
+        }
+
+    def test_watchlist_present(self):
+        ds = _build(observed=[], suppressed=[])
+        c = ds["candidates"]
+        assert "watchlist" in c
+        assert "watchlist_count" in c
+        assert "catalog_summary" in c
+
+    def test_watchlist_shows_only_signals(self):
+        """Watchlist excludes catalog-only items."""
+        obs = [
+            _make_strong_signal("META"),
+            _make_catalog("C1"), _make_catalog("C2"), _make_catalog("C3"),
+        ]
+        c = _build(observed=obs)["candidates"]
+        assert c["watchlist_count"] == 1
+        assert len(c["watchlist"]) == 1
+        assert c["watchlist"][0]["symbol"] == "META"
+
+    def test_watchlist_prioritizes_strong_over_weak(self):
+        """Strong signals rank before weak signals in watchlist."""
+        obs = [
+            self._make_weak_causal_strong("LP", effective_score=0.5),
+            _make_strong_signal("META", effective_score=0.7),
+        ]
+        c = _build(observed=obs)["candidates"]
+        assert c["watchlist_count"] == 2
+        # META (strong quality) should rank first
+        assert c["watchlist"][0]["symbol"] == "META"
+        assert c["watchlist"][1]["symbol"] == "LP"
+
+    def test_watchlist_max_10(self):
+        """Watchlist caps at 10 items."""
+        obs = [_make_strong_signal(f"S{i}", effective_score=0.5 + i * 0.01) for i in range(15)]
+        c = _build(observed=obs)["candidates"]
+        assert c["watchlist_count"] == 15
+        assert len(c["watchlist"]) == 10
+
+    def test_catalog_summary_counts(self):
+        """catalog_summary shows count and top 3 by priority."""
+        cats = [_make_catalog(f"C{i}", priority_score=i * 0.1) for i in range(100)]
+        c = _build(observed=cats)["candidates"]
+        cs = c["catalog_summary"]
+        assert cs["count"] == 100
+        assert cs["hidden_by_default"] is True
+        assert len(cs["top_by_priority"]) == 3
+
+    def test_catalog_summary_empty_when_no_catalog(self):
+        obs = [_make_strong_signal("META")]
+        c = _build(observed=obs)["candidates"]
+        cs = c["catalog_summary"]
+        assert cs["count"] == 0
+        assert cs["top_by_priority"] == []
+
+    def test_massive_catalog_doesnt_dominate_watchlist(self):
+        """1000 catalog + 2 signals → watchlist shows only 2 signals."""
+        signals = [
+            _make_strong_signal("META", effective_score=0.7),
+            self._make_weak_causal_strong("LP", effective_score=0.5),
+        ]
+        catalog = [_make_catalog(f"C{i}") for i in range(1000)]
+        c = _build(observed=signals + catalog)["candidates"]
+
+        assert c["watchlist_count"] == 2
+        assert len(c["watchlist"]) == 2
+        assert {w["symbol"] for w in c["watchlist"]} == {"META", "LP"}
+        assert c["catalog_summary"]["count"] == 1000
+        # top_observed still includes catalog (backward compat) but signals rank first
+        assert c["top_observed"][0]["symbol"] == "META"
+
+    def test_top_observed_unchanged_backward_compat(self):
+        """top_observed still includes catalog items (backward compat)."""
+        obs = [_make_catalog("C1"), _make_catalog("C2"), _make_catalog("C3")]
+        c = _build(observed=obs)["candidates"]
+        assert len(c["top_observed"]) == 3  # all catalog, no change
+        assert c["watchlist_count"] == 0  # no signals
+
+    def test_suppressed_not_in_watchlist(self):
+        """Suppressed items don't appear in watchlist."""
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+        obs = [_make_strong_signal("META")]
+        c = _build(observed=obs, suppressed=sup)["candidates"]
+        assert c["watchlist_count"] == 1
+        assert c["watchlist"][0]["symbol"] == "META"
+
+    # --- No regression tests ---
+    def test_promotion_gate_not_regressed(self):
+        """Weak items in watchlist don't promote."""
+        item = self._make_weak_causal_strong("LP", effective_score=0.8)
+        would_promote = (
+            item.get("signal_quality") == "strong"
+            and item.get("causal_link_strength") == "strong"
+            and (item.get("effective_score") or 0) >= 0.6
+            and item.get("investable") is True
+        )
+        assert would_promote is False
+
+    def test_top_suppressed_not_regressed(self):
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+        c = _build(observed=[], suppressed=sup)["candidates"]
+        assert c["suppressed_count"] == 1
+        assert c["top_suppressed"][0]["symbol"] == "MOEX"
+
+    def test_pipeline_counts_not_regressed(self):
+        obs = [_make_strong_signal("META"), _make_catalog("C1")]
+        ds = _build(observed=obs)
+        pc = ds["pipeline_counts"]
+        c = ds["candidates"]
+        assert pc["observed_count"] == c["observed_count"]
+        assert pc["suppressed_count"] == c["suppressed_count"]
+
+    def test_ambiguous_tickers_not_regressed(self):
+        from app.news.pipeline import classify_news_event
+        result = classify_news_event(
+            "Global markets rally as investors digest rate outlook",
+            "Analysts describe broad risk appetite across sectors.",
+            ["MA", "V"],
+        )
+        assert "MA" not in result["related_assets"]
+        assert "V" not in result["related_assets"]
