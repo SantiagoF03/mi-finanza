@@ -109,12 +109,42 @@ def _annotate_observed_candidate(item: dict) -> None:
         item.get("signal_quality") == "weak"
         and item.get("causal_link_strength") == "strong"
         and item.get("title_mention") is True
+        and item.get("symbol", "") not in _NON_EQUITY_SYMBOLS
     ):
         item["operational_status"] = "relevant_not_investable"
 
 
 # --- Defensibility scoring thresholds ---
 _WEAK_SCORE_THRESHOLD = 0.55  # weak-causal strong-quality items below this are not defensible
+
+# Symbols that should NOT survive the weak+causal_strong exception.
+# These are well-known non-equity/non-company symbols (crypto, indices, macro proxies)
+# that produce noise even when causally linked to a headline.
+# Maintained manually — add as new false positives appear in runtime.
+_NON_EQUITY_SYMBOLS = frozenset({
+    # Crypto
+    "BTC", "ETH", "XRP", "SOL", "ADA", "DOGE", "DOT", "AVAX", "MATIC", "LINK",
+    "BNB", "LTC", "SHIB", "UNI", "ATOM",
+    # Market indices / country proxies
+    "COLCAP",   # Colombia index
+    "MOEX",     # Moscow Exchange index
+    "MERVAL",   # Argentina index
+    "IBOV",     # Brazil Bovespa index
+    "IPSA",     # Chile index
+    "IPC",      # Mexico index
+    "FTSE",     # UK index
+    "DAX",      # Germany index
+    "CAC",      # France index
+    "NIKKEI",   # Japan index
+    "HSI",      # Hang Seng index
+    "KOSPI",    # Korea index
+    "SENSEX",   # India index
+    # Macro proxies
+    "DXY",      # US Dollar index
+    "VIX",      # Volatility index
+    "WTI",      # Oil benchmark
+    "BRENT",    # Oil benchmark
+})
 
 def _is_defensible_observed_candidate(item: dict) -> bool:
     """Return True if an observed signal is worth keeping (not noise).
@@ -138,10 +168,13 @@ def _is_defensible_observed_candidate(item: dict) -> bool:
         return True
     # Weak instrument but strong causal link with title mention:
     # the news IS about this symbol — worth monitoring even if untracked.
+    # Exception: crypto, indices, and macro proxies are excluded — they produce
+    # noise even with strong causal links (e.g. "BTC rallies").
     if (
         item.get("signal_quality") == "weak"
         and item.get("causal_link_strength") == "strong"
         and item.get("title_mention") is True
+        and item.get("symbol", "") not in _NON_EQUITY_SYMBOLS
     ):
         return True
     return False
