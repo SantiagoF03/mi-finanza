@@ -430,6 +430,8 @@ def _build_decision_summary(
              "signal_quality": i.get("signal_quality"),
              "causal_link_strength": i.get("causal_link_strength"),
              "observed_value_tier": i.get("observed_value_tier"),
+             "suppression_reason": i.get("suppression_reason"),
+             "suppressed_by_defensibility_filter": i.get("suppressed_by_defensibility_filter"),
              "opportunity_quality": i.get("opportunity_quality"),
              "opportunity_rank_reason": i.get("opportunity_rank_reason"),
              "market_confirmation_reason": i.get("market_confirmation_reason"),
@@ -522,7 +524,7 @@ def _build_decision_summary(
     refinement = fresh_quote_meta.get("refinement", {})
     promotion_events = {
         "promoted_count": scoring_summary.get("promoted_count", 0),
-        "suppressed_count": scoring_summary.get("suppressed_count", 0),
+        "suppressed_count": len(sup_cands),
         "fresh_promoted": refinement.get("promotions", 0),
         "fresh_demoted": refinement.get("demotions", 0),
     }
@@ -769,59 +771,9 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
                 if winner.get(key) is None and loser.get(key) is not None:
                     winner[key] = loser[key]
     merged_observed = list(seen_observed.values())
-    # Tag each observed with its origin for explainability:
-    # "signal" = has a real news signal (effective_score present)
-    # "catalog" = pure catalog/universe/watchlist discovery (no signal data)
     for item in merged_observed:
-        has_signal = item.get("effective_score") is not None or item.get("signal_class") is not None
-        item["observed_origin"] = "signal" if has_signal else "catalog"
-        # signal_quality: "strong" if the symbol is a known financial instrument,
-        # "weak" if it has a signal but is unrecognized (GPU, AWS, etc.)
-        if has_signal:
-            is_known = (
-                item.get("asset_type_status") == "known_valid"
-                or item.get("in_main_allowed") is True
-                or item.get("tracking_status") not in (None, "untracked")
-            )
-            item["signal_quality"] = "strong" if is_known else "weak"
-        else:
-            item["signal_quality"] = None
-        # causal_link_strength: "strong" if news appears causally related to this symbol,
-        # "weak" if the symbol has a signal but the causal link is vague/lateral.
-        # Heuristics: (1) ticker in headline, (2) company name in headline.
-        if has_signal:
-            item["causal_link_strength"] = "strong" if _has_causal_link(item) else "weak"
-        else:
-            item["causal_link_strength"] = None
-        # observed_value_tier: actionable summary of how useful this observed item is.
-        # "high"    = known instrument + strong causal link (real news about this company)
-        # "medium"  = known instrument + weak causal but investable (contextual, not noise)
-        # "low"     = weak instrument OR (known but weak causal + not investable)
-        # "catalog" = pure inventory, no news signal at all
-        if not has_signal:
-            item["observed_value_tier"] = "catalog"
-        elif (
-            item.get("signal_quality") == "strong"
-            and item.get("causal_link_strength") == "strong"
-        ):
-            item["observed_value_tier"] = "high"
-        elif (
-            item.get("signal_quality") == "strong"
-            and item.get("causal_link_strength") == "weak"
-            and item.get("investable") is True
-        ):
-            item["observed_value_tier"] = "medium"
-        else:
-            item["observed_value_tier"] = "low"
-        # operational_status: honest product-level classification
-        # "relevant_not_investable" = strong signal + strong causal but NOT investable
-        # (real opportunity the user can't operate with current config)
-        if (
-            item.get("signal_quality") == "strong"
-            and item.get("causal_link_strength") == "strong"
-            and item.get("investable") is not True
-        ):
-            item["operational_status"] = "relevant_not_investable"
+        _annotate_observed_candidate(item)
+    merged_observed, suppressed_by_defensibility = _split_observed_candidates_by_defensibility(merged_observed)
     merged_observed.sort(key=lambda x: (x.get("effective_score") or 0, x.get("priority_score") or 0), reverse=True)
 
     # --- Defensibility filter: suppress weak non-defensible observed signals ---
