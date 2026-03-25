@@ -550,17 +550,167 @@ class TestWeakCausalStrongPolicy:
 
     # --- End-to-end through split + decision_summary ---
     def test_end_to_end_lp_jbs_jll_scenario(self):
-        """Real runtime scenario: LP/JBS/JLL survive, MOEX suppressed."""
+        """Real runtime scenario: LP/JBS/JLL survive, BTC/COLCAP/MOEX suppressed."""
         from app.services.orchestrator import _split_observed_candidates_by_defensibility
         items = [
             self._make_weak_causal_strong("LP", effective_score=0.52),
             self._make_weak_causal_strong("JBS", effective_score=0.48),
             self._make_weak_causal_strong("JLL", effective_score=0.55),
-            _make_weak_signal("MOEX", 0.38),
+            self._make_weak_causal_strong("BTC", effective_score=0.6),   # crypto → suppressed
+            self._make_weak_causal_strong("COLCAP", effective_score=0.5),  # index → suppressed
+            _make_weak_signal("MOEX", 0.38),  # weak + weak → suppressed
             _make_catalog("SPY"),
         ]
         kept, suppressed = _split_observed_candidates_by_defensibility(items)
         kept_syms = {i["symbol"] for i in kept}
         suppressed_syms = {i["symbol"] for i in suppressed}
         assert kept_syms == {"LP", "JBS", "JLL", "SPY"}
-        assert suppressed_syms == {"MOEX"}
+        assert suppressed_syms == {"BTC", "COLCAP", "MOEX"}
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Non-equity symbol filtering (Sprint 37c)
+# ---------------------------------------------------------------------------
+
+class TestNonEquityFiltering:
+    """BTC, COLCAP runtime cases: weak instrument + strong causal + title_mention
+    but non-equity symbol (crypto/index/macro) → should still be suppressed.
+    """
+
+    def _make_weak_causal_strong(self, symbol, effective_score=0.5, **kw):
+        item = {
+            "symbol": symbol,
+            "reason": f"{symbol} rallies on global sentiment",
+            "signal_class": "observed_candidate",
+            "effective_score": effective_score,
+            "signal_quality": "weak",
+            "causal_link_strength": "strong",
+            "observed_value_tier": "low",
+            "observed_origin": "signal",
+            "asset_type_status": None,
+            "title_mention": True,
+        }
+        item.update(kw)
+        return item
+
+    # --- Crypto symbols suppressed ---
+    def test_btc_suppressed_despite_strong_causal(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("BTC")
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    def test_eth_suppressed_despite_strong_causal(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("ETH")
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    def test_sol_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("SOL")
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    # --- Index symbols suppressed ---
+    def test_colcap_suppressed_despite_strong_causal(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("COLCAP")
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    def test_merval_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("MERVAL")
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    def test_ibov_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("IBOV")
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    # --- Macro proxies suppressed ---
+    def test_vix_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("VIX")
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    def test_dxy_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("DXY")
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    # --- Company-like symbols STILL survive ---
+    def test_lp_still_survives(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("LP")
+        assert _get_observed_suppression_reason(item) is None
+
+    def test_jbs_still_survives(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("JBS")
+        assert _get_observed_suppression_reason(item) is None
+
+    def test_jll_still_survives(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("JLL")
+        assert _get_observed_suppression_reason(item) is None
+
+    # --- Non-equity does NOT get relevant_not_investable ---
+    def test_btc_no_relevant_status(self):
+        from app.services.orchestrator import _annotate_observed_candidate
+        item = {"symbol": "BTC", "effective_score": 0.6, "signal_class": "observed_candidate",
+                "title_mention": True, "reason": "BTC rallies", "asset_type_status": None}
+        _annotate_observed_candidate(item)
+        assert item.get("operational_status") is None
+
+    def test_lp_gets_relevant_status(self):
+        from app.services.orchestrator import _annotate_observed_candidate
+        item = {"symbol": "LP", "effective_score": 0.5, "signal_class": "observed_candidate",
+                "title_mention": True, "reason": "LP announces deal", "asset_type_status": None}
+        _annotate_observed_candidate(item)
+        assert item["operational_status"] == "relevant_not_investable"
+
+    # --- _NON_EQUITY_SYMBOLS is accessible ---
+    def test_blocklist_contains_expected_symbols(self):
+        from app.services.orchestrator import _NON_EQUITY_SYMBOLS
+        assert "BTC" in _NON_EQUITY_SYMBOLS
+        assert "COLCAP" in _NON_EQUITY_SYMBOLS
+        assert "MOEX" in _NON_EQUITY_SYMBOLS
+        assert "VIX" in _NON_EQUITY_SYMBOLS
+        # Company symbols NOT in blocklist
+        assert "LP" not in _NON_EQUITY_SYMBOLS
+        assert "JBS" not in _NON_EQUITY_SYMBOLS
+        assert "AAPL" not in _NON_EQUITY_SYMBOLS
+
+    # --- No regression: promotion gate ---
+    def test_non_equity_never_promoted_anyway(self):
+        """Even if somehow defensible, non-equity weak items can't promote."""
+        item = self._make_weak_causal_strong("BTC", effective_score=0.9)
+        would_promote = (
+            item.get("signal_quality") == "strong"
+            and item.get("causal_link_strength") == "strong"
+            and (item.get("effective_score") or 0) >= 0.6
+            and item.get("investable") is True
+        )
+        assert would_promote is False
+
+    # --- No regression: top_suppressed with mixed policy ---
+    def test_top_suppressed_includes_non_equity(self):
+        """BTC suppressed appears in top_suppressed."""
+        btc = self._make_weak_causal_strong("BTC")
+        btc["suppression_reason"] = "weak_signal_not_tracked"
+        btc["suppressed_by_defensibility_filter"] = True
+        lp = self._make_weak_causal_strong("LP")
+        ds = _build(observed=[lp], suppressed=[btc])
+        c = ds["candidates"]
+        assert c["observed_count"] == 1
+        assert c["suppressed_count"] == 1
+        assert c["top_suppressed"][0]["symbol"] == "BTC"
+
+    # --- No regression: ambiguous tickers ---
+    def test_ambiguous_tickers_not_regressed(self):
+        from app.news.pipeline import classify_news_event
+        result = classify_news_event(
+            "Global markets rally as investors digest rate outlook",
+            "Analysts describe broad risk appetite across sectors.",
+            ["MA", "V"],
+        )
+        assert "MA" not in result["related_assets"]
+        assert "V" not in result["related_assets"]
