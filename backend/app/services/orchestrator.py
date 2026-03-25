@@ -662,6 +662,27 @@ def _build_decision_summary(
         "fresh_demoted": refinement.get("demotions", 0),
     }
 
+    # --- Pipeline counts: single source of truth for final state ---
+    # scoring_summary reflects the scoring stage (pre-enrichment, pre-defensibility).
+    # pipeline_counts reflects the FINAL state after all filtering/promotion/suppression.
+    # When these differ, pipeline_counts is authoritative.
+    suppressed_by_contradiction = [i for i in sup_cands if i.get("suppressed_by_contradiction")]
+    suppressed_by_defensibility = [i for i in sup_cands if i.get("suppressed_by_defensibility_filter")]
+    pipeline_counts = {
+        "actionable_count": len(ext_ops),
+        "observed_count": len(obs_cands),
+        "suppressed_count": len(sup_cands),
+        "suppressed_by_contradiction_count": len(suppressed_by_contradiction),
+        "suppressed_by_defensibility_count": len(suppressed_by_defensibility),
+        "promoted_from_observed_count": len(promoted_from_observed),
+        "relevant_non_investable_count": len(obs_relevant_non_investable),
+        "observed_signal_count": len(obs_signals_real),
+        "observed_catalog_only_count": len(obs_catalog_only),
+        # Scoring-stage vs final-stage delta (for debugging alignment)
+        "scoring_stage_observed": scoring_summary.get("observed_count", 0),
+        "scoring_stage_suppressed": scoring_summary.get("suppressed_count", 0),
+    }
+
     # --- Why selected: derive from rationale_reasons ---
     if unchanged:
         why_selected = f"Sin cambios significativos: {unchanged_reason}"
@@ -678,6 +699,7 @@ def _build_decision_summary(
         "llm_input": llm_summary,
         "candidates": candidates,
         "promotion_events": promotion_events,
+        "pipeline_counts": pipeline_counts,
         "why_selected": why_selected,
     }
 

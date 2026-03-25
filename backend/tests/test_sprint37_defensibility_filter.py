@@ -714,3 +714,111 @@ class TestNonEquityFiltering:
         )
         assert "MA" not in result["related_assets"]
         assert "V" not in result["related_assets"]
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Pipeline counts alignment (Sprint 38)
+# ---------------------------------------------------------------------------
+
+class TestPipelineCounts:
+    """Validates that pipeline_counts in decision_summary reflects the final
+    pipeline state and is consistent with candidates counts.
+    """
+
+    def _make_weak_causal_strong(self, symbol, effective_score=0.5):
+        return {
+            "symbol": symbol, "reason": f"{symbol} deal",
+            "signal_class": "observed_candidate", "effective_score": effective_score,
+            "signal_quality": "weak", "causal_link_strength": "strong",
+            "observed_value_tier": "low", "observed_origin": "signal",
+            "title_mention": True, "operational_status": "relevant_not_investable",
+        }
+
+    def test_pipeline_counts_present(self):
+        """pipeline_counts must exist in decision_summary."""
+        ds = _build(observed=[], suppressed=[])
+        assert "pipeline_counts" in ds
+
+    def test_pipeline_counts_match_candidates(self):
+        """pipeline_counts and candidates must agree on all shared fields."""
+        obs = [
+            _make_strong_signal("META"),
+            _make_catalog("C1"),
+            _make_catalog("C2"),
+        ]
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+        sup[0]["suppressed_by_defensibility_filter"] = True
+        ds = _build(observed=obs, suppressed=sup)
+        c = ds["candidates"]
+        pc = ds["pipeline_counts"]
+
+        assert pc["observed_count"] == c["observed_count"]
+        assert pc["suppressed_count"] == c["suppressed_count"]
+        assert pc["actionable_count"] == c["actionable_count"]
+        assert pc["observed_signal_count"] == c["observed_signal_count"]
+        assert pc["observed_catalog_only_count"] == c["observed_catalog_only_count"]
+        assert pc["relevant_non_investable_count"] == c["relevant_non_investable_count"]
+
+    def test_suppression_breakdown(self):
+        """pipeline_counts breaks down suppression by type."""
+        contradicted = _make_strong_signal("AAPL")
+        contradicted["suppressed_by_contradiction"] = True
+        defensibility = _make_weak_signal("MOEX", 0.2)
+        defensibility["suppression_reason"] = "weak_signal_not_tracked"
+        defensibility["suppressed_by_defensibility_filter"] = True
+        ds = _build(observed=[], suppressed=[contradicted, defensibility])
+        pc = ds["pipeline_counts"]
+
+        assert pc["suppressed_count"] == 2
+        assert pc["suppressed_by_contradiction_count"] == 1
+        assert pc["suppressed_by_defensibility_count"] == 1
+
+    def test_scoring_stage_delta_visible(self):
+        """pipeline_counts shows scoring-stage counts for debugging."""
+        ds = _build(observed=[_make_catalog("C1")], suppressed=[])
+        pc = ds["pipeline_counts"]
+        # scoring_summary was passed empty, so scoring_stage counts are 0
+        assert pc["scoring_stage_observed"] == 0
+        assert pc["scoring_stage_suppressed"] == 0
+
+    def test_mixed_scenario_counts_aligned(self):
+        """Full scenario: actionable + observed + suppressed all aligned."""
+        ext = [_make_strong_signal("TSLA", operational_status="actionable")]
+        obs = [
+            self._make_weak_causal_strong("LP"),
+            _make_strong_signal("META"),
+            _make_catalog("C1"),
+        ]
+        sup_by_def = _make_weak_signal("BTC", 0.5)
+        sup_by_def["suppressed_by_defensibility_filter"] = True
+        sup_by_def["suppression_reason"] = "weak_signal_not_tracked"
+        sup_by_con = _make_strong_signal("NFLX")
+        sup_by_con["suppressed_by_contradiction"] = True
+
+        ds = _build(observed=obs, ext=ext, suppressed=[sup_by_def, sup_by_con])
+        c = ds["candidates"]
+        pc = ds["pipeline_counts"]
+
+        assert pc["actionable_count"] == 1  # TSLA
+        assert pc["observed_count"] == 3  # LP + META + C1
+        assert pc["suppressed_count"] == 2  # BTC + NFLX
+        assert pc["suppressed_by_defensibility_count"] == 1  # BTC
+        assert pc["suppressed_by_contradiction_count"] == 1  # NFLX
+        assert pc["relevant_non_investable_count"] == 1  # LP
+
+        # Cross-check with candidates
+        assert c["actionable_count"] == pc["actionable_count"]
+        assert c["observed_count"] == pc["observed_count"]
+        assert c["suppressed_count"] == pc["suppressed_count"]
+
+    def test_promotion_not_double_counted(self):
+        """Promoted items are in actionable, not in observed — counts must reflect this."""
+        promoted = _make_strong_signal("MELI", effective_score=0.7)
+        promoted["promoted_from_observed"] = True
+        ds = _build(observed=[], ext=[promoted])
+        pc = ds["pipeline_counts"]
+
+        assert pc["actionable_count"] == 1
+        assert pc["observed_count"] == 0
+        assert pc["promoted_from_observed_count"] == 1
