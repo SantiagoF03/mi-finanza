@@ -96,11 +96,19 @@ def _annotate_observed_candidate(item: dict) -> None:
     else:
         item["observed_value_tier"] = "low"
 
-    # operational_status: "relevant_not_investable" for strong+causal but not investable
+    # operational_status: "relevant_not_investable" for items with real causal evidence
+    # but not actionable — either strong quality + not investable, or weak quality
+    # with strong causal link (untracked instrument with real news signal).
     if (
         item.get("signal_quality") == "strong"
         and item.get("causal_link_strength") == "strong"
         and item.get("investable") is not True
+    ):
+        item["operational_status"] = "relevant_not_investable"
+    elif (
+        item.get("signal_quality") == "weak"
+        and item.get("causal_link_strength") == "strong"
+        and item.get("title_mention") is True
     ):
         item["operational_status"] = "relevant_not_investable"
 
@@ -115,6 +123,8 @@ def _is_defensible_observed_candidate(item: dict) -> bool:
     - catalog item (no signal to judge)
     - signal_quality == "strong" AND causal_link_strength == "strong"
     - signal_quality == "strong" AND causal_link_strength == "weak" AND effective_score >= threshold
+    - signal_quality == "weak" AND causal_link_strength == "strong" AND title_mention
+      (real causal evidence even though instrument is untracked — keep for monitoring)
     """
     if item.get("observed_origin") != "signal":
         return True  # catalog → always keep
@@ -124,6 +134,14 @@ def _is_defensible_observed_candidate(item: dict) -> bool:
         item.get("signal_quality") == "strong"
         and item.get("causal_link_strength") == "weak"
         and (item.get("effective_score") or 0) >= _WEAK_SCORE_THRESHOLD
+    ):
+        return True
+    # Weak instrument but strong causal link with title mention:
+    # the news IS about this symbol — worth monitoring even if untracked.
+    if (
+        item.get("signal_quality") == "weak"
+        and item.get("causal_link_strength") == "strong"
+        and item.get("title_mention") is True
     ):
         return True
     return False

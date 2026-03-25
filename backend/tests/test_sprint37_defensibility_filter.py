@@ -411,8 +411,156 @@ class TestRealWorldCalibration:
         spy = _make_catalog("SPY")
         assert _get_observed_suppression_reason(spy) is None
 
-    def test_weak_quality_any_score_suppressed(self):
-        """Unknown instrument → always suppressed regardless of score."""
+    def test_weak_quality_weak_causal_suppressed(self):
+        """Unknown instrument + weak causal → suppressed regardless of score."""
         from app.services.orchestrator import _get_observed_suppression_reason
         item = _make_weak_signal("CRYPTO", effective_score=0.9)
+        # _make_weak_signal defaults: causal_link_strength="weak", title_mention=False
         assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Weak quality + strong causal + title_mention policy (Sprint 37b)
+# ---------------------------------------------------------------------------
+
+class TestWeakCausalStrongPolicy:
+    """LP, JBS, JLL runtime cases: weak instrument but strong causal evidence.
+    These should survive in observed as low-value / relevant_not_investable,
+    NOT be suppressed, and NOT be promoted to actionable.
+    """
+
+    def _make_weak_causal_strong(self, symbol, effective_score=0.5, **kw):
+        """Weak quality + strong causal + title_mention=True (the LP/JBS/JLL case)."""
+        item = {
+            "symbol": symbol,
+            "reason": f"{symbol} announces major deal",
+            "signal_class": "observed_candidate",
+            "effective_score": effective_score,
+            "signal_quality": "weak",
+            "causal_link_strength": "strong",
+            "observed_value_tier": "low",
+            "observed_origin": "signal",
+            "asset_type_status": None,
+            "title_mention": True,
+        }
+        item.update(kw)
+        return item
+
+    # --- Required test 1: weak + causal weak → suppressed ---
+    def test_weak_weak_still_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = _make_weak_signal("MOEX", effective_score=0.6)
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    # --- Required test 2: weak + causal strong + title_mention → NOT suppressed ---
+    def test_weak_causal_strong_title_not_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("LP")
+        assert _get_observed_suppression_reason(item) is None
+
+    def test_weak_causal_strong_title_is_defensible(self):
+        from app.services.orchestrator import _is_defensible_observed_candidate
+        item = self._make_weak_causal_strong("JBS")
+        assert _is_defensible_observed_candidate(item) is True
+
+    def test_weak_causal_strong_title_stays_in_observed(self):
+        from app.services.orchestrator import _split_observed_candidates_by_defensibility
+        items = [
+            self._make_weak_causal_strong("LP"),
+            _make_weak_signal("MOEX", 0.4),  # weak + weak → suppressed
+        ]
+        kept, suppressed = _split_observed_candidates_by_defensibility(items)
+        assert len(kept) == 1
+        assert kept[0]["symbol"] == "LP"
+        assert len(suppressed) == 1
+        assert suppressed[0]["symbol"] == "MOEX"
+
+    def test_weak_causal_strong_gets_relevant_not_investable(self):
+        """Annotation tags these as relevant_not_investable for monitoring."""
+        from app.services.orchestrator import _annotate_observed_candidate
+        item = {"symbol": "JLL", "effective_score": 0.55, "signal_class": "observed_candidate",
+                "title_mention": True, "reason": "JLL reports earnings", "asset_type_status": None}
+        _annotate_observed_candidate(item)
+        assert item["signal_quality"] == "weak"
+        assert item["causal_link_strength"] == "strong"
+        assert item["operational_status"] == "relevant_not_investable"
+        assert item["observed_value_tier"] == "low"
+
+    def test_weak_causal_strong_no_title_still_suppressed(self):
+        """Without title_mention, weak + strong causal still gets suppressed."""
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = self._make_weak_causal_strong("X", title_mention=False)
+        assert _get_observed_suppression_reason(item) == "weak_signal_not_tracked"
+
+    # --- Required test 3: strong + causal strong → NOT suppressed ---
+    def test_strong_strong_not_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = _make_strong_signal("META")
+        assert _get_observed_suppression_reason(item) is None
+
+    # --- Required test 4: strong + causal weak + low score → suppressed ---
+    def test_strong_weak_low_score_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = _make_weak_signal("MA", effective_score=0.54, signal_quality="strong",
+                                 asset_type_status="known_valid")
+        assert _get_observed_suppression_reason(item) == "weak_signal_low_score"
+
+    def test_strong_weak_high_score_not_suppressed(self):
+        from app.services.orchestrator import _get_observed_suppression_reason
+        item = _make_weak_signal("MA", effective_score=0.57, signal_quality="strong",
+                                 asset_type_status="known_valid")
+        assert _get_observed_suppression_reason(item) is None
+
+    # --- Required test 5: promotion gate not regressed ---
+    def test_weak_causal_strong_never_promoted(self):
+        """weak signal_quality items NEVER pass the promotion gate regardless of causal strength."""
+        item = self._make_weak_causal_strong("LP", effective_score=0.8)
+        # Promotion requires signal_quality == "strong"
+        would_promote = (
+            item.get("signal_quality") == "strong"
+            and item.get("causal_link_strength") == "strong"
+            and (item.get("effective_score") or 0) >= 0.6
+            and item.get("investable") is True
+        )
+        assert would_promote is False
+
+    # --- Required test 6: ambiguous tickers not regressed ---
+    def test_ambiguous_tickers_still_filtered(self):
+        from app.news.pipeline import classify_news_event
+        result = classify_news_event(
+            "Global markets rally as investors digest rate outlook",
+            "Analysts describe broad risk appetite across sectors.",
+            ["MA", "V"],
+        )
+        assert "MA" not in result["related_assets"]
+        assert "V" not in result["related_assets"]
+
+    # --- Required test 7: top_suppressed / suppressed_count not regressed ---
+    def test_suppressed_count_with_mixed_policy(self):
+        """LP (weak+strong+title) observed, MOEX (weak+weak) suppressed."""
+        lp = self._make_weak_causal_strong("LP")
+        moex = _make_weak_signal("MOEX", 0.3)
+        moex["suppression_reason"] = "weak_signal_not_tracked"
+        moex["suppressed_by_defensibility_filter"] = True
+        ds = _build(observed=[lp], suppressed=[moex])
+        c = ds["candidates"]
+        assert c["observed_count"] == 1  # LP stays
+        assert c["suppressed_count"] == 1  # MOEX suppressed
+        assert c["top_suppressed"][0]["symbol"] == "MOEX"
+
+    # --- End-to-end through split + decision_summary ---
+    def test_end_to_end_lp_jbs_jll_scenario(self):
+        """Real runtime scenario: LP/JBS/JLL survive, MOEX suppressed."""
+        from app.services.orchestrator import _split_observed_candidates_by_defensibility
+        items = [
+            self._make_weak_causal_strong("LP", effective_score=0.52),
+            self._make_weak_causal_strong("JBS", effective_score=0.48),
+            self._make_weak_causal_strong("JLL", effective_score=0.55),
+            _make_weak_signal("MOEX", 0.38),
+            _make_catalog("SPY"),
+        ]
+        kept, suppressed = _split_observed_candidates_by_defensibility(items)
+        kept_syms = {i["symbol"] for i in kept}
+        suppressed_syms = {i["symbol"] for i in suppressed}
+        assert kept_syms == {"LP", "JBS", "JLL", "SPY"}
+        assert suppressed_syms == {"MOEX"}
