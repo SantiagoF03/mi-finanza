@@ -1074,3 +1074,102 @@ class TestReviewQueue:
         c_cat = ds["candidates"]["catalog_summary"]
         assert rq_cat["count"] == c_cat["count"]
         assert rq_cat["hidden_by_default"] == c_cat["hidden_by_default"]
+
+
+# ---------------------------------------------------------------------------
+# Test 14: ensure_review_queue backfill for old recommendations
+# ---------------------------------------------------------------------------
+
+class TestEnsureReviewQueue:
+    """Validates that ensure_review_queue backfills review_queue from stored
+    candidates/pipeline_counts for recommendations created before Sprint 38c.
+    """
+
+    def test_noop_when_review_queue_present(self):
+        """Already-present review_queue is not overwritten."""
+        from app.services.orchestrator import ensure_review_queue
+        ds = _build(observed=[_make_strong_signal("META")])
+        original_rq = ds["review_queue"]
+        result = ensure_review_queue(ds)
+        assert result["review_queue"] is original_rq  # same object, not rebuilt
+
+    def test_backfills_from_candidates_and_pipeline_counts(self):
+        """Missing review_queue is reconstructed from stored data."""
+        from app.services.orchestrator import ensure_review_queue
+        ds = _build(
+            ext=[_make_strong_signal("AAPL")],
+            observed=[_make_strong_signal("META"), _make_catalog("C1")],
+            suppressed=[_make_weak_signal("MOEX", 0.3)],
+        )
+        # Simulate old recommendation: remove review_queue
+        del ds["review_queue"]
+        assert "review_queue" not in ds
+
+        result = ensure_review_queue(ds)
+        rq = result["review_queue"]
+
+        assert "actionable_now" in rq
+        assert "watchlist_now" in rq
+        assert "relevant_not_investable_now" in rq
+        assert "suppressed_review" in rq
+        assert "catalog_compact" in rq
+        assert "total_items" in rq
+
+        # Counts reconcile with pipeline_counts
+        pc = ds["pipeline_counts"]
+        assert rq["actionable_now"]["count"] == pc["actionable_count"]
+        assert rq["suppressed_review"]["count"] == pc["suppressed_count"]
+        assert rq["total_items"] == pc["actionable_count"] + pc["observed_count"] + pc["suppressed_count"]
+
+    def test_backfill_empty_decision_summary(self):
+        """Empty dict returns as-is (no crash)."""
+        from app.services.orchestrator import ensure_review_queue
+        result = ensure_review_queue({})
+        assert result == {}
+
+    def test_backfill_none_decision_summary(self):
+        """None returns as-is (no crash)."""
+        from app.services.orchestrator import ensure_review_queue
+        result = ensure_review_queue(None)
+        assert result is None
+
+    def test_backfill_items_come_from_candidates_top_lists(self):
+        """Backfilled items use candidates.top_* lists."""
+        from app.services.orchestrator import ensure_review_queue
+        ds = _build(
+            ext=[_make_strong_signal("AAPL")],
+            observed=[_make_strong_signal("META")],
+        )
+        del ds["review_queue"]
+        result = ensure_review_queue(ds)
+        rq = result["review_queue"]
+
+        # actionable_now items should match top_actionable
+        assert len(rq["actionable_now"]["items"]) == len(ds["candidates"]["top_actionable"])
+        # watchlist_now items should match candidates.watchlist
+        assert len(rq["watchlist_now"]["items"]) == len(ds["candidates"]["watchlist"])
+
+    def test_full_shape_present_in_decision_summary(self):
+        """End-to-end: decision_summary from _build always has review_queue with full shape."""
+        ds = _build(
+            ext=[_make_strong_signal("AAPL")],
+            observed=[_make_strong_signal("META"), _make_catalog("C1")],
+            suppressed=[_make_weak_signal("MOEX", 0.3)],
+        )
+        # These keys must always be present in decision_summary
+        required_top = {"primary_driver", "candidates", "pipeline_counts", "review_queue",
+                        "promotion_events", "why_selected"}
+        assert required_top.issubset(ds.keys()), f"Missing: {required_top - ds.keys()}"
+
+        # review_queue shape
+        rq = ds["review_queue"]
+        required_rq = {"actionable_now", "watchlist_now", "relevant_not_investable_now",
+                        "suppressed_review", "catalog_compact", "total_items"}
+        assert required_rq.issubset(rq.keys()), f"Missing: {required_rq - rq.keys()}"
+
+        # Each section has count
+        for section in ("actionable_now", "watchlist_now", "relevant_not_investable_now", "suppressed_review"):
+            assert "count" in rq[section]
+            assert "items" in rq[section]
+        assert "count" in rq["catalog_compact"]
+        assert isinstance(rq["total_items"], int)

@@ -17,7 +17,7 @@ from app.services.execution import (
     get_recent_executions,
     reject_recommendation,
 )
-from app.services.orchestrator import get_current_recommendation, run_cycle
+from app.services.orchestrator import ensure_review_queue, get_current_recommendation, run_cycle
 
 router = APIRouter()
 
@@ -121,7 +121,7 @@ def current_recommendation(db: Session = Depends(get_db)):
         "cluster_traceability": meta.get("cluster_traceability") or [],
         "scoring_summary": meta.get("scoring_summary") or {},
         "fresh_quote_meta": meta.get("fresh_quote_meta") or {},
-        "decision_summary": meta.get("decision_summary") or {},
+        "decision_summary": ensure_review_queue(meta.get("decision_summary") or {}),
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 

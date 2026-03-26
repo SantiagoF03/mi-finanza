@@ -751,6 +751,51 @@ def _build_decision_summary(
     }
 
 
+def ensure_review_queue(decision_summary: dict) -> dict:
+    """Guarantee review_queue is present in decision_summary.
+
+    New recommendations already include it from _build_decision_summary.
+    For older recommendations stored before review_queue existed, this
+    backfills it from the already-persisted candidates / pipeline_counts.
+    Returns the (possibly mutated) decision_summary.
+    """
+    if not decision_summary or "review_queue" in decision_summary:
+        return decision_summary
+
+    candidates = decision_summary.get("candidates", {})
+    pipeline_counts = decision_summary.get("pipeline_counts", {})
+
+    decision_summary["review_queue"] = {
+        "actionable_now": {
+            "count": pipeline_counts.get("actionable_count", candidates.get("actionable_count", 0)),
+            "items": candidates.get("top_actionable", [])[:5],
+        },
+        "watchlist_now": {
+            "count": candidates.get("watchlist_count", pipeline_counts.get("observed_signal_count", 0)),
+            "items": candidates.get("watchlist", [])[:10],
+        },
+        "relevant_not_investable_now": {
+            "count": pipeline_counts.get("relevant_non_investable_count", candidates.get("relevant_non_investable_count", 0)),
+            "items": candidates.get("top_relevant_non_investable", [])[:5],
+        },
+        "suppressed_review": {
+            "count": pipeline_counts.get("suppressed_count", candidates.get("suppressed_count", 0)),
+            "items": candidates.get("top_suppressed", [])[:5],
+        },
+        "catalog_compact": candidates.get("catalog_summary", {
+            "count": pipeline_counts.get("observed_catalog_only_count", 0),
+            "top_by_priority": [],
+            "hidden_by_default": True,
+        }),
+        "total_items": (
+            pipeline_counts.get("actionable_count", candidates.get("actionable_count", 0))
+            + pipeline_counts.get("observed_count", candidates.get("observed_count", 0))
+            + pipeline_counts.get("suppressed_count", candidates.get("suppressed_count", 0))
+        ),
+    }
+    return decision_summary
+
+
 def run_cycle(db: Session, source: str = "manual") -> dict:
     settings = get_settings()
 
