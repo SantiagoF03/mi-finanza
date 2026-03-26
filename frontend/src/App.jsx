@@ -371,8 +371,27 @@ export default function App() {
                       <Badge type="pending">{pc.actionable_count ?? 0} accionables</Badge>
                       <Badge type="low">{pc.observed_count ?? 0} observados</Badge>
                       <Badge type="blocked">{pc.suppressed_count ?? 0} suprimidos</Badge>
-                      {pc.promoted_from_observed_count > 0 && <Badge type="executed">{pc.promoted_from_observed_count} promovidos</Badge>}
+                      {(pc.promoted_from_observed_count ?? 0) > 0 && <Badge type="executed">{pc.promoted_from_observed_count} promovidos</Badge>}
+                      {(pc.relevant_non_investable_count ?? 0) > 0 && <Badge type="low">{pc.relevant_non_investable_count} no invertibles</Badge>}
                     </div>
+                  </section>
+                )}
+
+                {/* Actionable now: top priority items ready to act on */}
+                {rq.actionable_now && rq.actionable_now.count > 0 && (
+                  <section>
+                    <h2>Accionables ahora <span style={{ fontSize: '0.7em', color: '#888' }}>({rq.actionable_now.count})</span></h2>
+                    {(rq.actionable_now.items || []).map((item, idx) => (
+                      <div key={`act-${item.symbol}-${idx}`} className="opportunity-item">
+                        <strong>{item.symbol}</strong>
+                        <div className="opp-badges">
+                          {item.investable && <span className="opp-badge" style={{ background: '#a5d6a7', fontWeight: 600 }}>invertible</span>}
+                          {item.signal_quality && <span className="opp-badge" style={{ background: item.signal_quality === 'strong' ? '#a5d6a7' : '#fff9c4' }}>{item.signal_quality}</span>}
+                          {item.effective_score != null && <span className="opp-badge" style={{ background: '#e3f2fd' }}>score: {(item.effective_score * 100).toFixed(0)}%</span>}
+                        </div>
+                        {item.reason && <div style={{ fontSize: '0.85em' }}>{item.reason}</div>}
+                      </div>
+                    ))}
                   </section>
                 )}
 
@@ -392,6 +411,7 @@ export default function App() {
                           {item.signal_quality && <span className="opp-badge" style={{ background: item.signal_quality === 'strong' ? '#a5d6a7' : '#fff9c4' }}>{item.signal_quality}</span>}
                           {item.causal_link_strength && <span className="opp-badge" style={{ background: '#e8eaf6' }}>causal: {item.causal_link_strength}</span>}
                           {item.operational_status === 'relevant_not_investable' && <span className="opp-badge" style={{ background: '#ffab91' }}>no invertible</span>}
+                          {item.effective_score != null && <span className="opp-badge" style={{ background: '#e3f2fd' }}>score: {(item.effective_score * 100).toFixed(0)}%</span>}
                         </div>
                         {item.reason && <div style={{ fontSize: '0.85em' }}>{item.reason}</div>}
                       </div>

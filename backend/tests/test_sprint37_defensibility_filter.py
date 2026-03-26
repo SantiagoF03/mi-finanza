@@ -1460,6 +1460,16 @@ class TestFrontendConsumptionShape:
         ds = _build(ext=ext, observed=obs, suppressed=sup)
 
         rq = ds["review_queue"]
+
+        # actionable_now shape the frontend reads
+        an = rq["actionable_now"]
+        assert "count" in an
+        assert "items" in an
+        for item in an["items"]:
+            assert "symbol" in item
+            assert "effective_score" in item
+            assert "investable" in item
+
         # watchlist_now shape the frontend reads
         wl = rq["watchlist_now"]
         assert "count" in wl
@@ -1471,6 +1481,7 @@ class TestFrontendConsumptionShape:
             assert "symbol" in item
             assert "signal_quality" in item
             assert "causal_link_strength" in item
+            assert "effective_score" in item
             assert "reason" in item
 
         # suppressed_review shape
