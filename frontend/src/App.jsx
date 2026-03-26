@@ -356,6 +356,104 @@ export default function App() {
             </section>
           )}
 
+          {/* --- Review Queue: human-first signal view (from decision_summary.review_queue) --- */}
+          {(() => {
+            const rq = current?.decision_summary?.review_queue
+            const pc = current?.decision_summary?.pipeline_counts
+            if (!rq) return null
+            return (
+              <>
+                {/* Pipeline counters */}
+                {pc && (
+                  <section>
+                    <h2>Pipeline</h2>
+                    <div className="opp-badges" style={{ flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                      <Badge type="pending">{pc.actionable_count ?? 0} accionables</Badge>
+                      <Badge type="low">{pc.observed_count ?? 0} observados</Badge>
+                      <Badge type="blocked">{pc.suppressed_count ?? 0} suprimidos</Badge>
+                      {(pc.promoted_from_observed_count ?? 0) > 0 && <Badge type="executed">{pc.promoted_from_observed_count} promovidos</Badge>}
+                      {(pc.relevant_non_investable_count ?? 0) > 0 && <Badge type="low">{pc.relevant_non_investable_count} no invertibles</Badge>}
+                    </div>
+                  </section>
+                )}
+
+                {/* Actionable now: top priority items ready to act on */}
+                {rq.actionable_now && rq.actionable_now.count > 0 && (
+                  <section>
+                    <h2>Accionables ahora <span style={{ fontSize: '0.7em', color: '#888' }}>({rq.actionable_now.count})</span></h2>
+                    {(rq.actionable_now.items || []).map((item, idx) => (
+                      <div key={`act-${item.symbol}-${idx}`} className="opportunity-item">
+                        <strong>{item.symbol}</strong>
+                        <div className="opp-badges">
+                          {item.investable && <span className="opp-badge" style={{ background: '#a5d6a7', fontWeight: 600 }}>invertible</span>}
+                          {item.signal_quality && <span className="opp-badge" style={{ background: item.signal_quality === 'strong' ? '#a5d6a7' : '#fff9c4' }}>{item.signal_quality}</span>}
+                          {item.effective_score != null && <span className="opp-badge" style={{ background: '#e3f2fd' }}>score: {(item.effective_score * 100).toFixed(0)}%</span>}
+                        </div>
+                        {item.reason && <div style={{ fontSize: '0.85em' }}>{item.reason}</div>}
+                      </div>
+                    ))}
+                  </section>
+                )}
+
+                {/* Watchlist: main signal monitoring layer */}
+                {rq.watchlist_now && rq.watchlist_now.count > 0 && (
+                  <section>
+                    <h2>Watchlist <span style={{ fontSize: '0.7em', color: '#888' }}>({rq.watchlist_now.count} señales)</span></h2>
+                    {rq.watchlist_now.relevant_not_investable_count > 0 && (
+                      <p style={{ fontSize: '0.85em', color: '#888' }}>
+                        {rq.watchlist_now.investable_signal_count ?? 0} operables · {rq.watchlist_now.relevant_not_investable_count} no invertibles aún
+                      </p>
+                    )}
+                    {(rq.watchlist_now.items || []).map((item, idx) => (
+                      <div key={`wl-${item.symbol}-${idx}`} className="opportunity-item">
+                        <strong>{item.symbol}</strong>
+                        <div className="opp-badges">
+                          {item.signal_quality && <span className="opp-badge" style={{ background: item.signal_quality === 'strong' ? '#a5d6a7' : '#fff9c4' }}>{item.signal_quality}</span>}
+                          {item.causal_link_strength && <span className="opp-badge" style={{ background: '#e8eaf6' }}>causal: {item.causal_link_strength}</span>}
+                          {item.operational_status === 'relevant_not_investable' && <span className="opp-badge" style={{ background: '#ffab91' }}>no invertible</span>}
+                          {item.effective_score != null && <span className="opp-badge" style={{ background: '#e3f2fd' }}>score: {(item.effective_score * 100).toFixed(0)}%</span>}
+                        </div>
+                        {item.reason && <div style={{ fontSize: '0.85em' }}>{item.reason}</div>}
+                      </div>
+                    ))}
+                  </section>
+                )}
+
+                {/* Suppressed: discarded with reason */}
+                {rq.suppressed_review && rq.suppressed_review.count > 0 && (
+                  <section>
+                    <h2>Suprimidos <span style={{ fontSize: '0.7em', color: '#888' }}>({rq.suppressed_review.count})</span></h2>
+                    {(rq.suppressed_review.items || []).map((item, idx) => (
+                      <div key={`sup-${item.symbol}-${idx}`} style={{ padding: '4px 0', borderBottom: '1px solid var(--border)', fontSize: '0.9em' }}>
+                        <strong>{item.symbol}</strong>
+                        {item.suppression_reason && <span style={{ color: '#888', marginLeft: 6 }}>({item.suppression_reason})</span>}
+                      </div>
+                    ))}
+                  </section>
+                )}
+
+                {/* Catalog compact: relegated, collapsed by default */}
+                {rq.catalog_compact && rq.catalog_compact.count > 0 && (
+                  <section>
+                    <details>
+                      <summary style={{ cursor: 'pointer', fontSize: '0.9em', color: '#888' }}>
+                        Catálogo ({rq.catalog_compact.count} instrumentos)
+                      </summary>
+                      {(rq.catalog_compact.top_by_priority || []).map((item, idx) => (
+                        <div key={`cat-${item.symbol}-${idx}`} style={{ padding: '2px 0', fontSize: '0.85em' }}>
+                          {item.symbol}
+                        </div>
+                      ))}
+                      {rq.catalog_compact.count > 3 && (
+                        <p style={{ fontSize: '0.8em', color: '#999' }}>y {rq.catalog_compact.count - 3} más...</p>
+                      )}
+                    </details>
+                  </section>
+                )}
+              </>
+            )
+          })()}
+
           {current?.allowed_assets && (
             <section>
               <h2>Activos permitidos</h2>
