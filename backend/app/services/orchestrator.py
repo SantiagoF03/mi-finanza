@@ -705,6 +705,38 @@ def _build_decision_summary(
     else:
         why_selected = rec.get("rationale", "Sin señales suficientes para actuar.")
 
+    # --- Review queue: unified human-first priority view ---
+    # Single ordered structure for operator/product consumption.
+    # Each section carries its own count + top items. total_items reconciles
+    # with pipeline_counts (actionable + observed + suppressed).
+    review_queue = {
+        "actionable_now": {
+            "count": len(ext_ops),
+            "items": _top_n(ext_ops, n=5, sort_key=_actionable_key),
+        },
+        "watchlist_now": {
+            "count": len(obs_signals_real),
+            "items": _top_n(obs_signals_real, n=10, sort_key=_observed_key),
+        },
+        "relevant_not_investable_now": {
+            "count": len(obs_relevant_non_investable),
+            "items": _top_n(obs_relevant_non_investable, n=5, sort_key=_observed_key),
+        },
+        "suppressed_review": {
+            "count": len(sup_cands),
+            "items": _top_n(sup_cands, n=5),
+        },
+        "catalog_compact": {
+            "count": len(obs_catalog_only),
+            "top_by_priority": _top_n(
+                obs_catalog_only, n=3,
+                sort_key=lambda x: (x.get("priority_score") or 0,),
+            ),
+            "hidden_by_default": True,
+        },
+        "total_items": len(ext_ops) + len(obs_cands) + len(sup_cands),
+    }
+
     return {
         "primary_driver": primary_driver,
         "winning_signal": winning_signal,
@@ -714,6 +746,7 @@ def _build_decision_summary(
         "candidates": candidates,
         "promotion_events": promotion_events,
         "pipeline_counts": pipeline_counts,
+        "review_queue": review_queue,
         "why_selected": why_selected,
     }
 

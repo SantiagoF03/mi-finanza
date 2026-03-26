@@ -963,3 +963,114 @@ class TestWatchlistLayer:
         )
         assert "MA" not in result["related_assets"]
         assert "V" not in result["related_assets"]
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Review queue — unified human-first priority view
+# ---------------------------------------------------------------------------
+
+class TestReviewQueue:
+    """Validates the review_queue block in decision_summary provides a
+    single ordered structure for operator consumption, reconciled with
+    pipeline_counts.
+    """
+
+    def _make_relevant_not_investable(self, symbol, effective_score=0.5):
+        return {
+            "symbol": symbol, "reason": f"{symbol} deal",
+            "signal_class": "observed_candidate", "effective_score": effective_score,
+            "signal_quality": "weak", "causal_link_strength": "strong",
+            "observed_value_tier": "low", "observed_origin": "signal",
+            "title_mention": True, "operational_status": "relevant_not_investable",
+        }
+
+    def test_review_queue_present(self):
+        """review_queue exists in decision_summary."""
+        ds = _build(observed=[], suppressed=[])
+        assert "review_queue" in ds
+        rq = ds["review_queue"]
+        for key in ("actionable_now", "watchlist_now", "relevant_not_investable_now",
+                     "suppressed_review", "catalog_compact", "total_items"):
+            assert key in rq, f"Missing key: {key}"
+
+    def test_review_queue_counts_match_pipeline(self):
+        """review_queue section counts reconcile with pipeline_counts."""
+        ext = [_make_strong_signal("AAPL", effective_score=0.8)]
+        ext[0]["investable"] = True
+        obs = [
+            _make_strong_signal("META"),
+            self._make_relevant_not_investable("LP"),
+            _make_catalog("C1"), _make_catalog("C2"),
+        ]
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+
+        ds = _build(ext=ext, observed=obs, suppressed=sup)
+        rq = ds["review_queue"]
+        pc = ds["pipeline_counts"]
+
+        assert rq["actionable_now"]["count"] == pc["actionable_count"]
+        assert rq["suppressed_review"]["count"] == pc["suppressed_count"]
+        assert rq["catalog_compact"]["count"] == pc["observed_catalog_only_count"]
+        assert rq["total_items"] == pc["actionable_count"] + pc["observed_count"] + pc["suppressed_count"]
+
+    def test_review_queue_sections_populated(self):
+        """Each section has items when data exists."""
+        ext = [_make_strong_signal("AAPL")]
+        ext[0]["investable"] = True
+        obs = [
+            _make_strong_signal("META"),
+            self._make_relevant_not_investable("LP"),
+            _make_catalog("C1"),
+        ]
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+
+        rq = _build(ext=ext, observed=obs, suppressed=sup)["review_queue"]
+
+        assert rq["actionable_now"]["count"] == 1
+        assert len(rq["actionable_now"]["items"]) == 1
+        assert rq["watchlist_now"]["count"] == 2  # META + LP (both are signals)
+        assert rq["relevant_not_investable_now"]["count"] == 1
+        assert rq["relevant_not_investable_now"]["items"][0]["symbol"] == "LP"
+        assert rq["suppressed_review"]["count"] == 1
+        assert rq["catalog_compact"]["count"] == 1
+        assert rq["catalog_compact"]["hidden_by_default"] is True
+
+    def test_review_queue_empty_pipeline(self):
+        """Empty pipeline produces zero counts everywhere."""
+        rq = _build(observed=[], suppressed=[])["review_queue"]
+        assert rq["actionable_now"]["count"] == 0
+        assert rq["watchlist_now"]["count"] == 0
+        assert rq["relevant_not_investable_now"]["count"] == 0
+        assert rq["suppressed_review"]["count"] == 0
+        assert rq["catalog_compact"]["count"] == 0
+        assert rq["total_items"] == 0
+
+    def test_review_queue_watchlist_max_10(self):
+        """watchlist_now items capped at 10."""
+        obs = [_make_strong_signal(f"S{i}", effective_score=0.5 + i * 0.01) for i in range(15)]
+        rq = _build(observed=obs)["review_queue"]
+        assert rq["watchlist_now"]["count"] == 15
+        assert len(rq["watchlist_now"]["items"]) == 10
+
+    def test_review_queue_does_not_break_existing_fields(self):
+        """Adding review_queue doesn't remove or change existing fields."""
+        obs = [_make_strong_signal("META"), _make_catalog("C1")]
+        ds = _build(observed=obs)
+        for key in ("primary_driver", "winning_signal", "candidates",
+                     "pipeline_counts", "promotion_events", "why_selected"):
+            assert key in ds
+        c = ds["candidates"]
+        assert "watchlist" in c
+        assert "catalog_summary" in c
+        assert "top_actionable" in c
+
+    def test_review_queue_catalog_compact_matches_catalog_summary(self):
+        """catalog_compact in review_queue matches catalog_summary in candidates."""
+        cats = [_make_catalog(f"C{i}", priority_score=i * 0.1) for i in range(50)]
+        ds = _build(observed=cats)
+        rq_cat = ds["review_queue"]["catalog_compact"]
+        c_cat = ds["candidates"]["catalog_summary"]
+        assert rq_cat["count"] == c_cat["count"]
+        assert rq_cat["hidden_by_default"] == c_cat["hidden_by_default"]
