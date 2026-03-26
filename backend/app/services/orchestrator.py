@@ -754,14 +754,28 @@ def _build_decision_summary(
     }
 
 
+def _strip_old_review_queue_shape(rq: dict) -> None:
+    """Remove deprecated relevant_not_investable_now from review_queue.
+
+    Ensures watchlist_now has the subcounts before deleting the old key.
+    Idempotent — safe to call on any review_queue shape.
+    """
+    if "relevant_not_investable_now" not in rq:
+        return
+    wl = rq.get("watchlist_now", {})
+    rni_count = rq["relevant_not_investable_now"].get("count", 0)
+    wl.setdefault("relevant_not_investable_count", rni_count)
+    wl.setdefault("investable_signal_count", wl.get("count", 0) - rni_count)
+    del rq["relevant_not_investable_now"]
+
+
 def ensure_review_queue(decision_summary: dict) -> dict:
-    """Guarantee review_queue is present in decision_summary.
+    """Guarantee review_queue is present and uses the deduplicated shape.
 
     New recommendations already include it from _build_decision_summary.
     For older recommendations stored before review_queue existed, this
     backfills it from the already-persisted candidates / pipeline_counts.
-    Also migrates old shape (separate relevant_not_investable_now) to
-    the deduplicated shape (merged into watchlist_now).
+    Always strips relevant_not_investable_now (old shape) if present.
     Returns the (possibly mutated) decision_summary.
     """
     if not decision_summary:
@@ -769,15 +783,7 @@ def ensure_review_queue(decision_summary: dict) -> dict:
 
     rq = decision_summary.get("review_queue")
     if rq is not None:
-        # Migrate old shape: if relevant_not_investable_now exists as
-        # separate section, fold its count into watchlist_now and remove it.
-        if "relevant_not_investable_now" in rq:
-            wl = rq.get("watchlist_now", {})
-            rni_count = rq["relevant_not_investable_now"].get("count", 0)
-            if "relevant_not_investable_count" not in wl:
-                wl["relevant_not_investable_count"] = rni_count
-                wl["investable_signal_count"] = wl.get("count", 0) - rni_count
-            del rq["relevant_not_investable_now"]
+        _strip_old_review_queue_shape(rq)
         return decision_summary
 
     candidates = decision_summary.get("candidates", {})

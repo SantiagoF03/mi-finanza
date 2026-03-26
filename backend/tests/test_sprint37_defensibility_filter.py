@@ -1204,6 +1204,32 @@ class TestEnsureReviewQueue:
         assert rq["watchlist_now"]["relevant_not_investable_count"] == 2
         assert rq["watchlist_now"]["investable_signal_count"] == 3  # 5 - 2
 
+    def test_ensure_migrates_hybrid_shape(self):
+        """Migrates even when watchlist_now already has subcounts (hybrid DB state)."""
+        from app.services.orchestrator import ensure_review_queue
+        # Exact runtime scenario: watchlist_now has subcounts AND old key still present
+        hybrid_rq = {
+            "actionable_now": {"count": 0, "items": []},
+            "watchlist_now": {
+                "count": 5, "items": [{"symbol": s} for s in ("LP", "JLL", "FY", "SK", "ASX")],
+                "relevant_not_investable_count": 5,
+                "investable_signal_count": 0,
+            },
+            "relevant_not_investable_now": {
+                "count": 5,
+                "items": [{"symbol": s} for s in ("LP", "JLL", "FY", "SK", "ASX")],
+            },
+            "suppressed_review": {"count": 3, "items": []},
+            "catalog_compact": {"count": 1790, "top_by_priority": [], "hidden_by_default": True},
+            "total_items": 1798,
+        }
+        ds = {"review_queue": hybrid_rq}
+        result = ensure_review_queue(ds)
+        rq = result["review_queue"]
+        assert "relevant_not_investable_now" not in rq
+        assert rq["watchlist_now"]["relevant_not_investable_count"] == 5
+        assert rq["watchlist_now"]["investable_signal_count"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Test 15: Deduplication invariant — no item in two review_queue sections
