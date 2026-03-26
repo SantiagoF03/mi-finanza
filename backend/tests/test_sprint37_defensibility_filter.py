@@ -1426,3 +1426,114 @@ class TestConsumerGuidance:
         result = ensure_review_queue(ds)
         assert "consumer_guidance" in result
         assert result["consumer_guidance"]["primary_view"] == "review_queue"
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Frontend consumption shape — full response contract
+# ---------------------------------------------------------------------------
+
+class TestFrontendConsumptionShape:
+    """Validates the exact shape the frontend needs from decision_summary.
+    If any of these fail, the frontend review_queue section will break.
+    """
+
+    def _make_rni(self, symbol):
+        return {
+            "symbol": symbol, "reason": f"{symbol} deal",
+            "signal_class": "observed_candidate", "effective_score": 0.5,
+            "signal_quality": "weak", "causal_link_strength": "strong",
+            "observed_value_tier": "low", "observed_origin": "signal",
+            "title_mention": True, "operational_status": "relevant_not_investable",
+        }
+
+    def test_review_queue_full_shape_for_frontend(self):
+        """The exact keys the frontend reads from review_queue."""
+        ext = [_make_strong_signal("AAPL")]
+        ext[0]["investable"] = True
+        obs = [
+            _make_strong_signal("META"),
+            self._make_rni("LP"),
+            _make_catalog("C1"), _make_catalog("C2"),
+        ]
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+        ds = _build(ext=ext, observed=obs, suppressed=sup)
+
+        rq = ds["review_queue"]
+        # watchlist_now shape the frontend reads
+        wl = rq["watchlist_now"]
+        assert "count" in wl
+        assert "items" in wl
+        assert "relevant_not_investable_count" in wl
+        assert "investable_signal_count" in wl
+        # Each item has the fields the frontend renders
+        for item in wl["items"]:
+            assert "symbol" in item
+            assert "signal_quality" in item
+            assert "causal_link_strength" in item
+            assert "reason" in item
+
+        # suppressed_review shape
+        sr = rq["suppressed_review"]
+        assert "count" in sr
+        assert "items" in sr
+        for item in sr["items"]:
+            assert "symbol" in item
+            assert "suppression_reason" in item
+
+        # catalog_compact shape
+        cc = rq["catalog_compact"]
+        assert "count" in cc
+        assert "top_by_priority" in cc
+
+    def test_pipeline_counts_shape_for_badges(self):
+        """The exact keys the frontend reads from pipeline_counts for badges."""
+        obs = [_make_strong_signal("META")]
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+        ds = _build(observed=obs, suppressed=sup)
+        pc = ds["pipeline_counts"]
+        # Frontend reads these for badges
+        assert "actionable_count" in pc
+        assert "observed_count" in pc
+        assert "suppressed_count" in pc
+        assert "promoted_from_observed_count" in pc
+
+    def test_consumer_guidance_shape(self):
+        """consumer_guidance tells frontend which view to use."""
+        ds = _build(observed=[])
+        cg = ds["consumer_guidance"]
+        assert cg["primary_view"] == "review_queue"
+        assert cg["metrics_view"] == "pipeline_counts"
+        assert cg["detailed_view"] == "candidates"
+
+    def test_fallback_when_review_queue_missing(self):
+        """Frontend shouldn't crash if review_queue is absent (old rec)."""
+        from app.services.orchestrator import ensure_review_queue
+        ds = _build(observed=[_make_strong_signal("META"), _make_catalog("C1")])
+        # Simulate old rec: no review_queue, no consumer_guidance
+        del ds["review_queue"]
+        del ds["consumer_guidance"]
+        result = ensure_review_queue(ds)
+        # ensure_review_queue backfills both
+        assert "review_queue" in result
+        assert "consumer_guidance" in result
+        rq = result["review_queue"]
+        assert "watchlist_now" in rq
+        assert "suppressed_review" in rq
+        assert "catalog_compact" in rq
+
+    def test_no_relevant_not_investable_now_in_final_shape(self):
+        """Frontend relies on relevant_not_investable_now NOT existing."""
+        obs = [_make_strong_signal("META"), self._make_rni("LP")]
+        ds = _build(observed=obs)
+        assert "relevant_not_investable_now" not in ds["review_queue"]
+
+    def test_watchlist_items_include_operational_status(self):
+        """Frontend uses operational_status to show 'no invertible' badge."""
+        obs = [self._make_rni("LP"), _make_strong_signal("META")]
+        rq = _build(observed=obs)["review_queue"]
+        rni_items = [i for i in rq["watchlist_now"]["items"]
+                     if i.get("operational_status") == "relevant_not_investable"]
+        assert len(rni_items) == 1
+        assert rni_items[0]["symbol"] == "LP"
