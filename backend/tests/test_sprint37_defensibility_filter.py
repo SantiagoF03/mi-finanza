@@ -985,13 +985,18 @@ class TestReviewQueue:
         }
 
     def test_review_queue_present(self):
-        """review_queue exists in decision_summary."""
+        """review_queue exists in decision_summary with deduplicated shape."""
         ds = _build(observed=[], suppressed=[])
         assert "review_queue" in ds
         rq = ds["review_queue"]
-        for key in ("actionable_now", "watchlist_now", "relevant_not_investable_now",
+        for key in ("actionable_now", "watchlist_now",
                      "suppressed_review", "catalog_compact", "total_items"):
             assert key in rq, f"Missing key: {key}"
+        # relevant_not_investable_now is NOT a separate section anymore
+        assert "relevant_not_investable_now" not in rq
+        # It's a subcount inside watchlist_now
+        assert "relevant_not_investable_count" in rq["watchlist_now"]
+        assert "investable_signal_count" in rq["watchlist_now"]
 
     def test_review_queue_counts_match_pipeline(self):
         """review_queue section counts reconcile with pipeline_counts."""
@@ -1031,8 +1036,8 @@ class TestReviewQueue:
         assert rq["actionable_now"]["count"] == 1
         assert len(rq["actionable_now"]["items"]) == 1
         assert rq["watchlist_now"]["count"] == 2  # META + LP (both are signals)
-        assert rq["relevant_not_investable_now"]["count"] == 1
-        assert rq["relevant_not_investable_now"]["items"][0]["symbol"] == "LP"
+        assert rq["watchlist_now"]["relevant_not_investable_count"] == 1
+        assert rq["watchlist_now"]["investable_signal_count"] == 1
         assert rq["suppressed_review"]["count"] == 1
         assert rq["catalog_compact"]["count"] == 1
         assert rq["catalog_compact"]["hidden_by_default"] is True
@@ -1042,7 +1047,7 @@ class TestReviewQueue:
         rq = _build(observed=[], suppressed=[])["review_queue"]
         assert rq["actionable_now"]["count"] == 0
         assert rq["watchlist_now"]["count"] == 0
-        assert rq["relevant_not_investable_now"]["count"] == 0
+        assert rq["watchlist_now"]["relevant_not_investable_count"] == 0
         assert rq["suppressed_review"]["count"] == 0
         assert rq["catalog_compact"]["count"] == 0
         assert rq["total_items"] == 0
@@ -1086,12 +1091,13 @@ class TestEnsureReviewQueue:
     """
 
     def test_noop_when_review_queue_present(self):
-        """Already-present review_queue is not overwritten."""
+        """Already-present review_queue keeps same object (no rebuild)."""
         from app.services.orchestrator import ensure_review_queue
         ds = _build(observed=[_make_strong_signal("META")])
         original_rq = ds["review_queue"]
         result = ensure_review_queue(ds)
         assert result["review_queue"] is original_rq  # same object, not rebuilt
+        assert "relevant_not_investable_now" not in result["review_queue"]
 
     def test_backfills_from_candidates_and_pipeline_counts(self):
         """Missing review_queue is reconstructed from stored data."""
@@ -1110,10 +1116,11 @@ class TestEnsureReviewQueue:
 
         assert "actionable_now" in rq
         assert "watchlist_now" in rq
-        assert "relevant_not_investable_now" in rq
+        assert "relevant_not_investable_now" not in rq  # merged into watchlist_now
         assert "suppressed_review" in rq
         assert "catalog_compact" in rq
         assert "total_items" in rq
+        assert "relevant_not_investable_count" in rq["watchlist_now"]
 
         # Counts reconcile with pipeline_counts
         pc = ds["pipeline_counts"]
@@ -1161,15 +1168,163 @@ class TestEnsureReviewQueue:
                         "promotion_events", "why_selected"}
         assert required_top.issubset(ds.keys()), f"Missing: {required_top - ds.keys()}"
 
-        # review_queue shape
+        # review_queue shape (deduplicated: no separate relevant_not_investable_now)
         rq = ds["review_queue"]
-        required_rq = {"actionable_now", "watchlist_now", "relevant_not_investable_now",
+        required_rq = {"actionable_now", "watchlist_now",
                         "suppressed_review", "catalog_compact", "total_items"}
         assert required_rq.issubset(rq.keys()), f"Missing: {required_rq - rq.keys()}"
+        assert "relevant_not_investable_now" not in rq
 
-        # Each section has count
-        for section in ("actionable_now", "watchlist_now", "relevant_not_investable_now", "suppressed_review"):
+        # Each section has count + items
+        for section in ("actionable_now", "watchlist_now", "suppressed_review"):
             assert "count" in rq[section]
             assert "items" in rq[section]
+        # watchlist_now has subcounts
+        assert "relevant_not_investable_count" in rq["watchlist_now"]
+        assert "investable_signal_count" in rq["watchlist_now"]
         assert "count" in rq["catalog_compact"]
         assert isinstance(rq["total_items"], int)
+
+    def test_ensure_migrates_old_shape(self):
+        """ensure_review_queue migrates old shape (separate relevant_not_investable_now)."""
+        from app.services.orchestrator import ensure_review_queue
+        # Simulate old-shape review_queue with separate section
+        old_rq = {
+            "actionable_now": {"count": 1, "items": []},
+            "watchlist_now": {"count": 5, "items": []},
+            "relevant_not_investable_now": {"count": 2, "items": []},
+            "suppressed_review": {"count": 1, "items": []},
+            "catalog_compact": {"count": 10, "top_by_priority": [], "hidden_by_default": True},
+            "total_items": 17,
+        }
+        ds = {"review_queue": old_rq}
+        result = ensure_review_queue(ds)
+        rq = result["review_queue"]
+        assert "relevant_not_investable_now" not in rq
+        assert rq["watchlist_now"]["relevant_not_investable_count"] == 2
+        assert rq["watchlist_now"]["investable_signal_count"] == 3  # 5 - 2
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Deduplication invariant — no item in two review_queue sections
+# ---------------------------------------------------------------------------
+
+class TestReviewQueueDedup:
+    """Validates that review_queue never shows the same item in multiple sections."""
+
+    def _make_relevant_not_investable(self, symbol, effective_score=0.5):
+        return {
+            "symbol": symbol, "reason": f"{symbol} deal",
+            "signal_class": "observed_candidate", "effective_score": effective_score,
+            "signal_quality": "weak", "causal_link_strength": "strong",
+            "observed_value_tier": "low", "observed_origin": "signal",
+            "title_mention": True, "operational_status": "relevant_not_investable",
+        }
+
+    def test_no_duplicate_items_across_sections(self):
+        """No symbol appears in more than one review_queue section."""
+        ext = [_make_strong_signal("AAPL")]
+        ext[0]["investable"] = True
+        obs = [
+            _make_strong_signal("META"),
+            self._make_relevant_not_investable("LP"),
+            self._make_relevant_not_investable("JBS"),
+            self._make_relevant_not_investable("JLL"),
+            _make_catalog("C1"), _make_catalog("C2"),
+        ]
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+
+        rq = _build(ext=ext, observed=obs, suppressed=sup)["review_queue"]
+
+        # Collect all symbols from each section
+        actionable_syms = {i["symbol"] for i in rq["actionable_now"]["items"]}
+        watchlist_syms = {i["symbol"] for i in rq["watchlist_now"]["items"]}
+        suppressed_syms = {i["symbol"] for i in rq["suppressed_review"]["items"]}
+        catalog_syms = {i.get("symbol") for i in rq["catalog_compact"].get("top_by_priority", [])}
+
+        # No overlap between watchlist and any other section
+        assert not watchlist_syms & suppressed_syms, "watchlist/suppressed overlap"
+        assert not watchlist_syms & catalog_syms, "watchlist/catalog overlap"
+        assert not actionable_syms & suppressed_syms, "actionable/suppressed overlap"
+
+    def test_multiple_relevant_not_investable_in_watchlist(self):
+        """Multiple relevant_not_investable items appear in watchlist_now with correct subcount."""
+        obs = [
+            _make_strong_signal("META"),
+            self._make_relevant_not_investable("LP"),
+            self._make_relevant_not_investable("JBS"),
+            self._make_relevant_not_investable("JLL"),
+            self._make_relevant_not_investable("SK"),
+            self._make_relevant_not_investable("ASX"),
+        ]
+        rq = _build(observed=obs)["review_queue"]
+
+        assert rq["watchlist_now"]["count"] == 6  # all are signals
+        assert rq["watchlist_now"]["relevant_not_investable_count"] == 5
+        assert rq["watchlist_now"]["investable_signal_count"] == 1  # META
+
+        # All items in one list, no separate section
+        watchlist_symbols = {i["symbol"] for i in rq["watchlist_now"]["items"]}
+        assert {"LP", "JBS", "JLL", "SK", "ASX", "META"} == watchlist_symbols
+        assert "relevant_not_investable_now" not in rq
+
+    def test_subcounts_add_up(self):
+        """investable_signal_count + relevant_not_investable_count == count."""
+        obs = [
+            _make_strong_signal("META"),
+            _make_strong_signal("GOOG"),
+            self._make_relevant_not_investable("LP"),
+            self._make_relevant_not_investable("JBS"),
+        ]
+        rq = _build(observed=obs)["review_queue"]
+        wl = rq["watchlist_now"]
+        assert wl["investable_signal_count"] + wl["relevant_not_investable_count"] == wl["count"]
+
+    def test_counts_aligned_with_pipeline_counts(self):
+        """review_queue counts reconcile with pipeline_counts after dedup."""
+        obs = [
+            _make_strong_signal("META"),
+            self._make_relevant_not_investable("LP"),
+            _make_catalog("C1"),
+        ]
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+
+        ds = _build(observed=obs, suppressed=sup)
+        rq = ds["review_queue"]
+        pc = ds["pipeline_counts"]
+
+        assert rq["actionable_now"]["count"] == pc["actionable_count"]
+        assert rq["watchlist_now"]["count"] == pc["observed_signal_count"]
+        assert rq["watchlist_now"]["relevant_not_investable_count"] == pc["relevant_non_investable_count"]
+        assert rq["suppressed_review"]["count"] == pc["suppressed_count"]
+        assert rq["catalog_compact"]["count"] == pc["observed_catalog_only_count"]
+
+    def test_no_regression_watchlist_original(self):
+        """candidates.watchlist still exists and is unaffected."""
+        obs = [_make_strong_signal("META"), self._make_relevant_not_investable("LP")]
+        ds = _build(observed=obs)
+        c = ds["candidates"]
+        assert "watchlist" in c
+        assert c["watchlist_count"] == 2
+        # top_relevant_non_investable still in candidates (backward compat)
+        assert "top_relevant_non_investable" in c
+
+    def test_no_regression_top_suppressed(self):
+        """candidates.top_suppressed still works."""
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+        ds = _build(observed=[], suppressed=sup)
+        assert ds["candidates"]["top_suppressed"][0]["symbol"] == "MOEX"
+
+    def test_no_regression_promotion_gate(self):
+        """Weak relevant_not_investable items don't promote to actionable."""
+        item = self._make_relevant_not_investable("LP", effective_score=0.8)
+        would_promote = (
+            item.get("signal_quality") == "strong"
+            and item.get("causal_link_strength") == "strong"
+            and (item.get("effective_score") or 0) >= 0.6
+            and item.get("investable") is True
+        )
+        assert would_promote is False

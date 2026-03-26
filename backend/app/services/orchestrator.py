@@ -709,6 +709,11 @@ def _build_decision_summary(
     # Single ordered structure for operator/product consumption.
     # Each section carries its own count + top items. total_items reconciles
     # with pipeline_counts (actionable + observed + suppressed).
+    # watchlist_now is the PRIMARY signal list. relevant_not_investable items
+    # live inside watchlist_now (not duplicated in a separate section).
+    # relevant_not_investable_count is a subcount for filtering/display.
+    obs_watchlist_only = [i for i in obs_signals_real
+                          if i.get("operational_status") != "relevant_not_investable"]
     review_queue = {
         "actionable_now": {
             "count": len(ext_ops),
@@ -717,10 +722,8 @@ def _build_decision_summary(
         "watchlist_now": {
             "count": len(obs_signals_real),
             "items": _top_n(obs_signals_real, n=10, sort_key=_observed_key),
-        },
-        "relevant_not_investable_now": {
-            "count": len(obs_relevant_non_investable),
-            "items": _top_n(obs_relevant_non_investable, n=5, sort_key=_observed_key),
+            "relevant_not_investable_count": len(obs_relevant_non_investable),
+            "investable_signal_count": len(obs_watchlist_only),
         },
         "suppressed_review": {
             "count": len(sup_cands),
@@ -757,13 +760,31 @@ def ensure_review_queue(decision_summary: dict) -> dict:
     New recommendations already include it from _build_decision_summary.
     For older recommendations stored before review_queue existed, this
     backfills it from the already-persisted candidates / pipeline_counts.
+    Also migrates old shape (separate relevant_not_investable_now) to
+    the deduplicated shape (merged into watchlist_now).
     Returns the (possibly mutated) decision_summary.
     """
-    if not decision_summary or "review_queue" in decision_summary:
+    if not decision_summary:
+        return decision_summary
+
+    rq = decision_summary.get("review_queue")
+    if rq is not None:
+        # Migrate old shape: if relevant_not_investable_now exists as
+        # separate section, fold its count into watchlist_now and remove it.
+        if "relevant_not_investable_now" in rq:
+            wl = rq.get("watchlist_now", {})
+            rni_count = rq["relevant_not_investable_now"].get("count", 0)
+            if "relevant_not_investable_count" not in wl:
+                wl["relevant_not_investable_count"] = rni_count
+                wl["investable_signal_count"] = wl.get("count", 0) - rni_count
+            del rq["relevant_not_investable_now"]
         return decision_summary
 
     candidates = decision_summary.get("candidates", {})
     pipeline_counts = decision_summary.get("pipeline_counts", {})
+
+    watchlist_count = candidates.get("watchlist_count", pipeline_counts.get("observed_signal_count", 0))
+    rni_count = pipeline_counts.get("relevant_non_investable_count", candidates.get("relevant_non_investable_count", 0))
 
     decision_summary["review_queue"] = {
         "actionable_now": {
@@ -771,12 +792,10 @@ def ensure_review_queue(decision_summary: dict) -> dict:
             "items": candidates.get("top_actionable", [])[:5],
         },
         "watchlist_now": {
-            "count": candidates.get("watchlist_count", pipeline_counts.get("observed_signal_count", 0)),
+            "count": watchlist_count,
             "items": candidates.get("watchlist", [])[:10],
-        },
-        "relevant_not_investable_now": {
-            "count": pipeline_counts.get("relevant_non_investable_count", candidates.get("relevant_non_investable_count", 0)),
-            "items": candidates.get("top_relevant_non_investable", [])[:5],
+            "relevant_not_investable_count": rni_count,
+            "investable_signal_count": watchlist_count - rni_count,
         },
         "suppressed_review": {
             "count": pipeline_counts.get("suppressed_count", candidates.get("suppressed_count", 0)),
