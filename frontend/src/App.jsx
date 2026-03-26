@@ -380,6 +380,7 @@ export default function App() {
                     {(rq.actionable_now.items || []).map((item, idx) => (
                       <div key={`act-${item.symbol}-${idx}`} className="opportunity-item">
                         <strong>{item.symbol}</strong>
+                        {item.effective_score != null && <span style={{ fontSize: '0.8em', color: '#888', marginLeft: 6 }}>score {(item.effective_score * 100).toFixed(0)}%</span>}
                         <div className="opp-badges">
                           {item.investable && <span className="opp-badge" style={{ background: '#a5d6a7', fontWeight: 600 }}>invertible</span>}
                           {item.signal_quality && <span className="opp-badge" style={{ background: item.signal_quality === 'strong' ? '#a5d6a7' : '#fff9c4' }}>{item.signal_quality === 'strong' ? 'señal fuerte' : 'señal débil'}</span>}
@@ -402,6 +403,7 @@ export default function App() {
                     {(rq.watchlist_now.items || []).map((item, idx) => (
                       <div key={`wl-${item.symbol}-${idx}`} className="opportunity-item">
                         <strong>{item.symbol}</strong>
+                        {item.effective_score != null && <span style={{ fontSize: '0.8em', color: '#888', marginLeft: 6 }}>score {(item.effective_score * 100).toFixed(0)}%</span>}
                         <div className="opp-badges">
                           {item.signal_quality && <span className="opp-badge" style={{ background: item.signal_quality === 'strong' ? '#a5d6a7' : '#fff9c4' }}>{item.signal_quality === 'strong' ? 'señal fuerte' : 'señal débil'}</span>}
                           {item.operational_status === 'relevant_not_investable' && <span className="opp-badge" style={{ background: '#ffab91' }}>no invertible</span>}
