@@ -1354,3 +1354,75 @@ class TestReviewQueueDedup:
             and item.get("investable") is True
         )
         assert would_promote is False
+
+
+# ---------------------------------------------------------------------------
+# Test 16: consumer_guidance — explicit API contract
+# ---------------------------------------------------------------------------
+
+class TestConsumerGuidance:
+    """Validates the consumer_guidance block formalizes the consumption contract."""
+
+    def test_consumer_guidance_present(self):
+        """consumer_guidance exists in decision_summary."""
+        ds = _build(observed=[], suppressed=[])
+        assert "consumer_guidance" in ds
+
+    def test_primary_view_is_review_queue(self):
+        ds = _build(observed=[_make_strong_signal("META")])
+        cg = ds["consumer_guidance"]
+        assert cg["primary_view"] == "review_queue"
+        assert "review_queue" in ds  # the referenced key exists
+
+    def test_metrics_view_is_pipeline_counts(self):
+        ds = _build(observed=[_make_strong_signal("META")])
+        cg = ds["consumer_guidance"]
+        assert cg["metrics_view"] == "pipeline_counts"
+        assert "pipeline_counts" in ds
+
+    def test_detailed_view_is_candidates(self):
+        ds = _build(observed=[_make_strong_signal("META")])
+        cg = ds["consumer_guidance"]
+        assert cg["detailed_view"] == "candidates"
+        assert "candidates" in ds
+
+    def test_has_version(self):
+        ds = _build(observed=[])
+        assert "version" in ds["consumer_guidance"]
+
+    def test_no_regression_review_queue(self):
+        obs = [_make_strong_signal("META"), _make_catalog("C1")]
+        ds = _build(observed=obs)
+        rq = ds["review_queue"]
+        assert "actionable_now" in rq
+        assert "watchlist_now" in rq
+        assert "suppressed_review" in rq
+        assert "catalog_compact" in rq
+
+    def test_no_regression_pipeline_counts(self):
+        obs = [_make_strong_signal("META")]
+        sup = [_make_weak_signal("MOEX", 0.3)]
+        sup[0]["suppression_reason"] = "weak_signal_not_tracked"
+        ds = _build(observed=obs, suppressed=sup)
+        pc = ds["pipeline_counts"]
+        assert "actionable_count" in pc
+        assert "observed_count" in pc
+        assert "suppressed_count" in pc
+
+    def test_no_regression_candidates(self):
+        obs = [_make_strong_signal("META"), _make_catalog("C1")]
+        ds = _build(observed=obs)
+        c = ds["candidates"]
+        assert "watchlist" in c
+        assert "catalog_summary" in c
+        assert "top_suppressed" in c
+        assert "top_actionable" in c
+
+    def test_backfill_for_old_recommendations(self):
+        """ensure_review_queue backfills consumer_guidance for old recs."""
+        from app.services.orchestrator import ensure_review_queue
+        ds = _build(observed=[_make_strong_signal("META")])
+        del ds["consumer_guidance"]
+        result = ensure_review_queue(ds)
+        assert "consumer_guidance" in result
+        assert result["consumer_guidance"]["primary_view"] == "review_queue"

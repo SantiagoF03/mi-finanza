@@ -740,6 +740,17 @@ def _build_decision_summary(
         "total_items": len(ext_ops) + len(obs_cands) + len(sup_cands),
     }
 
+    # --- Consumer guidance: explicit contract for frontend / human consumers ---
+    consumer_guidance = {
+        "primary_view": "review_queue",
+        "primary_view_purpose": "Human-first prioritized view: actionable, watchlist, suppressed, catalog.",
+        "metrics_view": "pipeline_counts",
+        "metrics_view_purpose": "Final pipeline state counts for reconciliation and debugging.",
+        "detailed_view": "candidates",
+        "detailed_view_purpose": "Full technical breakdown with top-N lists. Backward-compatible.",
+        "version": "38c",
+    }
+
     return {
         "primary_driver": primary_driver,
         "winning_signal": winning_signal,
@@ -750,6 +761,7 @@ def _build_decision_summary(
         "promotion_events": promotion_events,
         "pipeline_counts": pipeline_counts,
         "review_queue": review_queue,
+        "consumer_guidance": consumer_guidance,
         "why_selected": why_selected,
     }
 
@@ -780,6 +792,18 @@ def ensure_review_queue(decision_summary: dict) -> dict:
     """
     if not decision_summary:
         return decision_summary
+
+    # Backfill consumer_guidance for old recommendations
+    if "consumer_guidance" not in decision_summary and len(decision_summary) > 1:
+        decision_summary["consumer_guidance"] = {
+            "primary_view": "review_queue",
+            "primary_view_purpose": "Human-first prioritized view: actionable, watchlist, suppressed, catalog.",
+            "metrics_view": "pipeline_counts",
+            "metrics_view_purpose": "Final pipeline state counts for reconciliation and debugging.",
+            "detailed_view": "candidates",
+            "detailed_view_purpose": "Full technical breakdown with top-N lists. Backward-compatible.",
+            "version": "38c",
+        }
 
     rq = decision_summary.get("review_queue")
     if rq is not None:
