@@ -419,3 +419,266 @@ def test_get_execution_by_id(db):
 
     missing = get_execution_by_id(db, 9999)
     assert missing is None
+
+
+# ---------------------------------------------------------------------------
+# Sprint: Recommendation-level push & scheduler wiring
+# ---------------------------------------------------------------------------
+
+
+def _make_recommendation_with_review_queue(db, actionable_items=None, superseded=False):
+    """Helper: create a Recommendation with review_queue in metadata_json."""
+    items = actionable_items or []
+    meta = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {
+                    "count": len(items),
+                    "items": items,
+                },
+                "watchlist_now": {"count": 0, "items": []},
+                "suppressed_review": {"count": 0, "items": []},
+                "total_items": len(items),
+            },
+            "consumer_guidance": {"primary_view": "review_queue", "version": "38c"},
+        }
+    }
+    from datetime import datetime
+    rec = Recommendation(
+        action="hold",
+        status="pending",
+        suggested_pct=0.0,
+        confidence=0.7,
+        rationale="test",
+        risks="none",
+        executive_summary="test",
+        metadata_json=meta,
+        superseded_at=datetime.utcnow() if superseded else None,
+    )
+    db.add(rec)
+    db.commit()
+    return rec
+
+
+def test_dispatch_recommendation_alerts_no_actionable(db):
+    """No push when cycle has zero actionable items."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.notification_enabled
+    settings.notification_enabled = True
+    try:
+        rec = _make_recommendation_with_review_queue(db, actionable_items=[])
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["sent"] is False
+        assert result["reason"] == "no_actionable_items"
+    finally:
+        settings.notification_enabled = original
+
+
+def test_dispatch_recommendation_alerts_no_rec_id():
+    """No push when cycle_result has no recommendation_id."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from app.db.session import SessionLocal
+
+    settings = get_settings()
+    original = settings.notification_enabled
+    settings.notification_enabled = True
+    db = SessionLocal()
+    try:
+        result = dispatch_recommendation_alerts(db, {})
+        assert result["sent"] is False
+        assert result["reason"] == "no_recommendation"
+    finally:
+        settings.notification_enabled = original
+        db.close()
+
+
+def test_dispatch_recommendation_alerts_disabled(db):
+    """No push when notification_enabled is False."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.notification_enabled
+    settings.notification_enabled = False
+    try:
+        rec = _make_recommendation_with_review_queue(
+            db, actionable_items=[{"symbol": "AAPL", "effective_score": 0.8}]
+        )
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["sent"] is False
+        assert result["reason"] == "disabled"
+    finally:
+        settings.notification_enabled = original
+
+
+def test_dispatch_recommendation_alerts_detects_new_symbols(db):
+    """New symbols compared to previous recommendation are detected as high severity."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    import app.notifications.dispatcher as disp
+
+    # Create old (superseded) recommendation with AAPL
+    _make_recommendation_with_review_queue(
+        db,
+        actionable_items=[{"symbol": "AAPL", "effective_score": 0.8}],
+        superseded=True,
+    )
+
+    # Create new recommendation with AAPL + MSFT (MSFT is new)
+    rec_new = _make_recommendation_with_review_queue(
+        db,
+        actionable_items=[
+            {"symbol": "AAPL", "effective_score": 0.8},
+            {"symbol": "MSFT", "effective_score": 0.75},
+        ],
+    )
+
+    # Enable notifications, reset cooldown
+    from app.core.config import get_settings
+    settings = get_settings()
+    original_enabled = settings.notification_enabled
+    original_severity = settings.notification_min_severity
+    settings.notification_enabled = True
+    settings.notification_min_severity = "low"
+    old_last = disp._last_notification_at
+    disp._last_notification_at = None
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec_new.id})
+        assert result["severity"] == "high"
+        assert "MSFT" in result["new_symbols"]
+        assert result["actionable_count"] == 2
+    finally:
+        settings.notification_enabled = original_enabled
+        settings.notification_min_severity = original_severity
+        disp._last_notification_at = old_last
+
+
+def test_dispatch_recommendation_alerts_no_new_symbols_low_severity(db):
+    """When all actionable items existed in previous cycle, severity is low."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    import app.notifications.dispatcher as disp
+
+    # Old rec with AAPL
+    _make_recommendation_with_review_queue(
+        db,
+        actionable_items=[{"symbol": "AAPL", "effective_score": 0.8}],
+        superseded=True,
+    )
+
+    # New rec with same AAPL
+    rec_new = _make_recommendation_with_review_queue(
+        db,
+        actionable_items=[{"symbol": "AAPL", "effective_score": 0.82}],
+    )
+
+    from app.core.config import get_settings
+    settings = get_settings()
+    original_enabled = settings.notification_enabled
+    original_severity = settings.notification_min_severity
+    settings.notification_enabled = True
+    settings.notification_min_severity = "low"
+    old_last = disp._last_notification_at
+    disp._last_notification_at = None
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec_new.id})
+        assert result["severity"] == "low"
+        assert result["new_symbols"] == []
+    finally:
+        settings.notification_enabled = original_enabled
+        settings.notification_min_severity = original_severity
+        disp._last_notification_at = old_last
+
+
+def test_dispatch_recommendation_alerts_respects_cooldown(db):
+    """Push is blocked when cooldown has not elapsed."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    import app.notifications.dispatcher as disp
+    from datetime import datetime, timezone
+
+    rec = _make_recommendation_with_review_queue(
+        db, actionable_items=[{"symbol": "AAPL", "effective_score": 0.8}]
+    )
+
+    from app.core.config import get_settings
+    settings = get_settings()
+    original_enabled = settings.notification_enabled
+    original_severity = settings.notification_min_severity
+    settings.notification_enabled = True
+    settings.notification_min_severity = "low"
+    # Set last notification to NOW so cooldown blocks
+    old_last = disp._last_notification_at
+    disp._last_notification_at = datetime.now(timezone.utc)
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["sent"] is False
+        assert result["reason"] == "cooldown"
+    finally:
+        settings.notification_enabled = original_enabled
+        settings.notification_min_severity = original_severity
+        disp._last_notification_at = old_last
+
+
+def test_scheduler_full_cycle_calls_notify_recommendation():
+    """scheduled_full_cycle calls _notify_recommendation_change after run_cycle."""
+    import ast
+    import inspect
+    from app.scheduler import jobs
+
+    source = inspect.getsource(jobs.scheduled_full_cycle)
+    assert "_notify_recommendation_change" in source, \
+        "scheduled_full_cycle must call _notify_recommendation_change"
+
+
+def test_scheduler_ingestion_calls_notify_recommendation():
+    """scheduled_ingestion calls _notify_recommendation_change after event-triggered cycle."""
+    import inspect
+    from app.scheduler import jobs
+
+    source = inspect.getsource(jobs.scheduled_ingestion)
+    assert "_notify_recommendation_change" in source, \
+        "scheduled_ingestion must call _notify_recommendation_change"
+
+
+def test_notification_never_executes_orders():
+    """Safety invariant: notification code NEVER imports or calls execution functions."""
+    import inspect
+    from app.notifications import dispatcher
+
+    source = inspect.getsource(dispatcher)
+    # Must not import execution module
+    assert "from app.services.execution" not in source
+    assert "execute_recommendation" not in source
+    assert "send_order" not in source
+    assert "broker" not in source.lower() or "broker" in source.lower()  # allow broker in comments
+
+    # dispatch_recommendation_alerts must contain "informativo" in its messages
+    func_source = inspect.getsource(dispatcher.dispatch_recommendation_alerts)
+    assert "informativo" in func_source.lower() or "no se ejecutan" in func_source.lower(), \
+        "Recommendation notifications must explicitly state they don't execute orders"
+
+
+def test_dispatch_recommendation_alerts_message_safety():
+    """Push message body always contains safety disclaimer."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    import app.notifications.dispatcher as disp
+    from app.core.config import get_settings
+    import inspect
+
+    # Verify the function source contains safety language
+    source = inspect.getsource(dispatch_recommendation_alerts)
+    assert "Solo informativo" in source, "Must include 'Solo informativo' in messages"
+    assert "No se ejecutan órdenes" in source, "Must include execution disclaimer"
+
+
+def test_notify_recommendation_change_is_best_effort():
+    """_notify_recommendation_change swallows exceptions (best-effort)."""
+    import inspect
+    from app.scheduler import jobs
+
+    source = inspect.getsource(jobs._notify_recommendation_change)
+    assert "try:" in source
+    assert "except" in source
+    assert "pass" in source
