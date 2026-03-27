@@ -571,6 +571,7 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     3. Classify via policy (category → severity → should_notify)
     4. Apply phase-aware cooldown and suppression
     5. Send via Telegram + Web Push
+    6. Persist audit trail into recommendation metadata_json
 
     Safety invariant: notifications NEVER execute orders. They are
     informational only. Every message includes "Solo informativo" disclaimer.
@@ -603,7 +604,31 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
         contradiction_threshold=settings.notification_contradiction_threshold,
     )
 
+    # --- Build audit trail (always, regardless of outcome) ---
+    audit = {
+        "timestamp": now.isoformat(),
+        "category": classification["category"],
+        "severity": classification["severity"],
+        "should_send": classification["should_notify"],
+        "suppress_reason": None,
+        "cooldown_applied": False,
+        "market_phase": ar_phase,
+        "previous_recommendation_id": prev_rec.id if prev_rec else None,
+        "comparison_summary": {
+            "new_actionable": sorted(delta["new_actionable"]) if delta["new_actionable"] else [],
+            "new_watchlist": sorted(delta["new_watchlist"]) if delta["new_watchlist"] else [],
+            "actionable_count": delta["actionable_count"],
+            "watchlist_count": delta["watchlist_count"],
+            "contradiction_count": delta["suppressed_by_contradiction_count"],
+            "unchanged": delta["unchanged"],
+        },
+    }
+
+    # --- Check gates, update audit on each suppression ---
     if not classification["should_notify"]:
+        audit["should_send"] = False
+        audit["suppress_reason"] = f"policy:{classification['category']}"
+        _persist_audit(db, rec, audit)
         return {
             "sent": False,
             "reason": "policy_suppressed",
@@ -611,8 +636,10 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
             "severity": classification["severity"],
         }
 
-    # --- Severity filter (user's min_severity setting) ---
     if not _severity_passes(classification["severity"], settings.notification_min_severity):
+        audit["should_send"] = False
+        audit["suppress_reason"] = f"below_min_severity:{classification['severity']}<{settings.notification_min_severity}"
+        _persist_audit(db, rec, audit)
         return {
             "sent": False,
             "reason": "below_min_severity",
@@ -620,7 +647,6 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
             "severity": classification["severity"],
         }
 
-    # --- Phase-aware cooldown ---
     if _last_notification_at:
         tz_last = (
             _last_notification_at.replace(tzinfo=timezone.utc)
@@ -632,6 +658,10 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
         multiplier = _PHASE_COOLDOWN_MULTIPLIER.get(ar_phase, 1.0)
         effective_cooldown = base_cooldown * multiplier
         if elapsed < effective_cooldown:
+            audit["should_send"] = False
+            audit["suppress_reason"] = "cooldown"
+            audit["cooldown_applied"] = True
+            _persist_audit(db, rec, audit)
             return {
                 "sent": False,
                 "reason": "cooldown",
@@ -672,6 +702,11 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     if any_sent:
         _last_notification_at = now
 
+    audit["sent"] = any_sent
+    audit["telegram_sent"] = telegram_sent
+    audit["web_push_sent"] = push_result.get("sent", 0)
+    _persist_audit(db, rec, audit)
+
     return {
         "sent": any_sent,
         "category": classification["category"],
@@ -683,6 +718,22 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
         "web_push_sent": push_result.get("sent", 0),
         "web_push_failed": push_result.get("failed", 0),
     }
+
+
+def _persist_audit(db, rec, audit: dict) -> None:
+    """Best-effort: write notification_audit into recommendation metadata_json."""
+    try:
+        meta = rec.metadata_json or {}
+        meta["notification_audit"] = audit
+        rec.metadata_json = meta
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(rec, "metadata_json")
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def dispatch_alerts(db, events: list) -> dict:
