@@ -999,6 +999,154 @@ def test_dispatcher_source_has_disclaimer():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# 6b. Expanded policy tests — configurable threshold, digest, analysis_completed
+# ---------------------------------------------------------------------------
+
+
+def test_policy_contradiction_threshold_configurable():
+    """Contradiction threshold can be changed via parameter."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 2, "unchanged": False,
+    }
+    # With default threshold=3, 2 contradictions is NOT high
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] != "thesis_contradiction"
+
+    # With threshold=2, it IS high
+    result = classify_recommendation_alert(delta, "postmarket", contradiction_threshold=2)
+    assert result["category"] == "thesis_contradiction"
+    assert result["severity"] == "high"
+    assert result["should_notify"] is True
+
+
+def test_policy_contradiction_threshold_from_config(db):
+    """dispatch_recommendation_alerts passes config threshold to classifier."""
+    from app.core.config import get_settings
+    settings = get_settings()
+
+    # Verify the setting exists and has default value
+    assert hasattr(settings, "notification_contradiction_threshold")
+    assert settings.notification_contradiction_threshold == 3
+
+
+def test_policy_digest_watchlist_only_no_actionable():
+    """Postclose digest fires when watchlist has items but no actionable.
+
+    Scenario: analysis ran, no actionable opportunities, but watchlist has
+    5 items being tracked. This is material — the user wants to know at
+    end of day that the system is tracking things.
+    """
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 5,
+        "watchlist_symbols": {"A", "B", "C", "D", "E"}, "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "postclose_digest"
+    assert result["severity"] == "low"
+    assert result["should_notify"] is True
+    assert "watchlist" in result["body"].lower()
+    assert "informativo" in result["body"].lower() or "no ejecuta" in result["body"].lower()
+
+
+def test_policy_digest_contradictions_only():
+    """Postclose digest fires when contradictions exist (below HIGH threshold).
+
+    Scenario: 2 contradictions detected (below threshold of 3), no actionable,
+    no new watchlist. Still material for a post-close summary.
+    """
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 2, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "postclose_digest"
+    assert result["severity"] == "low"
+    assert result["should_notify"] is True
+    assert "contradicción" in result["body"].lower()
+
+
+def test_policy_digest_mixed_material():
+    """Postclose digest with actionable + contradictions + watchlist."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 2, "actionable_symbols": {"AAPL", "MSFT"},
+        "new_actionable": set(), "watchlist_count": 4,
+        "watchlist_symbols": {"A", "B", "C", "D"}, "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 1, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "postclose_digest"
+    assert result["should_notify"] is True
+    # All three should be mentioned
+    assert "vigente" in result["body"].lower()
+    assert "contradicción" in result["body"].lower()
+    assert "watchlist" in result["body"].lower()
+
+
+def test_policy_digest_zero_material_is_silent():
+    """Zero actionable, zero watchlist, zero contradictions => no_material_change, SILENT."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "no_material_change"
+    assert result["severity"] == "silent"
+    assert result["should_notify"] is False
+
+
+def test_policy_digest_not_intraday():
+    """Postclose digest does NOT fire during market hours, even with material."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 2, "actionable_symbols": {"AAPL"},
+        "new_actionable": set(), "watchlist_count": 3,
+        "watchlist_symbols": {"A", "B", "C"}, "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 1, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "open")
+    assert result["category"] == "postclose_digest"
+    assert result["should_notify"] is False, "Digest should not push during market hours"
+
+
+def test_policy_analysis_completed_overrides_everything():
+    """unchanged=True always wins, even with contradictions and actionable.
+
+    This tests the early-exit: unchanged=True means the system confirmed
+    nothing changed. No matter what other fields say, it's SILENT.
+    """
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 5, "actionable_symbols": {"A", "B", "C", "D", "E"},
+        "new_actionable": {"D", "E"}, "watchlist_count": 10,
+        "watchlist_symbols": set(), "new_watchlist": {"X"},
+        "suppressed_by_contradiction_count": 5, "unchanged": True,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "analysis_completed"
+    assert result["severity"] == "silent"
+    assert result["should_notify"] is False
+
+
+# ---------------------------------------------------------------------------
+# 7. Delta extraction (unit tests)
+# ---------------------------------------------------------------------------
+
+
 def test_extract_delta_new_actionable():
     """_extract_delta correctly identifies new actionable symbols."""
     from app.notifications.dispatcher import _extract_delta

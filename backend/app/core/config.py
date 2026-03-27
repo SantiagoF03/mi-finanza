@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     telegram_chat_id: str = ""
     notification_min_severity: str = "medium"  # low | medium | high | critical
     notification_cooldown_seconds: int = 300
+    notification_contradiction_threshold: int = 3  # >=N contradictions → high alert
 
     # Web push (VAPID keys — generate with: npx web-push generate-vapid-keys)
     vapid_public_key: str = ""
