@@ -417,30 +417,38 @@ def classify_recommendation_alert(delta: dict, market_phase: str) -> dict:
         {
             "category": str,     # new_actionable | thesis_contradiction |
                                  # watchlist_material | postclose_digest |
-                                 # no_material_change
+                                 # analysis_completed | no_material_change
             "severity": str,     # high | medium | low | silent
             "should_notify": bool,
             "title": str,
             "body": str,
         }
 
-    Policy (matches product spec):
+    Policy:
     ─────────────────────────────────────────────────────────────────
     HIGH — push always (within cooldown)
       • New actionable items (symbols not in previous cycle)
-      • Thesis contradiction: ≥2 items suppressed by contradiction
+      • Thesis contradiction: ≥3 items suppressed by contradiction
+        Rationale: 1 contradiction is noise (ambiguous ticker, weak
+        counter-signal). 2 is borderline. ≥3 means the portfolio thesis
+        is under real pressure from multiple independent signals.
 
     MEDIUM — push in premarket + postmarket only
-      • New watchlist items with signal (not in previous cycle)
-      • Material watchlist change ≥3 new symbols
+      • New watchlist items (symbols not in previous cycle)
 
-    LOW — push only in postmarket (post-close digest)
-      • Analysis completed, actionable items exist but unchanged
-      • Post-close summary with counts
+    LOW — push only in postmarket
+      • Post-close digest: analysis changed (unchanged=False),
+        actionable items exist but no NEW symbols emerged.
+        Useful as end-of-day summary: "tus oportunidades siguen vigentes,
+        el análisis se actualizó."
 
     SILENT — never push
-      • Analysis completed, nothing material changed (unchanged=True)
-      • Routine recalculation, no delta
+      • analysis_completed: unchanged=True. The system ran a full cycle
+        and confirmed nothing material changed. Explicit product decision:
+        this NEVER generates a notification. The user checks the app
+        when they want to; we don't interrupt them to say "nothing happened."
+      • no_material_change: zero actionable, zero new watchlist, no
+        contradictions, not unchanged (first run or edge case). Also silent.
     ─────────────────────────────────────────────────────────────────
 
     Safety: every message body includes "Solo informativo" disclaimer.
@@ -466,49 +474,65 @@ def classify_recommendation_alert(delta: dict, market_phase: str) -> dict:
             "body": f"Nuevas oportunidades: {symbols_text}. {_DISCLAIMER}",
         }
 
-    # --- HIGH: thesis contradiction (strong signal suppressed) ---
-    if contradiction_count >= 2:
+    # --- HIGH: thesis contradiction ---
+    # Threshold: ≥3 independent signals suppressed by contradiction.
+    # 1-2 can happen from ambiguous tickers or weak counter-signals.
+    # ≥3 means the portfolio thesis is under real multi-signal pressure.
+    if contradiction_count >= 3:
         return {
             "category": "thesis_contradiction",
             "severity": "high",
             "should_notify": True,
             "title": "Mi Finanza - Contradicción de tesis",
-            "body": f"{contradiction_count} señales suprimidas por contradicción. Revisar cartera. {_DISCLAIMER}",
+            "body": f"{contradiction_count} señales contradicen la tesis actual. Revisar cartera. {_DISCLAIMER}",
         }
 
-    # --- MEDIUM: material watchlist change ---
-    if new_watchlist and len(new_watchlist) >= 3:
-        symbols_text = ", ".join(sorted(new_watchlist)[:5])
-        return {
-            "category": "watchlist_material",
-            "severity": "medium",
-            "should_notify": market_phase in ("premarket", "postmarket"),
-            "title": f"Mi Finanza - {len(new_watchlist)} señal(es) en watchlist",
-            "body": f"Nuevas señales: {symbols_text}. {_DISCLAIMER}",
-        }
-
-    # --- MEDIUM: any new watchlist items in strong windows ---
+    # --- MEDIUM: new watchlist items (not during market hours) ---
     if new_watchlist:
         symbols_text = ", ".join(sorted(new_watchlist)[:5])
+        count = len(new_watchlist)
+        extra = f" (+{count - 5} más)" if count > 5 else ""
         return {
             "category": "watchlist_material",
             "severity": "medium",
             "should_notify": market_phase in ("premarket", "postmarket"),
-            "title": f"Mi Finanza - watchlist actualizada",
-            "body": f"Nuevas señales: {symbols_text}. {_DISCLAIMER}",
+            "title": f"Mi Finanza - {count} señal(es) nueva(s) en watchlist",
+            "body": f"Nuevas señales en observación: {symbols_text}{extra}. {_DISCLAIMER}",
         }
 
-    # --- LOW: post-close digest (actionable exists but unchanged) ---
+    # --- LOW: post-close digest ---
+    # Condition: actionable items exist, none are NEW symbols, but the
+    # analysis itself changed (unchanged=False). This means the system
+    # re-evaluated and the same opportunities remain valid with updated data.
     if actionable_count > 0 and not unchanged:
         return {
             "category": "postclose_digest",
             "severity": "low",
             "should_notify": market_phase == "postmarket",
             "title": "Mi Finanza - Resumen de cierre",
-            "body": f"{actionable_count} accionable(s), {watchlist_count} en watchlist. Sin cambios materiales. {_DISCLAIMER}",
+            "body": (
+                f"{actionable_count} oportunidad(es) vigente(s), "
+                f"{watchlist_count} en watchlist. "
+                f"Análisis actualizado, oportunidades confirmadas. {_DISCLAIMER}"
+            ),
         }
 
-    # --- SILENT: nothing material changed ---
+    # --- SILENT: analysis completed, confirmed unchanged ---
+    # Explicit product decision: when detect_unchanged says True, the system
+    # ran a full cycle and the recommendation is materially identical.
+    # This NEVER generates a notification. The user checks when they want to.
+    if unchanged:
+        return {
+            "category": "analysis_completed",
+            "severity": "silent",
+            "should_notify": False,
+            "title": "",
+            "body": "",
+        }
+
+    # --- SILENT: nothing material to report ---
+    # Zero actionable, zero new watchlist, no contradictions, not unchanged.
+    # Edge case: first run with no signals, or a run that found nothing.
     return {
         "category": "no_material_change",
         "severity": "silent",
