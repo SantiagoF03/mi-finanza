@@ -341,15 +341,195 @@ def dispatch_execution_notification(order_execution) -> dict:
     return {"sent": sent, "channel": settings.notification_channel, "status": status}
 
 
-def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
-    """Push notification after a cycle produces new actionable items.
+# ---------------------------------------------------------------------------
+# Recommendation-level alert policy
+# ---------------------------------------------------------------------------
 
-    Compares current review_queue.actionable_now against the previous
-    recommendation to detect NEW opportunities. Respects cooldown,
-    severity, and market-phase rules.
+# Phase-aware cooldown multipliers.
+# Pre-market and post-close are the "strong" windows where we allow more alerts.
+# Intraday (open) is conservative — double cooldown to avoid spam on micro-changes.
+# Off-hours: only critical gets through (handled in should_notify logic).
+_PHASE_COOLDOWN_MULTIPLIER = {
+    "premarket": 1.0,    # strong window — respect base cooldown
+    "open": 2.0,         # conservative — double cooldown
+    "postmarket": 0.5,   # strong window — allow faster alerts at close
+    "off": 1.0,          # rarely fires, only critical passes
+}
+
+
+def _get_previous_recommendation(db, exclude_id: int):
+    """Get the most recent superseded recommendation (for delta detection)."""
+    from app.models.models import Recommendation
+    return (
+        db.query(Recommendation)
+        .filter(Recommendation.id != exclude_id, Recommendation.superseded_at.isnot(None))
+        .order_by(Recommendation.created_at.desc())
+        .first()
+    )
+
+
+def _extract_delta(current_meta: dict, prev_meta: dict | None) -> dict:
+    """Compare current recommendation against previous to detect material changes.
+
+    Returns a dict with delta information used by the policy classifier.
+    """
+    ds = current_meta.get("decision_summary", {})
+    rq = ds.get("review_queue", {})
+    pc = ds.get("pipeline_counts", {})
+
+    actionable = rq.get("actionable_now", {})
+    watchlist = rq.get("watchlist_now", {})
+    current_actionable_items = actionable.get("items", [])
+    current_actionable_symbols = {i.get("symbol") for i in current_actionable_items if i.get("symbol")}
+    current_watchlist_items = watchlist.get("items", [])
+    current_watchlist_symbols = {i.get("symbol") for i in current_watchlist_items if i.get("symbol")}
+
+    prev_actionable_symbols: set = set()
+    prev_watchlist_symbols: set = set()
+    if prev_meta:
+        prev_ds = prev_meta.get("decision_summary", {})
+        prev_rq = prev_ds.get("review_queue", {})
+        prev_actionable_symbols = {
+            i.get("symbol") for i in prev_rq.get("actionable_now", {}).get("items", [])
+            if i.get("symbol")
+        }
+        prev_watchlist_symbols = {
+            i.get("symbol") for i in prev_rq.get("watchlist_now", {}).get("items", [])
+            if i.get("symbol")
+        }
+
+    return {
+        "actionable_count": actionable.get("count", 0),
+        "actionable_symbols": current_actionable_symbols,
+        "new_actionable": current_actionable_symbols - prev_actionable_symbols,
+        "watchlist_count": watchlist.get("count", 0),
+        "watchlist_symbols": current_watchlist_symbols,
+        "new_watchlist": current_watchlist_symbols - prev_watchlist_symbols,
+        "suppressed_by_contradiction_count": pc.get("suppressed_by_contradiction_count", 0),
+        "unchanged": current_meta.get("unchanged", False),
+    }
+
+
+def classify_recommendation_alert(delta: dict, market_phase: str) -> dict:
+    """Pure policy function: classify a recommendation change into alert category.
+
+    Returns:
+        {
+            "category": str,     # new_actionable | thesis_contradiction |
+                                 # watchlist_material | postclose_digest |
+                                 # no_material_change
+            "severity": str,     # high | medium | low | silent
+            "should_notify": bool,
+            "title": str,
+            "body": str,
+        }
+
+    Policy (matches product spec):
+    ─────────────────────────────────────────────────────────────────
+    HIGH — push always (within cooldown)
+      • New actionable items (symbols not in previous cycle)
+      • Thesis contradiction: ≥2 items suppressed by contradiction
+
+    MEDIUM — push in premarket + postmarket only
+      • New watchlist items with signal (not in previous cycle)
+      • Material watchlist change ≥3 new symbols
+
+    LOW — push only in postmarket (post-close digest)
+      • Analysis completed, actionable items exist but unchanged
+      • Post-close summary with counts
+
+    SILENT — never push
+      • Analysis completed, nothing material changed (unchanged=True)
+      • Routine recalculation, no delta
+    ─────────────────────────────────────────────────────────────────
+
+    Safety: every message body includes "Solo informativo" disclaimer.
+    Notifications NEVER execute orders.
+    """
+    new_actionable = delta.get("new_actionable", set())
+    actionable_count = delta.get("actionable_count", 0)
+    new_watchlist = delta.get("new_watchlist", set())
+    watchlist_count = delta.get("watchlist_count", 0)
+    contradiction_count = delta.get("suppressed_by_contradiction_count", 0)
+    unchanged = delta.get("unchanged", False)
+
+    _DISCLAIMER = "Solo informativo, no ejecuta órdenes."
+
+    # --- HIGH: new actionable opportunities ---
+    if new_actionable:
+        symbols_text = ", ".join(sorted(new_actionable))
+        return {
+            "category": "new_actionable",
+            "severity": "high",
+            "should_notify": True,
+            "title": f"Mi Finanza - {len(new_actionable)} oportunidad(es) nueva(s)",
+            "body": f"Nuevas oportunidades: {symbols_text}. {_DISCLAIMER}",
+        }
+
+    # --- HIGH: thesis contradiction (strong signal suppressed) ---
+    if contradiction_count >= 2:
+        return {
+            "category": "thesis_contradiction",
+            "severity": "high",
+            "should_notify": True,
+            "title": "Mi Finanza - Contradicción de tesis",
+            "body": f"{contradiction_count} señales suprimidas por contradicción. Revisar cartera. {_DISCLAIMER}",
+        }
+
+    # --- MEDIUM: material watchlist change ---
+    if new_watchlist and len(new_watchlist) >= 3:
+        symbols_text = ", ".join(sorted(new_watchlist)[:5])
+        return {
+            "category": "watchlist_material",
+            "severity": "medium",
+            "should_notify": market_phase in ("premarket", "postmarket"),
+            "title": f"Mi Finanza - {len(new_watchlist)} señal(es) en watchlist",
+            "body": f"Nuevas señales: {symbols_text}. {_DISCLAIMER}",
+        }
+
+    # --- MEDIUM: any new watchlist items in strong windows ---
+    if new_watchlist:
+        symbols_text = ", ".join(sorted(new_watchlist)[:5])
+        return {
+            "category": "watchlist_material",
+            "severity": "medium",
+            "should_notify": market_phase in ("premarket", "postmarket"),
+            "title": f"Mi Finanza - watchlist actualizada",
+            "body": f"Nuevas señales: {symbols_text}. {_DISCLAIMER}",
+        }
+
+    # --- LOW: post-close digest (actionable exists but unchanged) ---
+    if actionable_count > 0 and not unchanged:
+        return {
+            "category": "postclose_digest",
+            "severity": "low",
+            "should_notify": market_phase == "postmarket",
+            "title": "Mi Finanza - Resumen de cierre",
+            "body": f"{actionable_count} accionable(s), {watchlist_count} en watchlist. Sin cambios materiales. {_DISCLAIMER}",
+        }
+
+    # --- SILENT: nothing material changed ---
+    return {
+        "category": "no_material_change",
+        "severity": "silent",
+        "should_notify": False,
+        "title": "",
+        "body": "",
+    }
+
+
+def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
+    """Dispatch push notification for a recommendation cycle, governed by alert policy.
+
+    Flow:
+    1. Load current + previous recommendation metadata
+    2. Compute delta (new actionable, new watchlist, contradictions, unchanged)
+    3. Classify via policy (category → severity → should_notify)
+    4. Apply phase-aware cooldown and suppression
+    5. Send via Telegram + Web Push
 
     Safety invariant: notifications NEVER execute orders. They are
-    informational only.
+    informational only. Every message includes "Solo informativo" disclaimer.
     """
     global _last_notification_at
 
@@ -366,67 +546,63 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     if not rec or not rec.metadata_json:
         return {"sent": False, "reason": "recommendation_not_found"}
 
-    ds = rec.metadata_json.get("decision_summary", {})
-    rq = ds.get("review_queue", {})
-    actionable = rq.get("actionable_now", {})
-    actionable_count = actionable.get("count", 0)
+    # --- Delta detection ---
+    prev_rec = _get_previous_recommendation(db, rec_id)
+    prev_meta = prev_rec.metadata_json if prev_rec and prev_rec.metadata_json else None
+    delta = _extract_delta(rec.metadata_json, prev_meta)
 
-    if actionable_count == 0:
-        return {"sent": False, "reason": "no_actionable_items"}
-
-    # --- Delta detection: compare against previous recommendation ---
-    prev_actionable_symbols = set()
-    prev_rec = (
-        db.query(Recommendation)
-        .filter(Recommendation.id != rec_id, Recommendation.superseded_at.isnot(None))
-        .order_by(Recommendation.created_at.desc())
-        .first()
-    )
-    if prev_rec and prev_rec.metadata_json:
-        prev_ds = prev_rec.metadata_json.get("decision_summary", {})
-        prev_rq = prev_ds.get("review_queue", {})
-        prev_items = prev_rq.get("actionable_now", {}).get("items", [])
-        prev_actionable_symbols = {i.get("symbol") for i in prev_items if i.get("symbol")}
-
-    current_items = actionable.get("items", [])
-    current_symbols = {i.get("symbol") for i in current_items if i.get("symbol")}
-    new_symbols = current_symbols - prev_actionable_symbols
-
-    # Determine severity based on what changed
-    if new_symbols:
-        severity = "high"
-        symbols_text = ", ".join(sorted(new_symbols))
-        body = f"Nuevas oportunidades: {symbols_text}. Solo informativo."
-        title = f"Mi Finanza - {len(new_symbols)} nueva(s) oportunidad(es)"
-    else:
-        # All actionable items are the same as before — low-priority digest
-        severity = "low"
-        body = f"{actionable_count} oportunidades accionables. Sin cambios."
-        title = "Mi Finanza - Resumen"
-
-    # Severity filter
-    if not _severity_passes(severity, settings.notification_min_severity):
-        return {"sent": False, "reason": "below_min_severity", "severity": severity}
-
-    # Cooldown check
+    # --- Policy classification ---
     now = datetime.now(timezone.utc)
     ar_phase = _argentina_market_phase(now)
+    classification = classify_recommendation_alert(delta, ar_phase)
 
+    if not classification["should_notify"]:
+        return {
+            "sent": False,
+            "reason": "policy_suppressed",
+            "category": classification["category"],
+            "severity": classification["severity"],
+        }
+
+    # --- Severity filter (user's min_severity setting) ---
+    if not _severity_passes(classification["severity"], settings.notification_min_severity):
+        return {
+            "sent": False,
+            "reason": "below_min_severity",
+            "category": classification["category"],
+            "severity": classification["severity"],
+        }
+
+    # --- Phase-aware cooldown ---
     if _last_notification_at:
-        elapsed = (now - (_last_notification_at.replace(tzinfo=timezone.utc) if _last_notification_at.tzinfo is None else _last_notification_at)).total_seconds()
-        effective_cooldown = settings.notification_cooldown_seconds
-        if ar_phase == "open":
-            effective_cooldown = max(60, effective_cooldown // 2)
+        tz_last = (
+            _last_notification_at.replace(tzinfo=timezone.utc)
+            if _last_notification_at.tzinfo is None
+            else _last_notification_at
+        )
+        elapsed = (now - tz_last).total_seconds()
+        base_cooldown = settings.notification_cooldown_seconds
+        multiplier = _PHASE_COOLDOWN_MULTIPLIER.get(ar_phase, 1.0)
+        effective_cooldown = base_cooldown * multiplier
         if elapsed < effective_cooldown:
-            return {"sent": False, "reason": "cooldown", "remaining_seconds": int(effective_cooldown - elapsed)}
+            return {
+                "sent": False,
+                "reason": "cooldown",
+                "category": classification["category"],
+                "severity": classification["severity"],
+                "remaining_seconds": int(effective_cooldown - elapsed),
+            }
 
-    # --- Send via all channels ---
+    # --- Deliver via all channels ---
+    title = classification["title"]
+    body = classification["body"]
+
     telegram_sent = False
     if settings.notification_channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
         phase_map = {"premarket": "Pre-apertura", "open": "Mercado abierto",
                      "postmarket": "Post-cierre", "off": "Mercado cerrado"}
         msg = (
-            f"Mi Finanza - Recomendación actualizada\n\n"
+            f"{title}\n\n"
             f"BYMA: {phase_map.get(ar_phase, ar_phase)}\n\n"
             f"{body}\n\n"
             f">> Revisar en la app. No se ejecutan órdenes automáticamente."
@@ -439,7 +615,7 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
             db,
             title=title,
             body=body,
-            severity=severity,
+            severity=classification["severity"],
             deep_link="/recommendations",
         )
     except Exception as exc:
@@ -451,10 +627,11 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
 
     return {
         "sent": any_sent,
-        "type": "recommendation_change",
-        "severity": severity,
-        "actionable_count": actionable_count,
-        "new_symbols": sorted(new_symbols) if new_symbols else [],
+        "category": classification["category"],
+        "severity": classification["severity"],
+        "actionable_count": delta["actionable_count"],
+        "new_actionable": sorted(delta["new_actionable"]) if delta["new_actionable"] else [],
+        "new_watchlist": sorted(delta["new_watchlist"]) if delta["new_watchlist"] else [],
         "telegram_sent": telegram_sent,
         "web_push_sent": push_result.get("sent", 0),
         "web_push_failed": push_result.get("failed", 0),
