@@ -63,6 +63,7 @@ def scheduled_ingestion():
             db.commit()
 
             _notify_events(db, pending)
+            _notify_recommendation_change(db, cycle_result)
     finally:
         db.close()
 
@@ -72,6 +73,9 @@ def scheduled_full_cycle():
 
     Gated: only runs run_cycle if there are LLM-eligible news or
     pending trigger_recalc events, unless scheduler_postmarket_force_cycle is True.
+
+    After cycle completes, triggers recommendation-level push notification
+    if new actionable items were detected.
     """
     settings = get_settings()
     db = SessionLocal()
@@ -84,16 +88,30 @@ def scheduled_full_cycle():
             or bool(get_pending_recalc_events(db))
         )
         if should_run:
-            run_cycle(db, source="scheduler")
+            cycle_result = run_cycle(db, source="scheduler")
+            _notify_recommendation_change(db, cycle_result)
     finally:
         db.close()
 
 
 def _notify_events(db, events):
-    """Best-effort notification dispatch."""
+    """Best-effort notification dispatch for market events."""
     try:
         from app.notifications.dispatcher import dispatch_alerts
         dispatch_alerts(db, events)
+    except Exception:
+        pass
+
+
+def _notify_recommendation_change(db, cycle_result: dict):
+    """Best-effort recommendation-level push notification.
+
+    Checks if the cycle produced new actionable items and sends push.
+    Safety: notifications NEVER execute orders.
+    """
+    try:
+        from app.notifications.dispatcher import dispatch_recommendation_alerts
+        dispatch_recommendation_alerts(db, cycle_result)
     except Exception:
         pass
 

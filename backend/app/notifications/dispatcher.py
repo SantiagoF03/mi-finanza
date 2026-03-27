@@ -341,6 +341,126 @@ def dispatch_execution_notification(order_execution) -> dict:
     return {"sent": sent, "channel": settings.notification_channel, "status": status}
 
 
+def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
+    """Push notification after a cycle produces new actionable items.
+
+    Compares current review_queue.actionable_now against the previous
+    recommendation to detect NEW opportunities. Respects cooldown,
+    severity, and market-phase rules.
+
+    Safety invariant: notifications NEVER execute orders. They are
+    informational only.
+    """
+    global _last_notification_at
+
+    settings = get_settings()
+    if not settings.notification_enabled:
+        return {"sent": False, "reason": "disabled"}
+
+    rec_id = cycle_result.get("recommendation_id")
+    if not rec_id:
+        return {"sent": False, "reason": "no_recommendation"}
+
+    from app.models.models import Recommendation
+    rec = db.query(Recommendation).filter(Recommendation.id == rec_id).first()
+    if not rec or not rec.metadata_json:
+        return {"sent": False, "reason": "recommendation_not_found"}
+
+    ds = rec.metadata_json.get("decision_summary", {})
+    rq = ds.get("review_queue", {})
+    actionable = rq.get("actionable_now", {})
+    actionable_count = actionable.get("count", 0)
+
+    if actionable_count == 0:
+        return {"sent": False, "reason": "no_actionable_items"}
+
+    # --- Delta detection: compare against previous recommendation ---
+    prev_actionable_symbols = set()
+    prev_rec = (
+        db.query(Recommendation)
+        .filter(Recommendation.id != rec_id, Recommendation.superseded_at.isnot(None))
+        .order_by(Recommendation.created_at.desc())
+        .first()
+    )
+    if prev_rec and prev_rec.metadata_json:
+        prev_ds = prev_rec.metadata_json.get("decision_summary", {})
+        prev_rq = prev_ds.get("review_queue", {})
+        prev_items = prev_rq.get("actionable_now", {}).get("items", [])
+        prev_actionable_symbols = {i.get("symbol") for i in prev_items if i.get("symbol")}
+
+    current_items = actionable.get("items", [])
+    current_symbols = {i.get("symbol") for i in current_items if i.get("symbol")}
+    new_symbols = current_symbols - prev_actionable_symbols
+
+    # Determine severity based on what changed
+    if new_symbols:
+        severity = "high"
+        symbols_text = ", ".join(sorted(new_symbols))
+        body = f"Nuevas oportunidades: {symbols_text}. Solo informativo."
+        title = f"Mi Finanza - {len(new_symbols)} nueva(s) oportunidad(es)"
+    else:
+        # All actionable items are the same as before — low-priority digest
+        severity = "low"
+        body = f"{actionable_count} oportunidades accionables. Sin cambios."
+        title = "Mi Finanza - Resumen"
+
+    # Severity filter
+    if not _severity_passes(severity, settings.notification_min_severity):
+        return {"sent": False, "reason": "below_min_severity", "severity": severity}
+
+    # Cooldown check
+    now = datetime.now(timezone.utc)
+    ar_phase = _argentina_market_phase(now)
+
+    if _last_notification_at:
+        elapsed = (now - (_last_notification_at.replace(tzinfo=timezone.utc) if _last_notification_at.tzinfo is None else _last_notification_at)).total_seconds()
+        effective_cooldown = settings.notification_cooldown_seconds
+        if ar_phase == "open":
+            effective_cooldown = max(60, effective_cooldown // 2)
+        if elapsed < effective_cooldown:
+            return {"sent": False, "reason": "cooldown", "remaining_seconds": int(effective_cooldown - elapsed)}
+
+    # --- Send via all channels ---
+    telegram_sent = False
+    if settings.notification_channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
+        phase_map = {"premarket": "Pre-apertura", "open": "Mercado abierto",
+                     "postmarket": "Post-cierre", "off": "Mercado cerrado"}
+        msg = (
+            f"Mi Finanza - Recomendación actualizada\n\n"
+            f"BYMA: {phase_map.get(ar_phase, ar_phase)}\n\n"
+            f"{body}\n\n"
+            f">> Revisar en la app. No se ejecutan órdenes automáticamente."
+        )
+        telegram_sent = _send_telegram(msg, settings.telegram_bot_token, settings.telegram_chat_id)
+
+    push_result = {"sent": 0, "failed": 0, "removed": 0}
+    try:
+        push_result = send_web_push_to_all(
+            db,
+            title=title,
+            body=body,
+            severity=severity,
+            deep_link="/recommendations",
+        )
+    except Exception as exc:
+        logger.warning("Recommendation push failed: %s", exc)
+
+    any_sent = telegram_sent or push_result.get("sent", 0) > 0
+    if any_sent:
+        _last_notification_at = now
+
+    return {
+        "sent": any_sent,
+        "type": "recommendation_change",
+        "severity": severity,
+        "actionable_count": actionable_count,
+        "new_symbols": sorted(new_symbols) if new_symbols else [],
+        "telegram_sent": telegram_sent,
+        "web_push_sent": push_result.get("sent", 0),
+        "web_push_failed": push_result.get("failed", 0),
+    }
+
+
 def dispatch_alerts(db, events: list) -> dict:
     """Dispatch notifications for qualifying events.
 
