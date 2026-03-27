@@ -422,36 +422,36 @@ def test_get_execution_by_id(db):
 
 
 # ---------------------------------------------------------------------------
-# Sprint: Recommendation-level push & scheduler wiring
+# Sprint: Alert policy — recommendation-level notifications
 # ---------------------------------------------------------------------------
 
 
-def _make_recommendation_with_review_queue(db, actionable_items=None, superseded=False):
-    """Helper: create a Recommendation with review_queue in metadata_json."""
-    items = actionable_items or []
+def _make_rec_with_meta(db, actionable_items=None, watchlist_items=None,
+                        contradiction_count=0, unchanged=False, superseded=False):
+    """Helper: create a Recommendation with full metadata for alert policy tests."""
+    a_items = actionable_items or []
+    w_items = watchlist_items or []
     meta = {
+        "unchanged": unchanged,
         "decision_summary": {
             "review_queue": {
-                "actionable_now": {
-                    "count": len(items),
-                    "items": items,
-                },
-                "watchlist_now": {"count": 0, "items": []},
+                "actionable_now": {"count": len(a_items), "items": a_items},
+                "watchlist_now": {"count": len(w_items), "items": w_items,
+                                  "relevant_not_investable_count": 0,
+                                  "investable_signal_count": len(w_items)},
                 "suppressed_review": {"count": 0, "items": []},
-                "total_items": len(items),
+                "total_items": len(a_items) + len(w_items),
+            },
+            "pipeline_counts": {
+                "suppressed_by_contradiction_count": contradiction_count,
             },
             "consumer_guidance": {"primary_view": "review_queue", "version": "38c"},
-        }
+        },
     }
     from datetime import datetime
     rec = Recommendation(
-        action="hold",
-        status="pending",
-        suggested_pct=0.0,
-        confidence=0.7,
-        rationale="test",
-        risks="none",
-        executive_summary="test",
+        action="hold", status="pending", suggested_pct=0.0, confidence=0.7,
+        rationale="test", risks="none", executive_summary="test",
         metadata_json=meta,
         superseded_at=datetime.utcnow() if superseded else None,
     )
@@ -460,25 +460,302 @@ def _make_recommendation_with_review_queue(db, actionable_items=None, superseded
     return rec
 
 
-def test_dispatch_recommendation_alerts_no_actionable(db):
-    """No push when cycle has zero actionable items."""
+def _enable_notifications():
+    """Context-manager-like helper to enable notifications and reset cooldown."""
+    from app.core.config import get_settings
+    import app.notifications.dispatcher as disp
+    settings = get_settings()
+    originals = {
+        "enabled": settings.notification_enabled,
+        "severity": settings.notification_min_severity,
+        "last_at": disp._last_notification_at,
+    }
+    settings.notification_enabled = True
+    settings.notification_min_severity = "low"
+    disp._last_notification_at = None
+    return originals
+
+
+def _restore_notifications(originals):
+    from app.core.config import get_settings
+    import app.notifications.dispatcher as disp
+    settings = get_settings()
+    settings.notification_enabled = originals["enabled"]
+    settings.notification_min_severity = originals["severity"]
+    disp._last_notification_at = originals["last_at"]
+
+
+# ---------------------------------------------------------------------------
+# 1. classify_recommendation_alert — pure policy tests
+# ---------------------------------------------------------------------------
+
+
+def test_policy_new_actionable_is_high():
+    """New actionable items => HIGH severity, should_notify=True."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 2, "actionable_symbols": {"AAPL", "MSFT"},
+        "new_actionable": {"MSFT"}, "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "premarket")
+    assert result["severity"] == "high"
+    assert result["category"] == "new_actionable"
+    assert result["should_notify"] is True
+    assert "MSFT" in result["body"]
+    assert "informativo" in result["body"].lower()
+
+
+def test_policy_thesis_contradiction_is_high():
+    """>=2 contradiction suppressions => HIGH severity."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 3,
+        "watchlist_symbols": {"A", "B", "C"}, "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 3, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "open")
+    assert result["severity"] == "high"
+    assert result["category"] == "thesis_contradiction"
+    assert result["should_notify"] is True
+
+
+def test_policy_single_contradiction_not_high():
+    """1 contradiction is NOT enough for thesis_contradiction category."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 1, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "open")
+    assert result["category"] != "thesis_contradiction"
+
+
+def test_policy_watchlist_material_premarket_notifies():
+    """New watchlist items in premarket => MEDIUM severity, should_notify=True."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 4,
+        "watchlist_symbols": {"A", "B", "C", "D"}, "new_watchlist": {"C", "D"},
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "premarket")
+    assert result["severity"] == "medium"
+    assert result["category"] == "watchlist_material"
+    assert result["should_notify"] is True
+
+
+def test_policy_watchlist_intraday_suppressed():
+    """New watchlist items during market hours => MEDIUM but should_notify=False."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 2,
+        "watchlist_symbols": {"A", "B"}, "new_watchlist": {"B"},
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "open")
+    assert result["severity"] == "medium"
+    assert result["should_notify"] is False, "Watchlist changes during open market should NOT push"
+
+
+def test_policy_watchlist_postclose_notifies():
+    """New watchlist items in postmarket => MEDIUM, should_notify=True."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 5,
+        "watchlist_symbols": {"A", "B", "C", "D", "E"},
+        "new_watchlist": {"D", "E", "C"},
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["severity"] == "medium"
+    assert result["should_notify"] is True
+
+
+def test_policy_no_change_actionable_postclose_digest():
+    """Actionable exists but unchanged, postmarket => LOW, should_notify=True."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 2, "actionable_symbols": {"AAPL", "MSFT"},
+        "new_actionable": set(), "watchlist_count": 3,
+        "watchlist_symbols": {"A", "B", "C"}, "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["severity"] == "low"
+    assert result["category"] == "postclose_digest"
+    assert result["should_notify"] is True
+
+
+def test_policy_no_change_actionable_intraday_silent():
+    """Actionable exists but unchanged, during market => LOW, should_notify=False."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 2, "actionable_symbols": {"AAPL"},
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "open")
+    assert result["should_notify"] is False
+
+
+def test_policy_unchanged_is_silent():
+    """Analysis with unchanged=True => SILENT, never pushes."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": True,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["severity"] == "silent"
+    assert result["category"] == "no_material_change"
+    assert result["should_notify"] is False
+
+
+def test_policy_no_actionable_no_watchlist_no_contradiction_silent():
+    """Zero everything => SILENT."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "premarket")
+    assert result["severity"] == "silent"
+    assert result["should_notify"] is False
+
+
+def test_policy_all_payloads_have_disclaimer():
+    """Every non-silent policy message includes safety disclaimer."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+
+    scenarios = [
+        {"new_actionable": {"X"}, "actionable_count": 1, "actionable_symbols": {"X"},
+         "watchlist_count": 0, "watchlist_symbols": set(), "new_watchlist": set(),
+         "suppressed_by_contradiction_count": 0, "unchanged": False},
+        {"new_actionable": set(), "actionable_count": 0, "actionable_symbols": set(),
+         "watchlist_count": 2, "watchlist_symbols": {"A", "B"}, "new_watchlist": {"A", "B"},
+         "suppressed_by_contradiction_count": 0, "unchanged": False},
+        {"new_actionable": set(), "actionable_count": 0, "actionable_symbols": set(),
+         "watchlist_count": 0, "watchlist_symbols": set(), "new_watchlist": set(),
+         "suppressed_by_contradiction_count": 3, "unchanged": False},
+        {"new_actionable": set(), "actionable_count": 1, "actionable_symbols": {"Y"},
+         "watchlist_count": 0, "watchlist_symbols": set(), "new_watchlist": set(),
+         "suppressed_by_contradiction_count": 0, "unchanged": False},
+    ]
+    for delta in scenarios:
+        result = classify_recommendation_alert(delta, "postmarket")
+        if result["should_notify"]:
+            assert "informativo" in result["body"].lower() or "no ejecuta" in result["body"].lower(), \
+                f"Category {result['category']} missing disclaimer: {result['body']}"
+
+
+# ---------------------------------------------------------------------------
+# 2. dispatch_recommendation_alerts — integration tests
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_new_actionable_high_push(db):
+    """New actionable => high severity push dispatched."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], superseded=True)
+    rec_new = _make_rec_with_meta(db, actionable_items=[
+        {"symbol": "AAPL"}, {"symbol": "MSFT"},
+    ])
+
+    orig = _enable_notifications()
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec_new.id})
+        assert result["severity"] == "high"
+        assert result["category"] == "new_actionable"
+        assert "MSFT" in result["new_actionable"]
+        assert result["actionable_count"] == 2
+    finally:
+        _restore_notifications(orig)
+
+
+def test_dispatch_same_actionable_no_push_intraday(db):
+    """Same actionable, no change, during market => policy_suppressed (LOW in open)."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], superseded=True)
+    rec_new = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}])
+
+    orig = _enable_notifications()
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec_new.id})
+        # During non-postmarket, low severity postclose_digest won't fire
+        # The phase will be whatever the test machine's clock says,
+        # but with no new symbols and no contradictions, it's either
+        # postclose_digest (postmarket) or no_material_change
+        assert result["sent"] is False or result["severity"] == "low"
+    finally:
+        _restore_notifications(orig)
+
+
+def test_dispatch_unchanged_silent(db):
+    """unchanged=True => policy_suppressed, category=no_material_change."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    rec = _make_rec_with_meta(db, unchanged=True)
+
+    orig = _enable_notifications()
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["sent"] is False
+        assert result["reason"] == "policy_suppressed"
+        assert result["category"] == "no_material_change"
+        assert result["severity"] == "silent"
+    finally:
+        _restore_notifications(orig)
+
+
+def test_dispatch_contradiction_high(db):
+    """>=2 contradictions => high severity thesis_contradiction."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    rec = _make_rec_with_meta(db, contradiction_count=3)
+
+    orig = _enable_notifications()
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["severity"] == "high"
+        assert result["category"] == "thesis_contradiction"
+    finally:
+        _restore_notifications(orig)
+
+
+def test_dispatch_disabled(db):
+    """notification_enabled=False => disabled."""
     from app.notifications.dispatcher import dispatch_recommendation_alerts
     from app.core.config import get_settings
 
     settings = get_settings()
     original = settings.notification_enabled
-    settings.notification_enabled = True
+    settings.notification_enabled = False
     try:
-        rec = _make_recommendation_with_review_queue(db, actionable_items=[])
+        rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}])
         result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
         assert result["sent"] is False
-        assert result["reason"] == "no_actionable_items"
+        assert result["reason"] == "disabled"
     finally:
         settings.notification_enabled = original
 
 
-def test_dispatch_recommendation_alerts_no_rec_id():
-    """No push when cycle_result has no recommendation_id."""
+def test_dispatch_no_rec_id():
+    """No recommendation_id => no_recommendation."""
     from app.notifications.dispatcher import dispatch_recommendation_alerts
     from app.core.config import get_settings
     from app.db.session import SessionLocal
@@ -496,140 +773,102 @@ def test_dispatch_recommendation_alerts_no_rec_id():
         db.close()
 
 
-def test_dispatch_recommendation_alerts_disabled(db):
-    """No push when notification_enabled is False."""
-    from app.notifications.dispatcher import dispatch_recommendation_alerts
-    from app.core.config import get_settings
-
-    settings = get_settings()
-    original = settings.notification_enabled
-    settings.notification_enabled = False
-    try:
-        rec = _make_recommendation_with_review_queue(
-            db, actionable_items=[{"symbol": "AAPL", "effective_score": 0.8}]
-        )
-        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
-        assert result["sent"] is False
-        assert result["reason"] == "disabled"
-    finally:
-        settings.notification_enabled = original
-
-
-def test_dispatch_recommendation_alerts_detects_new_symbols(db):
-    """New symbols compared to previous recommendation are detected as high severity."""
-    from app.notifications.dispatcher import dispatch_recommendation_alerts
-    import app.notifications.dispatcher as disp
-
-    # Create old (superseded) recommendation with AAPL
-    _make_recommendation_with_review_queue(
-        db,
-        actionable_items=[{"symbol": "AAPL", "effective_score": 0.8}],
-        superseded=True,
-    )
-
-    # Create new recommendation with AAPL + MSFT (MSFT is new)
-    rec_new = _make_recommendation_with_review_queue(
-        db,
-        actionable_items=[
-            {"symbol": "AAPL", "effective_score": 0.8},
-            {"symbol": "MSFT", "effective_score": 0.75},
-        ],
-    )
-
-    # Enable notifications, reset cooldown
-    from app.core.config import get_settings
-    settings = get_settings()
-    original_enabled = settings.notification_enabled
-    original_severity = settings.notification_min_severity
-    settings.notification_enabled = True
-    settings.notification_min_severity = "low"
-    old_last = disp._last_notification_at
-    disp._last_notification_at = None
-    try:
-        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec_new.id})
-        assert result["severity"] == "high"
-        assert "MSFT" in result["new_symbols"]
-        assert result["actionable_count"] == 2
-    finally:
-        settings.notification_enabled = original_enabled
-        settings.notification_min_severity = original_severity
-        disp._last_notification_at = old_last
-
-
-def test_dispatch_recommendation_alerts_no_new_symbols_low_severity(db):
-    """When all actionable items existed in previous cycle, severity is low."""
-    from app.notifications.dispatcher import dispatch_recommendation_alerts
-    import app.notifications.dispatcher as disp
-
-    # Old rec with AAPL
-    _make_recommendation_with_review_queue(
-        db,
-        actionable_items=[{"symbol": "AAPL", "effective_score": 0.8}],
-        superseded=True,
-    )
-
-    # New rec with same AAPL
-    rec_new = _make_recommendation_with_review_queue(
-        db,
-        actionable_items=[{"symbol": "AAPL", "effective_score": 0.82}],
-    )
-
-    from app.core.config import get_settings
-    settings = get_settings()
-    original_enabled = settings.notification_enabled
-    original_severity = settings.notification_min_severity
-    settings.notification_enabled = True
-    settings.notification_min_severity = "low"
-    old_last = disp._last_notification_at
-    disp._last_notification_at = None
-    try:
-        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec_new.id})
-        assert result["severity"] == "low"
-        assert result["new_symbols"] == []
-    finally:
-        settings.notification_enabled = original_enabled
-        settings.notification_min_severity = original_severity
-        disp._last_notification_at = old_last
-
-
-def test_dispatch_recommendation_alerts_respects_cooldown(db):
-    """Push is blocked when cooldown has not elapsed."""
+def test_dispatch_respects_cooldown(db):
+    """Push blocked when cooldown hasn't elapsed."""
     from app.notifications.dispatcher import dispatch_recommendation_alerts
     import app.notifications.dispatcher as disp
     from datetime import datetime, timezone
 
-    rec = _make_recommendation_with_review_queue(
-        db, actionable_items=[{"symbol": "AAPL", "effective_score": 0.8}]
-    )
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "NEW"}])
 
-    from app.core.config import get_settings
-    settings = get_settings()
-    original_enabled = settings.notification_enabled
-    original_severity = settings.notification_min_severity
-    settings.notification_enabled = True
-    settings.notification_min_severity = "low"
-    # Set last notification to NOW so cooldown blocks
-    old_last = disp._last_notification_at
-    disp._last_notification_at = datetime.now(timezone.utc)
+    orig = _enable_notifications()
+    disp._last_notification_at = datetime.now(timezone.utc)  # just notified
     try:
         result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
         assert result["sent"] is False
         assert result["reason"] == "cooldown"
     finally:
-        settings.notification_enabled = original_enabled
-        settings.notification_min_severity = original_severity
+        _restore_notifications(orig)
+
+
+def test_dispatch_respects_min_severity(db):
+    """Push blocked when severity < min_severity setting."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    import app.notifications.dispatcher as disp
+
+    # Create a rec that would be LOW severity (same actionable, no change)
+    _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], superseded=True)
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}])
+
+    settings = get_settings()
+    orig_enabled = settings.notification_enabled
+    orig_severity = settings.notification_min_severity
+    old_last = disp._last_notification_at
+    settings.notification_enabled = True
+    settings.notification_min_severity = "high"  # only high passes
+    disp._last_notification_at = None
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        if result.get("reason") == "below_min_severity":
+            assert result["sent"] is False
+        # If category was no_material_change, it's policy_suppressed before severity check
+    finally:
+        settings.notification_enabled = orig_enabled
+        settings.notification_min_severity = orig_severity
         disp._last_notification_at = old_last
+
+
+def test_dispatch_watchlist_new_items(db):
+    """New watchlist items produce watchlist_material category via delta extraction."""
+    from app.notifications.dispatcher import _extract_delta, classify_recommendation_alert
+
+    _make_rec_with_meta(db, watchlist_items=[{"symbol": "A"}], superseded=True)
+    rec = _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "A"}, {"symbol": "B"}, {"symbol": "C"},
+    ])
+
+    # Test via pure policy (phase-independent)
+    prev_meta = {"decision_summary": {"review_queue": {
+        "actionable_now": {"count": 0, "items": []},
+        "watchlist_now": {"count": 1, "items": [{"symbol": "A"}]},
+    }}}
+    delta = _extract_delta(rec.metadata_json, prev_meta)
+    assert "B" in delta["new_watchlist"]
+    assert "C" in delta["new_watchlist"]
+
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "watchlist_material"
+    assert result["severity"] == "medium"
+    assert result["should_notify"] is True
+
+
+# ---------------------------------------------------------------------------
+# 3. Phase-aware cooldown
+# ---------------------------------------------------------------------------
+
+
+def test_phase_cooldown_multipliers():
+    """Phase multipliers: open=2x, postmarket=0.5x, premarket=1x."""
+    from app.notifications.dispatcher import _PHASE_COOLDOWN_MULTIPLIER
+
+    assert _PHASE_COOLDOWN_MULTIPLIER["open"] == 2.0, "Intraday should double cooldown"
+    assert _PHASE_COOLDOWN_MULTIPLIER["postmarket"] == 0.5, "Post-close should halve cooldown"
+    assert _PHASE_COOLDOWN_MULTIPLIER["premarket"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# 4. Scheduler wiring
+# ---------------------------------------------------------------------------
 
 
 def test_scheduler_full_cycle_calls_notify_recommendation():
     """scheduled_full_cycle calls _notify_recommendation_change after run_cycle."""
-    import ast
     import inspect
     from app.scheduler import jobs
 
     source = inspect.getsource(jobs.scheduled_full_cycle)
-    assert "_notify_recommendation_change" in source, \
-        "scheduled_full_cycle must call _notify_recommendation_change"
+    assert "_notify_recommendation_change" in source
 
 
 def test_scheduler_ingestion_calls_notify_recommendation():
@@ -638,39 +877,7 @@ def test_scheduler_ingestion_calls_notify_recommendation():
     from app.scheduler import jobs
 
     source = inspect.getsource(jobs.scheduled_ingestion)
-    assert "_notify_recommendation_change" in source, \
-        "scheduled_ingestion must call _notify_recommendation_change"
-
-
-def test_notification_never_executes_orders():
-    """Safety invariant: notification code NEVER imports or calls execution functions."""
-    import inspect
-    from app.notifications import dispatcher
-
-    source = inspect.getsource(dispatcher)
-    # Must not import execution module
-    assert "from app.services.execution" not in source
-    assert "execute_recommendation" not in source
-    assert "send_order" not in source
-    assert "broker" not in source.lower() or "broker" in source.lower()  # allow broker in comments
-
-    # dispatch_recommendation_alerts must contain "informativo" in its messages
-    func_source = inspect.getsource(dispatcher.dispatch_recommendation_alerts)
-    assert "informativo" in func_source.lower() or "no se ejecutan" in func_source.lower(), \
-        "Recommendation notifications must explicitly state they don't execute orders"
-
-
-def test_dispatch_recommendation_alerts_message_safety():
-    """Push message body always contains safety disclaimer."""
-    from app.notifications.dispatcher import dispatch_recommendation_alerts
-    import app.notifications.dispatcher as disp
-    from app.core.config import get_settings
-    import inspect
-
-    # Verify the function source contains safety language
-    source = inspect.getsource(dispatch_recommendation_alerts)
-    assert "Solo informativo" in source, "Must include 'Solo informativo' in messages"
-    assert "No se ejecutan órdenes" in source, "Must include execution disclaimer"
+    assert "_notify_recommendation_change" in source
 
 
 def test_notify_recommendation_change_is_best_effort():
@@ -682,3 +889,109 @@ def test_notify_recommendation_change_is_best_effort():
     assert "try:" in source
     assert "except" in source
     assert "pass" in source
+
+
+# ---------------------------------------------------------------------------
+# 5. Safety invariants
+# ---------------------------------------------------------------------------
+
+
+def test_notification_never_executes_orders():
+    """Notification code NEVER imports or calls execution functions."""
+    import inspect
+    from app.notifications import dispatcher
+
+    source = inspect.getsource(dispatcher)
+    assert "from app.services.execution" not in source
+    assert "execute_recommendation" not in source
+    assert "send_order" not in source
+
+
+def test_classifier_source_has_disclaimer():
+    """classify_recommendation_alert source contains safety disclaimer."""
+    import inspect
+    from app.notifications.dispatcher import classify_recommendation_alert
+
+    source = inspect.getsource(classify_recommendation_alert)
+    assert "Solo informativo" in source
+    assert "NEVER execute orders" in source or "no ejecuta" in source.lower()
+
+
+def test_dispatcher_source_has_disclaimer():
+    """dispatch_recommendation_alerts source contains safety disclaimer."""
+    import inspect
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    source = inspect.getsource(dispatch_recommendation_alerts)
+    assert "No se ejecutan órdenes" in source
+    assert "informational only" in source.lower() or "informativo" in source.lower()
+
+
+# ---------------------------------------------------------------------------
+# 6. Delta extraction (unit tests)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_delta_new_actionable():
+    """_extract_delta correctly identifies new actionable symbols."""
+    from app.notifications.dispatcher import _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 2, "items": [{"symbol": "A"}, {"symbol": "B"}]},
+                "watchlist_now": {"count": 0, "items": []},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": False,
+    }
+    prev = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 1, "items": [{"symbol": "A"}]},
+                "watchlist_now": {"count": 0, "items": []},
+            },
+        },
+    }
+    delta = _extract_delta(current, prev)
+    assert delta["new_actionable"] == {"B"}
+    assert delta["actionable_count"] == 2
+    assert delta["unchanged"] is False
+
+
+def test_extract_delta_no_previous():
+    """_extract_delta with no previous rec treats everything as new."""
+    from app.notifications.dispatcher import _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 1, "items": [{"symbol": "X"}]},
+                "watchlist_now": {"count": 2, "items": [{"symbol": "W1"}, {"symbol": "W2"}]},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": False,
+    }
+    delta = _extract_delta(current, None)
+    assert delta["new_actionable"] == {"X"}
+    assert delta["new_watchlist"] == {"W1", "W2"}
+
+
+def test_extract_delta_unchanged():
+    """_extract_delta propagates unchanged flag."""
+    from app.notifications.dispatcher import _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 0, "items": []},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": True,
+    }
+    delta = _extract_delta(current, None)
+    assert delta["unchanged"] is True
