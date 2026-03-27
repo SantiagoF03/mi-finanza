@@ -122,6 +122,7 @@ def current_recommendation(db: Session = Depends(get_db)):
         "scoring_summary": meta.get("scoring_summary") or {},
         "fresh_quote_meta": meta.get("fresh_quote_meta") or {},
         "decision_summary": ensure_review_queue(meta.get("decision_summary") or {}),
+        "notification_audit": meta.get("notification_audit"),
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 
