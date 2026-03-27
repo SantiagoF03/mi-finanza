@@ -410,8 +410,19 @@ def _extract_delta(current_meta: dict, prev_meta: dict | None) -> dict:
     }
 
 
-def classify_recommendation_alert(delta: dict, market_phase: str) -> dict:
+def classify_recommendation_alert(
+    delta: dict,
+    market_phase: str,
+    *,
+    contradiction_threshold: int = 3,
+) -> dict:
     """Pure policy function: classify a recommendation change into alert category.
+
+    Parameters:
+        delta: output of _extract_delta()
+        market_phase: premarket | open | postmarket | off
+        contradiction_threshold: configurable via notification_contradiction_threshold
+            (default 3). >=N contradictions → HIGH thesis_contradiction.
 
     Returns:
         {
@@ -427,28 +438,28 @@ def classify_recommendation_alert(delta: dict, market_phase: str) -> dict:
     Policy:
     ─────────────────────────────────────────────────────────────────
     HIGH — push always (within cooldown)
-      • New actionable items (symbols not in previous cycle)
-      • Thesis contradiction: ≥3 items suppressed by contradiction
-        Rationale: 1 contradiction is noise (ambiguous ticker, weak
-        counter-signal). 2 is borderline. ≥3 means the portfolio thesis
-        is under real pressure from multiple independent signals.
+      • new_actionable: new symbols in actionable_now vs previous cycle
+      • thesis_contradiction: >=contradiction_threshold signals suppressed
+        by contradiction. Default 3. Rationale: 1-2 can be noise (ambiguous
+        ticker, weak counter-signal). >=3 means portfolio thesis under
+        real multi-signal pressure. Configurable for tuning.
 
     MEDIUM — push in premarket + postmarket only
-      • New watchlist items (symbols not in previous cycle)
+      • watchlist_material: new symbols in watchlist vs previous cycle.
+        Suppressed during market hours (intraday) to avoid noise.
 
-    LOW — push only in postmarket
-      • Post-close digest: analysis changed (unchanged=False),
-        actionable items exist but no NEW symbols emerged.
-        Useful as end-of-day summary: "tus oportunidades siguen vigentes,
-        el análisis se actualizó."
+    LOW — push only in postmarket (post-close digest)
+      • postclose_digest: analysis ran, unchanged=False, and at least one
+        material thing to report: actionable items exist, OR new watchlist
+        items appeared, OR contradictions were detected (below threshold).
+        Summarizes the day. Only fires in postmarket.
 
     SILENT — never push
-      • analysis_completed: unchanged=True. The system ran a full cycle
-        and confirmed nothing material changed. Explicit product decision:
-        this NEVER generates a notification. The user checks the app
-        when they want to; we don't interrupt them to say "nothing happened."
-      • no_material_change: zero actionable, zero new watchlist, no
-        contradictions, not unchanged (first run or edge case). Also silent.
+      • analysis_completed: unchanged=True. Full cycle confirmed nothing
+        material changed. Product decision: NEVER notifies. User checks
+        the app when they want to.
+      • no_material_change: nothing to report at all. Edge case (first run,
+        empty signals). Silent.
     ─────────────────────────────────────────────────────────────────
 
     Safety: every message body includes "Solo informativo" disclaimer.
@@ -463,6 +474,18 @@ def classify_recommendation_alert(delta: dict, market_phase: str) -> dict:
 
     _DISCLAIMER = "Solo informativo, no ejecuta órdenes."
 
+    # --- SILENT (early exit): unchanged=True → analysis_completed ---
+    # Product decision: when detect_unchanged says True, the recommendation
+    # is materially identical. NEVER notify. User checks when they want to.
+    if unchanged:
+        return {
+            "category": "analysis_completed",
+            "severity": "silent",
+            "should_notify": False,
+            "title": "",
+            "body": "",
+        }
+
     # --- HIGH: new actionable opportunities ---
     if new_actionable:
         symbols_text = ", ".join(sorted(new_actionable))
@@ -475,10 +498,8 @@ def classify_recommendation_alert(delta: dict, market_phase: str) -> dict:
         }
 
     # --- HIGH: thesis contradiction ---
-    # Threshold: ≥3 independent signals suppressed by contradiction.
-    # 1-2 can happen from ambiguous tickers or weak counter-signals.
-    # ≥3 means the portfolio thesis is under real multi-signal pressure.
-    if contradiction_count >= 3:
+    # Configurable threshold (default 3). 1-2 can be noise.
+    if contradiction_count >= contradiction_threshold:
         return {
             "category": "thesis_contradiction",
             "severity": "high",
@@ -501,37 +522,36 @@ def classify_recommendation_alert(delta: dict, market_phase: str) -> dict:
         }
 
     # --- LOW: post-close digest ---
-    # Condition: actionable items exist, none are NEW symbols, but the
-    # analysis itself changed (unchanged=False). This means the system
-    # re-evaluated and the same opportunities remain valid with updated data.
-    if actionable_count > 0 and not unchanged:
+    # Fires when there's material activity to summarize at end of day:
+    # actionable items exist, OR contradictions were detected (below HIGH
+    # threshold), OR watchlist has items. Must be unchanged=False (already
+    # guaranteed by early exit above) and must have something to report.
+    has_actionable = actionable_count > 0
+    has_contradictions = contradiction_count > 0
+    has_watchlist = watchlist_count > 0
+    has_material = has_actionable or has_contradictions or has_watchlist
+
+    if has_material:
+        # Build a summary of what's worth reporting
+        parts = []
+        if has_actionable:
+            parts.append(f"{actionable_count} oportunidad(es) vigente(s)")
+        if has_contradictions:
+            parts.append(f"{contradiction_count} contradicción(es) detectada(s)")
+        if has_watchlist:
+            parts.append(f"{watchlist_count} en watchlist")
+        summary = ", ".join(parts)
+
         return {
             "category": "postclose_digest",
             "severity": "low",
             "should_notify": market_phase == "postmarket",
             "title": "Mi Finanza - Resumen de cierre",
-            "body": (
-                f"{actionable_count} oportunidad(es) vigente(s), "
-                f"{watchlist_count} en watchlist. "
-                f"Análisis actualizado, oportunidades confirmadas. {_DISCLAIMER}"
-            ),
-        }
-
-    # --- SILENT: analysis completed, confirmed unchanged ---
-    # Explicit product decision: when detect_unchanged says True, the system
-    # ran a full cycle and the recommendation is materially identical.
-    # This NEVER generates a notification. The user checks when they want to.
-    if unchanged:
-        return {
-            "category": "analysis_completed",
-            "severity": "silent",
-            "should_notify": False,
-            "title": "",
-            "body": "",
+            "body": f"{summary}. Análisis actualizado. {_DISCLAIMER}",
         }
 
     # --- SILENT: nothing material to report ---
-    # Zero actionable, zero new watchlist, no contradictions, not unchanged.
+    # Zero actionable, zero watchlist, no contradictions, not unchanged.
     # Edge case: first run with no signals, or a run that found nothing.
     return {
         "category": "no_material_change",
@@ -578,7 +598,10 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     # --- Policy classification ---
     now = datetime.now(timezone.utc)
     ar_phase = _argentina_market_phase(now)
-    classification = classify_recommendation_alert(delta, ar_phase)
+    classification = classify_recommendation_alert(
+        delta, ar_phase,
+        contradiction_threshold=settings.notification_contradiction_threshold,
+    )
 
     if not classification["should_notify"]:
         return {
