@@ -508,7 +508,12 @@ def test_policy_new_actionable_is_high():
 
 
 def test_policy_thesis_contradiction_is_high():
-    """>=2 contradiction suppressions => HIGH severity."""
+    """>=3 contradiction suppressions => HIGH severity.
+
+    Threshold rationale: 1-2 contradictions can be noise (ambiguous tickers,
+    weak counter-signals). >=3 means the portfolio thesis is under real
+    multi-signal pressure and warrants immediate review.
+    """
     from app.notifications.dispatcher import classify_recommendation_alert
     delta = {
         "actionable_count": 0, "actionable_symbols": set(),
@@ -520,6 +525,19 @@ def test_policy_thesis_contradiction_is_high():
     assert result["severity"] == "high"
     assert result["category"] == "thesis_contradiction"
     assert result["should_notify"] is True
+
+
+def test_policy_two_contradictions_not_high():
+    """2 contradictions is NOT enough — could be noise or ambiguous tickers."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 0, "actionable_symbols": set(),
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 2, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "open")
+    assert result["category"] != "thesis_contradiction"
 
 
 def test_policy_single_contradiction_not_high():
@@ -579,8 +597,14 @@ def test_policy_watchlist_postclose_notifies():
     assert result["should_notify"] is True
 
 
-def test_policy_no_change_actionable_postclose_digest():
-    """Actionable exists but unchanged, postmarket => LOW, should_notify=True."""
+def test_policy_postclose_digest_semantics():
+    """Postclose digest: actionable exists, no new symbols, analysis changed.
+
+    Condition: actionable_count > 0 AND unchanged=False AND new_actionable empty.
+    Meaning: the system re-evaluated with fresh data, and the same opportunities
+    remain valid. The copy must reflect this — NOT say "sin cambios materiales"
+    (that would be contradictory since unchanged=False).
+    """
     from app.notifications.dispatcher import classify_recommendation_alert
     delta = {
         "actionable_count": 2, "actionable_symbols": {"AAPL", "MSFT"},
@@ -592,6 +616,11 @@ def test_policy_no_change_actionable_postclose_digest():
     assert result["severity"] == "low"
     assert result["category"] == "postclose_digest"
     assert result["should_notify"] is True
+    # Copy must be consistent: analysis changed, opportunities confirmed
+    assert "confirmada" in result["body"].lower() or "vigente" in result["body"].lower()
+    # Must NOT say "sin cambios" — that would contradict unchanged=False
+    assert "sin cambios materiales" not in result["body"].lower()
+    assert "informativo" in result["body"].lower() or "no ejecuta" in result["body"].lower()
 
 
 def test_policy_no_change_actionable_intraday_silent():
@@ -607,8 +636,13 @@ def test_policy_no_change_actionable_intraday_silent():
     assert result["should_notify"] is False
 
 
-def test_policy_unchanged_is_silent():
-    """Analysis with unchanged=True => SILENT, never pushes."""
+def test_policy_analysis_completed_unchanged_is_silent():
+    """unchanged=True => SILENT, category=analysis_completed. Never pushes.
+
+    Explicit product decision: when the system ran a full cycle and confirmed
+    nothing material changed, we don't interrupt the user. They check when
+    they want to. This is distinct from no_material_change (edge case).
+    """
     from app.notifications.dispatcher import classify_recommendation_alert
     delta = {
         "actionable_count": 0, "actionable_symbols": set(),
@@ -618,7 +652,26 @@ def test_policy_unchanged_is_silent():
     }
     result = classify_recommendation_alert(delta, "postmarket")
     assert result["severity"] == "silent"
-    assert result["category"] == "no_material_change"
+    assert result["category"] == "analysis_completed"
+    assert result["should_notify"] is False
+
+
+def test_policy_analysis_completed_even_with_actionable_unchanged():
+    """unchanged=True with existing actionable items => still analysis_completed.
+
+    Even if there are actionable items from a previous cycle, if unchanged=True
+    the recommendation is the same. No new information to push.
+    """
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 2, "actionable_symbols": {"AAPL", "MSFT"},
+        "new_actionable": set(), "watchlist_count": 3,
+        "watchlist_symbols": {"A", "B", "C"}, "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": True,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["severity"] == "silent"
+    assert result["category"] == "analysis_completed"
     assert result["should_notify"] is False
 
 
@@ -706,7 +759,7 @@ def test_dispatch_same_actionable_no_push_intraday(db):
 
 
 def test_dispatch_unchanged_silent(db):
-    """unchanged=True => policy_suppressed, category=no_material_change."""
+    """unchanged=True => policy_suppressed, category=analysis_completed."""
     from app.notifications.dispatcher import dispatch_recommendation_alerts
 
     rec = _make_rec_with_meta(db, unchanged=True)
@@ -716,23 +769,37 @@ def test_dispatch_unchanged_silent(db):
         result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
         assert result["sent"] is False
         assert result["reason"] == "policy_suppressed"
-        assert result["category"] == "no_material_change"
+        assert result["category"] == "analysis_completed"
         assert result["severity"] == "silent"
     finally:
         _restore_notifications(orig)
 
 
 def test_dispatch_contradiction_high(db):
-    """>=2 contradictions => high severity thesis_contradiction."""
+    """>=3 contradictions => high severity thesis_contradiction."""
     from app.notifications.dispatcher import dispatch_recommendation_alerts
 
-    rec = _make_rec_with_meta(db, contradiction_count=3)
+    rec = _make_rec_with_meta(db, contradiction_count=4)
 
     orig = _enable_notifications()
     try:
         result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
         assert result["severity"] == "high"
         assert result["category"] == "thesis_contradiction"
+    finally:
+        _restore_notifications(orig)
+
+
+def test_dispatch_contradiction_below_threshold(db):
+    """2 contradictions => NOT thesis_contradiction (threshold is >=3)."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    rec = _make_rec_with_meta(db, contradiction_count=2)
+
+    orig = _enable_notifications()
+    try:
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result.get("category") != "thesis_contradiction"
     finally:
         _restore_notifications(orig)
 
