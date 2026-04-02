@@ -36,7 +36,14 @@ def broker_ping():
 
 @router.post("/analysis/run")
 def run_manual_analysis(db: Session = Depends(get_db)):
-    return run_cycle(db, source="manual")
+    cycle_result = run_cycle(db, source="manual")
+    # Persist notification audit trail (best-effort, does not affect cycle result)
+    try:
+        from app.notifications.dispatcher import dispatch_recommendation_alerts
+        dispatch_recommendation_alerts(db, cycle_result)
+    except Exception:
+        pass
+    return cycle_result
 
 
 @router.get("/portfolio/summary")
