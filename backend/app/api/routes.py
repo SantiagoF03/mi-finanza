@@ -41,8 +41,9 @@ def run_manual_analysis(db: Session = Depends(get_db)):
     try:
         from app.notifications.dispatcher import dispatch_recommendation_alerts
         dispatch_recommendation_alerts(db, cycle_result)
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("dispatch_recommendation_alerts failed: %s", exc)
     return cycle_result
 
 

@@ -729,13 +729,19 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
 def _persist_audit(db, rec, audit: dict) -> None:
     """Best-effort: write notification_audit into recommendation metadata_json."""
     try:
+        # Refresh rec to ensure clean session state after run_cycle + app_log commits
+        try:
+            db.refresh(rec)
+        except Exception:
+            pass
         meta = rec.metadata_json or {}
         meta["notification_audit"] = audit
         rec.metadata_json = meta
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(rec, "metadata_json")
         db.commit()
-    except Exception:
+    except Exception as exc:
+        logger.warning("_persist_audit failed for rec %s: %s", getattr(rec, "id", "?"), exc)
         try:
             db.rollback()
         except Exception:
