@@ -1372,3 +1372,52 @@ def test_audit_trail_on_below_min_severity(db):
         settings.notification_enabled = orig_enabled
         settings.notification_min_severity = orig_severity
         disp._last_notification_at = old_last
+
+
+def test_audit_trail_persisted_when_notifications_disabled(db):
+    """Audit trail persists even when notification_enabled=False.
+
+    This was the real gap: the old code returned early on disabled
+    before building/persisting audit, so notification_audit was never
+    written. Now it always persists.
+    """
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from app.models.models import Recommendation
+
+    settings = get_settings()
+    original = settings.notification_enabled
+    settings.notification_enabled = False
+    try:
+        rec = _make_rec_with_meta(db, unchanged=True, watchlist_items=[
+            {"symbol": "LP"}, {"symbol": "JLL"},
+        ])
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["sent"] is False
+        assert result["reason"] == "disabled"
+
+        # Audit trail MUST still be persisted
+        db.expire(rec)
+        fresh = db.query(Recommendation).filter(Recommendation.id == rec.id).first()
+        audit = fresh.metadata_json.get("notification_audit")
+        assert audit is not None, "audit trail must be persisted even when notifications are disabled"
+        assert audit["category"] == "analysis_completed"
+        assert audit["severity"] == "silent"
+        assert audit["should_send"] is False
+        assert audit["suppress_reason"] == "notifications_disabled"
+        assert audit["cooldown_applied"] is False
+        assert "comparison_summary" in audit
+        assert audit["comparison_summary"]["unchanged"] is True
+        assert audit["comparison_summary"]["watchlist_count"] == 2
+    finally:
+        settings.notification_enabled = original
+
+
+def test_analysis_run_endpoint_persists_audit():
+    """POST /analysis/run wires dispatch_recommendation_alerts for audit."""
+    import inspect
+    from app.api import routes
+
+    source = inspect.getsource(routes.run_manual_analysis)
+    assert "dispatch_recommendation_alerts" in source, \
+        "POST /analysis/run must call dispatch_recommendation_alerts for audit trail"

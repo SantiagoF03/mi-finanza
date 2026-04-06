@@ -569,9 +569,10 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     1. Load current + previous recommendation metadata
     2. Compute delta (new actionable, new watchlist, contradictions, unchanged)
     3. Classify via policy (category → severity → should_notify)
-    4. Apply phase-aware cooldown and suppression
-    5. Send via Telegram + Web Push
-    6. Persist audit trail into recommendation metadata_json
+    4. Build audit trail (always — even when notifications disabled)
+    5. Apply phase-aware cooldown and suppression
+    6. Send via Telegram + Web Push
+    7. Persist audit trail into recommendation metadata_json
 
     Safety invariant: notifications NEVER execute orders. They are
     informational only. Every message includes "Solo informativo" disclaimer.
@@ -579,8 +580,6 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     global _last_notification_at
 
     settings = get_settings()
-    if not settings.notification_enabled:
-        return {"sent": False, "reason": "disabled"}
 
     rec_id = cycle_result.get("recommendation_id")
     if not rec_id:
@@ -624,7 +623,14 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
         },
     }
 
-    # --- Check gates, update audit on each suppression ---
+    # --- Gate: notifications disabled ---
+    if not settings.notification_enabled:
+        audit["should_send"] = False
+        audit["suppress_reason"] = "notifications_disabled"
+        _persist_audit(db, rec, audit)
+        return {"sent": False, "reason": "disabled"}
+
+    # --- Gate: policy suppression ---
     if not classification["should_notify"]:
         audit["should_send"] = False
         audit["suppress_reason"] = f"policy:{classification['category']}"
@@ -723,13 +729,19 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
 def _persist_audit(db, rec, audit: dict) -> None:
     """Best-effort: write notification_audit into recommendation metadata_json."""
     try:
+        # Refresh rec to ensure clean session state after run_cycle + app_log commits
+        try:
+            db.refresh(rec)
+        except Exception:
+            pass
         meta = rec.metadata_json or {}
         meta["notification_audit"] = audit
         rec.metadata_json = meta
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(rec, "metadata_json")
         db.commit()
-    except Exception:
+    except Exception as exc:
+        logger.warning("_persist_audit failed for rec %s: %s", getattr(rec, "id", "?"), exc)
         try:
             db.rollback()
         except Exception:
