@@ -613,7 +613,7 @@ def test_policy_postclose_digest_semantics():
         "suppressed_by_contradiction_count": 0, "unchanged": False,
     }
     result = classify_recommendation_alert(delta, "postmarket")
-    assert result["severity"] == "low"
+    assert result["severity"] == "medium"
     assert result["category"] == "postclose_digest"
     assert result["should_notify"] is True
     # Copy must be consistent: analysis changed, opportunities confirmed
@@ -753,7 +753,7 @@ def test_dispatch_same_actionable_no_push_intraday(db):
         # The phase will be whatever the test machine's clock says,
         # but with no new symbols and no contradictions, it's either
         # postclose_digest (postmarket) or no_material_change
-        assert result["sent"] is False or result["severity"] == "low"
+        assert result["sent"] is False or result["severity"] == "medium"
     finally:
         _restore_notifications(orig)
 
@@ -1050,7 +1050,7 @@ def test_policy_digest_watchlist_only_no_actionable():
     }
     result = classify_recommendation_alert(delta, "postmarket")
     assert result["category"] == "postclose_digest"
-    assert result["severity"] == "low"
+    assert result["severity"] == "medium"
     assert result["should_notify"] is True
     assert "watchlist" in result["body"].lower()
     assert "informativo" in result["body"].lower() or "no ejecuta" in result["body"].lower()
@@ -1071,7 +1071,7 @@ def test_policy_digest_contradictions_only():
     }
     result = classify_recommendation_alert(delta, "postmarket")
     assert result["category"] == "postclose_digest"
-    assert result["severity"] == "low"
+    assert result["severity"] == "medium"
     assert result["should_notify"] is True
     assert "contradicción" in result["body"].lower()
 
@@ -1210,6 +1210,127 @@ def test_extract_delta_unchanged():
     }
     delta = _extract_delta(current, None)
     assert delta["unchanged"] is True
+
+
+def test_extract_delta_watchlist_filters_weak_unconfirmed_rni():
+    """Weak + unconfirmed + relevant_not_investable watchlist items are excluded from new_watchlist."""
+    from app.notifications.dispatcher import _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 2, "items": [
+                    # Weak + unconfirmed + relevant_not_investable → excluded
+                    {"symbol": "BTCC", "signal_quality": "weak",
+                     "market_confirmation": "unconfirmed",
+                     "operational_status": "relevant_not_investable"},
+                    # Strong signal → included
+                    {"symbol": "AAPL", "signal_quality": "strong",
+                     "market_confirmation": "confirmed",
+                     "operational_status": None},
+                ]},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": False,
+    }
+    delta = _extract_delta(current, None)
+    # BTCC filtered out, only AAPL counts
+    assert delta["new_watchlist"] == {"AAPL"}
+    # Raw watchlist_count stays unfiltered (for postclose_digest)
+    assert delta["watchlist_count"] == 2
+
+
+def test_extract_delta_watchlist_weak_but_confirmed_passes():
+    """Weak signal with market confirmation is notification-worthy."""
+    from app.notifications.dispatcher import _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 1, "items": [
+                    {"symbol": "XYZ", "signal_quality": "weak",
+                     "market_confirmation": "confirmed",
+                     "operational_status": "relevant_not_investable"},
+                ]},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": False,
+    }
+    delta = _extract_delta(current, None)
+    # Weak but confirmed → passes filter
+    assert delta["new_watchlist"] == {"XYZ"}
+
+
+def test_extract_delta_watchlist_weak_investable_passes():
+    """Weak signal that is investable (not relevant_not_investable) passes filter."""
+    from app.notifications.dispatcher import _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 1, "items": [
+                    {"symbol": "ABC", "signal_quality": "weak",
+                     "market_confirmation": "unconfirmed",
+                     "operational_status": None},
+                ]},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": False,
+    }
+    delta = _extract_delta(current, None)
+    assert delta["new_watchlist"] == {"ABC"}
+
+
+def test_policy_postclose_digest_severity_medium():
+    """postclose_digest has severity=medium to pass default min_severity filter."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 1, "actionable_symbols": {"SPY"},
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "postclose_digest"
+    assert result["severity"] == "medium"
+    assert result["should_notify"] is True
+
+
+def test_watchlist_all_weak_rni_triggers_no_notification():
+    """If ALL watchlist items are weak+unconfirmed+rni, watchlist_material never fires."""
+    from app.notifications.dispatcher import classify_recommendation_alert, _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 2, "items": [
+                    {"symbol": "BTCC", "signal_quality": "weak",
+                     "market_confirmation": "unconfirmed",
+                     "operational_status": "relevant_not_investable"},
+                    {"symbol": "DOGE", "signal_quality": "weak",
+                     "market_confirmation": None,
+                     "operational_status": "relevant_not_investable"},
+                ]},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": False,
+    }
+    delta = _extract_delta(current, None)
+    assert delta["new_watchlist"] == set()
+    # But raw count is preserved — postclose_digest can still mention them
+    assert delta["watchlist_count"] == 2
+    # Policy: no new_watchlist → falls through to postclose_digest (has_watchlist=True)
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "postclose_digest"
+    assert result["severity"] == "medium"
 
 
 # ---------------------------------------------------------------------------

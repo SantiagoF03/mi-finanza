@@ -368,6 +368,21 @@ def _get_previous_recommendation(db, exclude_id: int):
     )
 
 
+def _watchlist_notification_worthy(item: dict) -> bool:
+    """Return True if a watchlist item should count for notification delta.
+
+    Filters out: weak signal + unconfirmed market + relevant_not_investable.
+    These are real signals but too noisy to push — user reviews in-app.
+    """
+    if (
+        item.get("signal_quality") == "weak"
+        and item.get("operational_status") == "relevant_not_investable"
+        and item.get("market_confirmation") in (None, "unconfirmed")
+    ):
+        return False
+    return True
+
+
 def _extract_delta(current_meta: dict, prev_meta: dict | None) -> dict:
     """Compare current recommendation against previous to detect material changes.
 
@@ -382,7 +397,12 @@ def _extract_delta(current_meta: dict, prev_meta: dict | None) -> dict:
     current_actionable_items = actionable.get("items", [])
     current_actionable_symbols = {i.get("symbol") for i in current_actionable_items if i.get("symbol")}
     current_watchlist_items = watchlist.get("items", [])
-    current_watchlist_symbols = {i.get("symbol") for i in current_watchlist_items if i.get("symbol")}
+    # Only notification-worthy watchlist items count for delta/new_watchlist.
+    # Raw watchlist_count stays unfiltered (used by postclose_digest).
+    current_watchlist_symbols = {
+        i.get("symbol") for i in current_watchlist_items
+        if i.get("symbol") and _watchlist_notification_worthy(i)
+    }
 
     prev_actionable_symbols: set = set()
     prev_watchlist_symbols: set = set()
@@ -395,7 +415,7 @@ def _extract_delta(current_meta: dict, prev_meta: dict | None) -> dict:
         }
         prev_watchlist_symbols = {
             i.get("symbol") for i in prev_rq.get("watchlist_now", {}).get("items", [])
-            if i.get("symbol")
+            if i.get("symbol") and _watchlist_notification_worthy(i)
         }
 
     return {
@@ -447,12 +467,15 @@ def classify_recommendation_alert(
     MEDIUM — push in premarket + postmarket only
       • watchlist_material: new symbols in watchlist vs previous cycle.
         Suppressed during market hours (intraday) to avoid noise.
+        Quality filter: weak + unconfirmed + relevant_not_investable items
+        are excluded from new_watchlist delta (too noisy to push).
 
-    LOW — push only in postmarket (post-close digest)
+    MEDIUM — push only in postmarket (post-close digest)
       • postclose_digest: analysis ran, unchanged=False, and at least one
         material thing to report: actionable items exist, OR new watchlist
         items appeared, OR contradictions were detected (below threshold).
-        Summarizes the day. Only fires in postmarket.
+        Summarizes the day. Only fires in postmarket. Severity=medium so it
+        passes default min_severity filter without lowering global threshold.
 
     SILENT — never push
       • analysis_completed: unchanged=True. Full cycle confirmed nothing
@@ -544,7 +567,7 @@ def classify_recommendation_alert(
 
         return {
             "category": "postclose_digest",
-            "severity": "low",
+            "severity": "medium",
             "should_notify": market_phase == "postmarket",
             "title": "Mi Finanza - Resumen de cierre",
             "body": f"{summary}. Análisis actualizado. {_DISCLAIMER}",
