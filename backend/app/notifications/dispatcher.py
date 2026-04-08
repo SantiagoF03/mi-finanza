@@ -398,7 +398,8 @@ def _extract_delta(current_meta: dict, prev_meta: dict | None) -> dict:
     current_actionable_symbols = {i.get("symbol") for i in current_actionable_items if i.get("symbol")}
     current_watchlist_items = watchlist.get("items", [])
     # Only notification-worthy watchlist items count for delta/new_watchlist.
-    # Raw watchlist_count stays unfiltered (used by postclose_digest).
+    # watchlist_count also uses the filtered set — weak+unconfirmed+rni items
+    # must not justify a postclose_digest by themselves.
     current_watchlist_symbols = {
         i.get("symbol") for i in current_watchlist_items
         if i.get("symbol") and _watchlist_notification_worthy(i)
@@ -422,7 +423,7 @@ def _extract_delta(current_meta: dict, prev_meta: dict | None) -> dict:
         "actionable_count": actionable.get("count", 0),
         "actionable_symbols": current_actionable_symbols,
         "new_actionable": current_actionable_symbols - prev_actionable_symbols,
-        "watchlist_count": watchlist.get("count", 0),
+        "watchlist_count": len(current_watchlist_symbols),
         "watchlist_symbols": current_watchlist_symbols,
         "new_watchlist": current_watchlist_symbols - prev_watchlist_symbols,
         "suppressed_by_contradiction_count": pc.get("suppressed_by_contradiction_count", 0),

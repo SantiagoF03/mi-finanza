@@ -1238,8 +1238,8 @@ def test_extract_delta_watchlist_filters_weak_unconfirmed_rni():
     delta = _extract_delta(current, None)
     # BTCC filtered out, only AAPL counts
     assert delta["new_watchlist"] == {"AAPL"}
-    # Raw watchlist_count stays unfiltered (for postclose_digest)
-    assert delta["watchlist_count"] == 2
+    # watchlist_count also filtered — weak+rni items don't justify digest
+    assert delta["watchlist_count"] == 1
 
 
 def test_extract_delta_watchlist_weak_but_confirmed_passes():
@@ -1325,12 +1325,122 @@ def test_watchlist_all_weak_rni_triggers_no_notification():
     }
     delta = _extract_delta(current, None)
     assert delta["new_watchlist"] == set()
-    # But raw count is preserved — postclose_digest can still mention them
-    assert delta["watchlist_count"] == 2
-    # Policy: no new_watchlist → falls through to postclose_digest (has_watchlist=True)
+    # Filtered count — weak+rni items don't count
+    assert delta["watchlist_count"] == 0
+    # No material at all → no_material_change SILENT (not postclose_digest)
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "no_material_change"
+    assert result["severity"] == "silent"
+    assert result["should_notify"] is False
+
+
+def test_digest_not_triggered_by_weak_rni_watchlist_alone():
+    """postclose_digest must NOT fire when the only watchlist items are weak+unconfirmed+rni.
+
+    Product rule: noise displaced from watchlist_material must not leak into digest.
+    If the only "material" is weak signals, there's nothing useful to summarize.
+    """
+    from app.notifications.dispatcher import classify_recommendation_alert, _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 3, "items": [
+                    {"symbol": "BTCC", "signal_quality": "weak",
+                     "market_confirmation": "unconfirmed",
+                     "operational_status": "relevant_not_investable"},
+                    {"symbol": "DOGE", "signal_quality": "weak",
+                     "market_confirmation": None,
+                     "operational_status": "relevant_not_investable"},
+                    {"symbol": "SHIB", "signal_quality": "weak",
+                     "market_confirmation": "unconfirmed",
+                     "operational_status": "relevant_not_investable"},
+                ]},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": False,
+    }
+    delta = _extract_delta(current, None)
+    # All three filtered out
+    assert delta["watchlist_count"] == 0
+    assert delta["new_watchlist"] == set()
+
+    # No actionable, no contradictions, no worthy watchlist → no_material_change
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "no_material_change"
+    assert result["severity"] == "silent"
+    assert result["should_notify"] is False
+
+
+def test_digest_fires_with_real_material_alongside_weak():
+    """postclose_digest fires when there's real material, even if weak items also exist.
+
+    One strong watchlist item + one weak+rni item: the strong one counts,
+    the weak one doesn't. Digest fires because there's real material.
+    """
+    from app.notifications.dispatcher import classify_recommendation_alert, _extract_delta
+
+    current = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 2, "items": [
+                    # Weak+rni → filtered out
+                    {"symbol": "BTCC", "signal_quality": "weak",
+                     "market_confirmation": "unconfirmed",
+                     "operational_status": "relevant_not_investable"},
+                    # Strong → counts
+                    {"symbol": "AAPL", "signal_quality": "strong",
+                     "market_confirmation": "confirmed",
+                     "operational_status": None},
+                ]},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+        "unchanged": False,
+    }
+    prev = {
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 1, "items": [
+                    {"symbol": "AAPL", "signal_quality": "strong",
+                     "market_confirmation": "confirmed",
+                     "operational_status": None},
+                ]},
+            },
+        },
+    }
+    delta = _extract_delta(current, prev)
+    # AAPL not new (was in prev), BTCC filtered out
+    assert delta["new_watchlist"] == set()
+    # But filtered count includes AAPL
+    assert delta["watchlist_count"] == 1
+
+    # has_watchlist=True → postclose_digest at postmarket
     result = classify_recommendation_alert(delta, "postmarket")
     assert result["category"] == "postclose_digest"
     assert result["severity"] == "medium"
+    assert result["should_notify"] is True
+    assert "watchlist" in result["body"].lower()
+
+
+def test_digest_fires_on_actionable_even_without_watchlist():
+    """postclose_digest fires on actionable count alone, independent of watchlist noise."""
+    from app.notifications.dispatcher import classify_recommendation_alert
+    delta = {
+        "actionable_count": 2, "actionable_symbols": {"SPY", "QQQ"},
+        "new_actionable": set(), "watchlist_count": 0,
+        "watchlist_symbols": set(), "new_watchlist": set(),
+        "suppressed_by_contradiction_count": 0, "unchanged": False,
+    }
+    result = classify_recommendation_alert(delta, "postmarket")
+    assert result["category"] == "postclose_digest"
+    assert result["severity"] == "medium"
+    assert result["should_notify"] is True
+    assert "vigente" in result["body"].lower()
 
 
 # ---------------------------------------------------------------------------
