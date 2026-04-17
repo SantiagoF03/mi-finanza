@@ -2,6 +2,138 @@ import { useEffect, useState } from 'react'
 
 const API = (import.meta.env.VITE_API_BASE || window.location.origin) + '/api'
 
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/')
+  const rawData = atob(base64)
+  return new Uint8Array([...rawData].map((c) => c.charCodeAt(0)))
+}
+
+function NotificationPanel({ api }) {
+  const supported =
+    typeof Notification !== 'undefined' &&
+    'serviceWorker' in navigator &&
+    'PushManager' in window
+
+  const [permission, setPermission] = useState(() =>
+    supported ? Notification.permission : 'unsupported'
+  )
+  const [swState, setSwState] = useState('checking')
+  const [subscribed, setSubscribed] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [msg, setMsg] = useState('')
+
+  useEffect(() => {
+    if (!supported) { setSwState('unavailable'); setSubscribed(false); return }
+    navigator.serviceWorker.ready
+      .then((reg) => { setSwState('ready'); return reg.pushManager.getSubscription() })
+      .then((sub) => setSubscribed(!!sub))
+      .catch(() => { setSwState('unavailable'); setSubscribed(false) })
+  }, [])
+
+  const activate = async () => {
+    setLoading(true); setMsg('')
+    try {
+      const perm = await Notification.requestPermission()
+      setPermission(perm)
+      if (perm !== 'granted') {
+        setMsg('Permiso denegado. En Chrome Android: Configuración → Sitios → Notificaciones.')
+        return
+      }
+      const vapidRes = await fetch(`${api}/push/vapid-public-key`)
+      const { vapid_public_key } = await vapidRes.json()
+      if (!vapid_public_key) {
+        setMsg('VAPID key no configurada en el servidor. Revisá VAPID_PUBLIC_KEY en el .env del backend.')
+        return
+      }
+      const reg = await navigator.serviceWorker.ready
+      setSwState('ready')
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(vapid_public_key),
+      })
+      const subJson = sub.toJSON()
+      const postRes = await fetch(`${api}/push/subscribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: subJson.endpoint, keys: subJson.keys }),
+      })
+      if (!postRes.ok) throw new Error('Error registrando suscripción en el servidor.')
+      setSubscribed(true)
+      setMsg('Suscripción activa. Ya podés recibir notificaciones push.')
+    } catch (err) {
+      setMsg(`Error: ${err.message}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const sendTest = async () => {
+    setLoading(true); setMsg('')
+    try {
+      const res = await fetch(`${api}/push/test`, { method: 'POST' })
+      const data = await res.json()
+      if (res.ok) {
+        const sent = data.sent ?? 0
+        const failed = data.failed ?? 0
+        setMsg(
+          sent > 0 ? 'Push enviado. Revisá tu celular.' :
+          failed > 0 ? `Falló el envío (${failed} errores). Verificá claves VAPID.` :
+          'Sin suscripciones activas. Activá notificaciones primero.'
+        )
+      } else {
+        setMsg('Error al enviar push de prueba.')
+      }
+    } catch { setMsg('No se pudo conectar con el servidor.') }
+    finally { setLoading(false) }
+  }
+
+  const permLabel = permission === 'granted' ? '✓ Otorgado' : permission === 'denied' ? '✗ Denegado' : permission === 'default' ? 'Sin definir' : 'No soportado'
+  const swLabel = swState === 'ready' ? '✓ Activo' : swState === 'checking' ? '...' : '✗ No disponible'
+  const subLabel = subscribed === null ? '...' : subscribed ? '✓ Activa' : 'Sin suscripción'
+  const canActivate = supported && permission !== 'denied' && !subscribed && subscribed !== null
+
+  return (
+    <section>
+      <h2>Notificaciones Push</h2>
+      {!supported && (
+        <div className="info-box info-blocked">Navegador no soporta push. Usá Chrome en Android.</div>
+      )}
+      {supported && (
+        <>
+          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 12 }}>
+            <span style={{ fontSize: '0.85em' }}>Permiso: <strong>{permLabel}</strong></span>
+            <span style={{ fontSize: '0.85em' }}>SW: <strong>{swLabel}</strong></span>
+            <span style={{ fontSize: '0.85em' }}>Suscripción: <strong>{subLabel}</strong></span>
+          </div>
+          {permission === 'denied' && (
+            <div className="info-box info-blocked" style={{ marginBottom: 8 }}>
+              Bloqueado. En Chrome Android: Configuración → Configuración del sitio → Notificaciones → habilitá este sitio.
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            {canActivate && (
+              <button onClick={activate} disabled={loading} className="btn-primary">
+                {loading ? 'Activando...' : 'Activar notificaciones'}
+              </button>
+            )}
+            {subscribed && (
+              <button onClick={sendTest} disabled={loading}>
+                {loading ? 'Enviando...' : 'Probar notificación'}
+              </button>
+            )}
+          </div>
+          {msg && (
+            <p style={{ marginTop: 8, fontSize: '0.9em', color: msg.startsWith('Error') || msg.startsWith('Bloq') || msg.startsWith('Falló') ? 'var(--danger)' : 'var(--success)' }}>
+              {msg}
+            </p>
+          )}
+        </>
+      )}
+    </section>
+  )
+}
+
 function formatRemaining(totalSeconds) {
   const seconds = Math.max(0, Number(totalSeconds || 0))
   const mins = Math.floor(seconds / 60)
@@ -474,6 +606,8 @@ export default function App() {
       {/* ALERTS TAB */}
       {tab === 'alerts' && (
         <>
+          <NotificationPanel api={API} />
+
           {alerts.length > 0 && (
             <section>
               <h2>Alertas activas</h2>
