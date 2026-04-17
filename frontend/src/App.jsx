@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 
-const API = (import.meta.env.VITE_API_BASE || window.location.origin) + '/api'
+const API = import.meta.env.VITE_API_BASE
+  ? import.meta.env.VITE_API_BASE + '/api'
+  : `${window.location.protocol}//${window.location.hostname}:8000/api`
 
 function urlBase64ToUint8Array(base64String) {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
