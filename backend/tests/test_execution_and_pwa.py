@@ -1652,3 +1652,112 @@ def test_analysis_run_endpoint_persists_audit():
     source = inspect.getsource(routes.run_manual_analysis)
     assert "dispatch_recommendation_alerts" in source, \
         "POST /analysis/run must call dispatch_recommendation_alerts for audit trail"
+
+
+# ---------------------------------------------------------------------------
+# 9. Notification channel routing
+# ---------------------------------------------------------------------------
+
+
+def test_notification_channel_default_is_web_push():
+    """Default notification_channel must be web_push, not telegram."""
+    from app.core.config import Settings
+    s = Settings()
+    assert s.notification_channel == "web_push", (
+        "Default channel must be web_push so Android PWA works out of the box"
+    )
+
+
+def test_notification_channel_web_push_skips_telegram(db):
+    """channel=web_push: web push attempted, telegram never called."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig_channel = settings.notification_channel
+    orig_enabled = settings.notification_enabled
+    orig_last = disp._last_notification_at
+    settings.notification_channel = "web_push"
+    settings.notification_enabled = True
+    disp._last_notification_at = None  # clear cooldown
+
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
+
+    with patch("app.notifications.dispatcher._send_telegram") as mock_tg, \
+         patch("app.notifications.dispatcher.send_web_push_to_all",
+               return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+        dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        mock_tg.assert_not_called()
+        mock_wp.assert_called_once()
+
+    settings.notification_channel = orig_channel
+    settings.notification_enabled = orig_enabled
+    disp._last_notification_at = orig_last
+
+
+def test_notification_channel_telegram_calls_web_push_too(db):
+    """channel=telegram + credentials set: both telegram and web push attempted."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig_channel = settings.notification_channel
+    orig_enabled = settings.notification_enabled
+    orig_token = settings.telegram_bot_token
+    orig_chat = settings.telegram_chat_id
+    orig_last = disp._last_notification_at
+    settings.notification_channel = "telegram"
+    settings.notification_enabled = True
+    settings.telegram_bot_token = "fake-token"
+    settings.telegram_chat_id = "fake-chat"
+    disp._last_notification_at = None  # clear cooldown
+
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
+
+    with patch("app.notifications.dispatcher._send_telegram", return_value=False) as mock_tg, \
+         patch("app.notifications.dispatcher.send_web_push_to_all",
+               return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+        dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        mock_tg.assert_called_once()
+        mock_wp.assert_called_once()
+
+    settings.notification_channel = orig_channel
+    settings.notification_enabled = orig_enabled
+    settings.telegram_bot_token = orig_token
+    settings.telegram_chat_id = orig_chat
+    disp._last_notification_at = orig_last
+
+
+def test_settings_api_rejects_invalid_channel():
+    """PUT /notifications/settings must reject unknown channel values."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    resp = client.put("/api/notifications/settings", json={"notification_channel": "email"})
+    assert resp.status_code == 400
+
+
+def test_settings_api_accepts_web_push_channel():
+    """PUT /notifications/settings accepts web_push as valid channel."""
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig = settings.notification_channel
+    try:
+        # Patch DB calls so TestClient doesn't need a real user_settings table
+        with patch("app.api.routes._persist_setting"), \
+             patch("app.api.routes._load_persisted_settings"):
+            client = TestClient(app)
+            resp = client.put("/api/notifications/settings", json={"notification_channel": "web_push"})
+        assert resp.status_code == 200
+        assert resp.json()["notification_channel"] == "web_push"
+    finally:
+        settings.notification_channel = orig

@@ -400,6 +400,7 @@ def get_execution(execution_id: int, db: Session = Depends(get_db)):
 
 class NotificationSettingsIn(BaseModel):
     notification_enabled: bool | None = None
+    notification_channel: str | None = None  # telegram | web_push
     notification_min_severity: str | None = None
     notification_cooldown_seconds: int | None = None
     telegram_bot_token: str | None = None
@@ -426,6 +427,13 @@ def update_notification_settings(payload: NotificationSettingsIn, db: Session = 
     if payload.notification_enabled is not None:
         settings.notification_enabled = payload.notification_enabled
         _persist_setting(db, "notification_enabled", str(payload.notification_enabled))
+
+    if payload.notification_channel is not None:
+        valid_channels = {"telegram", "web_push"}
+        if payload.notification_channel not in valid_channels:
+            raise HTTPException(400, f"Canal inválido. Válidos: {', '.join(sorted(valid_channels))}")
+        settings.notification_channel = payload.notification_channel
+        _persist_setting(db, "notification_channel", payload.notification_channel)
 
     if payload.notification_min_severity is not None:
         valid = {"low", "medium", "high", "critical"}

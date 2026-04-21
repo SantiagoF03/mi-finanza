@@ -703,9 +703,10 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     # --- Deliver via all channels ---
     title = classification["title"]
     body = classification["body"]
+    channel = settings.notification_channel  # telegram | web_push
 
     telegram_sent = False
-    if settings.notification_channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
+    if channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
         phase_map = {"premarket": "Pre-apertura", "open": "Mercado abierto",
                      "postmarket": "Post-cierre", "off": "Mercado cerrado"}
         msg = (
@@ -716,17 +717,20 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
         )
         telegram_sent = _send_telegram(msg, settings.telegram_bot_token, settings.telegram_chat_id)
 
+    # web_push: primary channel when channel=web_push; also fires alongside telegram
+    # when channel=telegram (belt-and-suspenders for high-value alerts).
     push_result = {"sent": 0, "failed": 0, "removed": 0}
-    try:
-        push_result = send_web_push_to_all(
-            db,
-            title=title,
-            body=body,
-            severity=classification["severity"],
-            deep_link="/recommendations",
-        )
-    except Exception as exc:
-        logger.warning("Recommendation push failed: %s", exc)
+    if channel in ("web_push", "telegram"):
+        try:
+            push_result = send_web_push_to_all(
+                db,
+                title=title,
+                body=body,
+                severity=classification["severity"],
+                deep_link="/recommendations",
+            )
+        except Exception as exc:
+            logger.warning("Recommendation push failed: %s", exc)
 
     any_sent = telegram_sent or push_result.get("sent", 0) > 0
     if any_sent:
