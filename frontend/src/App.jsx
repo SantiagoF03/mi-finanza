@@ -61,8 +61,16 @@ function NotificationPanel({ api }) {
         body: JSON.stringify({ endpoint: subJson.endpoint, keys: subJson.keys }),
       })
       if (!postRes.ok) throw new Error('Error registrando suscripción en el servidor.')
+      // Auto-promote channel to web_push so the persisted setting matches the real delivery path.
+      try {
+        await fetch(`${api}/notifications/settings`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ notification_channel: 'web_push' }),
+        })
+      } catch { /* non-fatal: subscription still works */ }
       setSubscribed(true)
-      setMsg('Suscripción activa. Ya podés recibir notificaciones push.')
+      setMsg('Suscripción activa. Canal configurado como web push. Ya podés recibir notificaciones.')
     } catch (err) {
       setMsg(`Error: ${err.message}`)
     } finally {
