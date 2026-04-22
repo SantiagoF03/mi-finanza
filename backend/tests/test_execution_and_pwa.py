@@ -2389,3 +2389,218 @@ def test_slim_function_unit():
     # Sliced preserves order
     assert items[0]["x"] == 0
     assert items[9]["x"] == 9
+
+
+# ── Section 13: Weak noise exclusion from watchlist_now.items ───────────
+
+def _make_observed_item(symbol, signal_quality="weak", market_confirmation="unconfirmed",
+                        operational_status="relevant_not_investable", effective_score=0.4,
+                        observed_origin="signal", causal_link_strength="strong"):
+    return {
+        "symbol": symbol,
+        "signal_quality": signal_quality,
+        "market_confirmation": market_confirmation,
+        "operational_status": operational_status,
+        "effective_score": effective_score,
+        "observed_origin": observed_origin,
+        "causal_link_strength": causal_link_strength,
+        "signal_class": "observed_candidate",
+    }
+
+
+def _make_rec_with_watchlist_items(db, observed_items):
+    """Create a Recommendation with specific observed items in review_queue + observed_candidates."""
+    from datetime import datetime
+
+    # Build obs_signals_real (all have observed_origin="signal")
+    obs_signals_real = [i for i in observed_items if i.get("observed_origin") == "signal"]
+
+    # Mirror the orchestrator's filtering logic for watchlist_now.items
+    obs_watchlist_prominent = [
+        i for i in obs_signals_real
+        if not (i.get("signal_quality") == "weak"
+                and i.get("operational_status") == "relevant_not_investable"
+                and i.get("market_confirmation") in (None, "unconfirmed"))
+    ]
+    obs_rni = [i for i in observed_items
+               if i.get("operational_status") == "relevant_not_investable"]
+    obs_investable = [i for i in obs_signals_real
+                      if i.get("operational_status") != "relevant_not_investable"]
+
+    top_items = sorted(obs_watchlist_prominent,
+                       key=lambda x: x.get("effective_score", 0), reverse=True)[:10]
+
+    meta = {
+        "unchanged": False,
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {
+                    "count": len(obs_signals_real),
+                    "items": top_items,
+                    "relevant_not_investable_count": len(obs_rni),
+                    "investable_signal_count": len(obs_investable),
+                    "weak_noise_excluded_count": len(obs_signals_real) - len(obs_watchlist_prominent),
+                },
+                "suppressed_review": {"count": 0, "items": []},
+                "total_items": len(observed_items),
+            },
+            "pipeline_counts": {
+                "observed_count": len(observed_items),
+                "suppressed_count": 0,
+            },
+            "candidates": {
+                "watchlist_count": len(obs_signals_real),
+            },
+        },
+        "observed_candidates": observed_items,
+        "suppressed_candidates": [],
+    }
+    rec = Recommendation(
+        action="hold", status="pending", suggested_pct=0.0, confidence=0.5,
+        rationale="watchlist test", risks="", executive_summary="watchlist test",
+        metadata_json=meta,
+        created_at=datetime.utcnow(),
+    )
+    db.add(rec)
+    db.commit()
+    return rec
+
+
+def test_weak_unconfirmed_rni_excluded_from_watchlist_items():
+    """weak+unconfirmed+rni items must not appear in watchlist_now.items."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    items = [
+        _make_observed_item("BTCC", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+        _make_observed_item("AEVEX", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+        _make_observed_item("GOOD_STRONG", signal_quality="strong", market_confirmation="confirmed",
+                            operational_status=None, effective_score=0.7),
+    ]
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_watchlist_items(db, items)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        wn = data["decision_summary"]["review_queue"]["watchlist_now"]
+        item_symbols = [i["symbol"] for i in wn["items"]]
+        assert "GOOD_STRONG" in item_symbols
+        assert "BTCC" not in item_symbols
+        assert "AEVEX" not in item_symbols
+        assert wn["weak_noise_excluded_count"] == 2
+        # Total count still reflects all signal-bearing items
+        assert wn["count"] == 3
+
+        # But observed_candidates still has all items (observability preserved)
+        obs_symbols = [i["symbol"] for i in data["observed_candidates"]]
+        assert "BTCC" in obs_symbols
+        assert "AEVEX" in obs_symbols
+        assert "GOOD_STRONG" in obs_symbols
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_strong_rni_stays_in_watchlist_items():
+    """strong+rni items ARE prominent (real signal, just not investable yet)."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    items = [
+        _make_observed_item("STRONG_RNI", signal_quality="strong", market_confirmation="confirmed",
+                            operational_status="relevant_not_investable", effective_score=0.8),
+        _make_observed_item("WEAK_RNI", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+    ]
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_watchlist_items(db, items)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        wn = data["decision_summary"]["review_queue"]["watchlist_now"]
+        item_symbols = [i["symbol"] for i in wn["items"]]
+        assert "STRONG_RNI" in item_symbols
+        assert "WEAK_RNI" not in item_symbols
+        assert wn["weak_noise_excluded_count"] == 1
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_weak_confirmed_rni_stays_in_watchlist():
+    """weak+CONFIRMED+rni items stay — market confirmation gives them legitimacy."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    items = [
+        _make_observed_item("CONFIRMED_WEAK", signal_quality="weak",
+                            market_confirmation="confirmed",
+                            operational_status="relevant_not_investable",
+                            effective_score=0.5),
+    ]
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_watchlist_items(db, items)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        wn = data["decision_summary"]["review_queue"]["watchlist_now"]
+        item_symbols = [i["symbol"] for i in wn["items"]]
+        assert "CONFIRMED_WEAK" in item_symbols
+        assert wn["weak_noise_excluded_count"] == 0
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_all_weak_noise_yields_empty_watchlist_items():
+    """If ALL observed items are weak noise, watchlist_now.items is empty."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    items = [
+        _make_observed_item("FMC", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+        _make_observed_item("BAE", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+        _make_observed_item("IFC", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+    ]
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_watchlist_items(db, items)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        wn = data["decision_summary"]["review_queue"]["watchlist_now"]
+        assert wn["items"] == []
+        assert wn["count"] == 3  # total signal count preserved
+        assert wn["weak_noise_excluded_count"] == 3
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
