@@ -65,7 +65,7 @@ class Settings(BaseSettings):
 
     # Notification (Part E)
     notification_enabled: bool = False
-    notification_channel: str = "telegram"  # telegram | email
+    notification_channel: str = "web_push"  # telegram | web_push
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     notification_min_severity: str = "medium"  # low | medium | high | critical

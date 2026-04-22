@@ -313,8 +313,14 @@ def send_web_push_to_all(
     return {"sent": sent, "failed": failed, "removed": removed}
 
 
-def dispatch_execution_notification(order_execution) -> dict:
-    """Send notification about an execution state change."""
+def dispatch_execution_notification(order_execution, db=None) -> dict:
+    """Send notification about an execution state change.
+
+    Honors notification_channel. Telegram fires only when channel=telegram
+    and credentials are set. Web push fires when channel=web_push (and also
+    as belt-and-suspenders when channel=telegram), provided a db session is
+    passed so we can iterate PushSubscription rows.
+    """
     settings = get_settings()
     if not settings.notification_enabled:
         return {"sent": False, "reason": "disabled"}
@@ -332,13 +338,35 @@ def dispatch_execution_notification(order_execution) -> dict:
         "validation_failed": f"Orden {side} de {symbol} bloqueada por validación.",
         "failed": f"Orden {side} de {symbol} falló.",
     }
-    msg = f"Mi Finanza - Ejecución\n\n{status_msg.get(status, f'{symbol}: {status}')}"
+    body = status_msg.get(status, f"{symbol}: {status}")
+    msg = f"Mi Finanza - Ejecución\n\n{body}"
+    channel = settings.notification_channel
 
-    sent = False
-    if settings.notification_channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
-        sent = _send_telegram(msg, settings.telegram_bot_token, settings.telegram_chat_id)
+    telegram_sent = False
+    if channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
+        telegram_sent = _send_telegram(msg, settings.telegram_bot_token, settings.telegram_chat_id)
 
-    return {"sent": sent, "channel": settings.notification_channel, "status": status}
+    push_result = {"sent": 0, "failed": 0, "removed": 0}
+    if db is not None and channel in ("web_push", "telegram"):
+        try:
+            push_result = send_web_push_to_all(
+                db,
+                title=f"Mi Finanza - Ejecución {symbol}",
+                body=body,
+                severity="medium",
+                deep_link="/executions",
+            )
+        except Exception as exc:
+            logger.warning("Execution push failed: %s", exc)
+
+    any_sent = telegram_sent or push_result.get("sent", 0) > 0
+    return {
+        "sent": any_sent,
+        "channel": channel,
+        "status": status,
+        "telegram_sent": telegram_sent,
+        "web_push_sent": push_result.get("sent", 0),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +678,7 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     # --- Gate: notifications disabled ---
     if not settings.notification_enabled:
         audit["should_send"] = False
+        audit["sent"] = False
         audit["suppress_reason"] = "notifications_disabled"
         _persist_audit(db, rec, audit)
         return {"sent": False, "reason": "disabled"}
@@ -657,6 +686,7 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     # --- Gate: policy suppression ---
     if not classification["should_notify"]:
         audit["should_send"] = False
+        audit["sent"] = False
         audit["suppress_reason"] = f"policy:{classification['category']}"
         _persist_audit(db, rec, audit)
         return {
@@ -668,6 +698,7 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
 
     if not _severity_passes(classification["severity"], settings.notification_min_severity):
         audit["should_send"] = False
+        audit["sent"] = False
         audit["suppress_reason"] = f"below_min_severity:{classification['severity']}<{settings.notification_min_severity}"
         _persist_audit(db, rec, audit)
         return {
@@ -689,6 +720,7 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
         effective_cooldown = base_cooldown * multiplier
         if elapsed < effective_cooldown:
             audit["should_send"] = False
+            audit["sent"] = False
             audit["suppress_reason"] = "cooldown"
             audit["cooldown_applied"] = True
             _persist_audit(db, rec, audit)
@@ -703,9 +735,10 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     # --- Deliver via all channels ---
     title = classification["title"]
     body = classification["body"]
+    channel = settings.notification_channel  # telegram | web_push
 
     telegram_sent = False
-    if settings.notification_channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
+    if channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
         phase_map = {"premarket": "Pre-apertura", "open": "Mercado abierto",
                      "postmarket": "Post-cierre", "off": "Mercado cerrado"}
         msg = (
@@ -716,17 +749,20 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
         )
         telegram_sent = _send_telegram(msg, settings.telegram_bot_token, settings.telegram_chat_id)
 
+    # web_push: primary channel when channel=web_push; also fires alongside telegram
+    # when channel=telegram (belt-and-suspenders for high-value alerts).
     push_result = {"sent": 0, "failed": 0, "removed": 0}
-    try:
-        push_result = send_web_push_to_all(
-            db,
-            title=title,
-            body=body,
-            severity=classification["severity"],
-            deep_link="/recommendations",
-        )
-    except Exception as exc:
-        logger.warning("Recommendation push failed: %s", exc)
+    if channel in ("web_push", "telegram"):
+        try:
+            push_result = send_web_push_to_all(
+                db,
+                title=title,
+                body=body,
+                severity=classification["severity"],
+                deep_link="/recommendations",
+            )
+        except Exception as exc:
+            logger.warning("Recommendation push failed: %s", exc)
 
     any_sent = telegram_sent or push_result.get("sent", 0) > 0
     if any_sent:
@@ -790,7 +826,12 @@ def dispatch_alerts(db, events: list) -> dict:
 
     # Cooldown check — shorter during market hours
     if _last_notification_at:
-        elapsed = (now - _last_notification_at.replace(tzinfo=timezone.utc) if _last_notification_at.tzinfo is None else now - _last_notification_at).total_seconds()
+        tz_last = (
+            _last_notification_at.replace(tzinfo=timezone.utc)
+            if _last_notification_at.tzinfo is None
+            else _last_notification_at
+        )
+        elapsed = (now - tz_last).total_seconds()
         effective_cooldown = settings.notification_cooldown_seconds
         if ar_phase == "open":
             effective_cooldown = max(60, effective_cooldown // 2)  # halve cooldown during market hours
@@ -817,34 +858,36 @@ def dispatch_alerts(db, events: list) -> dict:
 
     message = _format_alert_message(qualifying, ar_phase, us_phase)
 
+    channel = settings.notification_channel
+
     telegram_sent = False
-    if settings.notification_channel == "telegram":
-        if settings.telegram_bot_token and settings.telegram_chat_id:
-            telegram_sent = _send_telegram(message, settings.telegram_bot_token, settings.telegram_chat_id)
+    if channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
+        telegram_sent = _send_telegram(message, settings.telegram_bot_token, settings.telegram_chat_id)
 
-    # --- Web Push (P3): send to all subscriptions ---
+    # --- Web Push (P3): send to all subscriptions (gated by channel) ---
     push_result = {"sent": 0, "failed": 0, "removed": 0}
-    try:
-        # Build push payload from first qualifying event
-        first = qualifying[0]
-        severity = getattr(first, "severity", "medium")
-        symbols = ", ".join(getattr(first, "affected_symbols", []) or [])
-        push_title = f"Mi Finanza - {severity.upper()}"
-        push_body = getattr(first, "message", "Alerta de mercado")
-        if symbols:
-            push_body += f" ({symbols})"
-        if len(qualifying) > 1:
-            push_body += f" +{len(qualifying) - 1} más"
+    if channel in ("web_push", "telegram"):
+        try:
+            # Build push payload from first qualifying event
+            first = qualifying[0]
+            severity = getattr(first, "severity", "medium")
+            symbols = ", ".join(getattr(first, "affected_symbols", []) or [])
+            push_title = f"Mi Finanza - {severity.upper()}"
+            push_body = getattr(first, "message", "Alerta de mercado")
+            if symbols:
+                push_body += f" ({symbols})"
+            if len(qualifying) > 1:
+                push_body += f" +{len(qualifying) - 1} más"
 
-        push_result = send_web_push_to_all(
-            db,
-            title=push_title,
-            body=push_body,
-            severity=severity,
-            deep_link="/alerts",
-        )
-    except Exception as exc:
-        logger.warning("Web push dispatch failed: %s", exc)
+            push_result = send_web_push_to_all(
+                db,
+                title=push_title,
+                body=push_body,
+                severity=severity,
+                deep_link="/alerts",
+            )
+        except Exception as exc:
+            logger.warning("Web push dispatch failed: %s", exc)
 
     any_sent = telegram_sent or push_result.get("sent", 0) > 0
     if any_sent:

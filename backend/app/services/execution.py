@@ -422,7 +422,7 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
                 OrderExecution.recommendation_action_id == action.id
             ).first()
             if exec_row:
-                dispatch_execution_notification(exec_row)
+                dispatch_execution_notification(exec_row, db=db)
     except Exception:
         pass
 
