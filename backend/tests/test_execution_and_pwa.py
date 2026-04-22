@@ -2232,3 +2232,160 @@ def test_digest_allowed_next_day(db):
     finally:
         settings.notification_enabled = orig_enabled
         _restore_antispam(saved)
+
+
+# ---------------------------------------------------------------------------
+# 12. Payload slimming — /recommendations/current
+# ---------------------------------------------------------------------------
+
+
+def _make_rec_with_heavy_payload(db, observed_n: int = 200, suppressed_n: int = 100):
+    """Create a Recommendation with large observed/suppressed lists to test slim cap."""
+    from datetime import datetime
+    meta = {
+        "unchanged": False,
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 0, "items": [],
+                                  "relevant_not_investable_count": 0,
+                                  "investable_signal_count": 0},
+                "suppressed_review": {"count": 0, "items": []},
+                "total_items": 0,
+            },
+            "pipeline_counts": {"observed_count": observed_n, "suppressed_count": suppressed_n},
+        },
+        "observed_candidates": [
+            {"symbol": f"OBS_{i}", "priority_score": i * 0.01} for i in range(observed_n)
+        ],
+        "suppressed_candidates": [
+            {"symbol": f"SUP_{i}"} for i in range(suppressed_n)
+        ],
+    }
+    rec = Recommendation(
+        action="hold", status="pending", suggested_pct=0.0, confidence=0.5,
+        rationale="heavy", risks="", executive_summary="heavy",
+        metadata_json=meta,
+        created_at=datetime.utcnow(),
+    )
+    db.add(rec)
+    db.commit()
+    return rec
+
+
+def test_slim_mode_caps_observed_candidates():
+    """GET /recommendations/current default (slim) caps observed_candidates to 50."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_heavy_payload(db, observed_n=200, suppressed_n=150)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        # Slim caps both lists
+        assert len(data["observed_candidates"]) == 50
+        assert data["observed_candidates_meta"]["total"] == 200
+        assert data["observed_candidates_meta"]["truncated"] is True
+        assert data["observed_candidates_meta"]["cap"] == 50
+
+        assert len(data["suppressed_candidates"]) == 50
+        assert data["suppressed_candidates_meta"]["total"] == 150
+        assert data["suppressed_candidates_meta"]["truncated"] is True
+
+        assert data["payload_mode"] == "slim"
+
+        # Load-bearing fields intact
+        assert "decision_summary" in data
+        ds = data["decision_summary"]
+        assert "review_queue" in ds
+        assert "pipeline_counts" in ds
+        assert ds["pipeline_counts"]["observed_count"] == 200
+
+        # Cleanup
+        from app.models.models import Recommendation
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_full_mode_returns_all_candidates():
+    """GET /recommendations/current?full=true returns the complete lists."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_heavy_payload(db, observed_n=120, suppressed_n=80)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current?full=true")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert len(data["observed_candidates"]) == 120
+        assert data["observed_candidates_meta"]["truncated"] is False
+        assert data["observed_candidates_meta"]["total"] == 120
+
+        assert len(data["suppressed_candidates"]) == 80
+        assert data["suppressed_candidates_meta"]["truncated"] is False
+
+        assert data["payload_mode"] == "full"
+
+        from app.models.models import Recommendation
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_slim_mode_preserves_small_lists():
+    """Small lists (<= cap) returned intact in slim mode, truncated=False."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_heavy_payload(db, observed_n=5, suppressed_n=3)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert len(data["observed_candidates"]) == 5
+        assert data["observed_candidates_meta"]["truncated"] is False
+        assert data["observed_candidates_meta"]["total"] == 5
+
+        assert len(data["suppressed_candidates"]) == 3
+        assert data["suppressed_candidates_meta"]["truncated"] is False
+
+        from app.models.models import Recommendation
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_slim_function_unit():
+    """Unit test the _slim_candidates helper."""
+    from app.api.routes import _slim_candidates
+
+    # Under cap
+    items, meta = _slim_candidates([{"a": 1}, {"a": 2}], cap=10)
+    assert len(items) == 2
+    assert meta == {"total": 2, "truncated": False, "cap": 10}
+
+    # Over cap
+    big = [{"x": i} for i in range(100)]
+    items, meta = _slim_candidates(big, cap=10)
+    assert len(items) == 10
+    assert meta == {"total": 100, "truncated": True, "cap": 10}
+    # Sliced preserves order
+    assert items[0]["x"] == 0
+    assert items[9]["x"] == 9

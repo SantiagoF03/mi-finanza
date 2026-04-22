@@ -89,13 +89,38 @@ def recent_news(db: Session = Depends(get_db)):
     return db.query(NewsEvent).order_by(desc(NewsEvent.created_at)).limit(10).all()
 
 
+_CANDIDATES_SLIM_CAP = 50
+
+
+def _slim_candidates(items: list, cap: int = _CANDIDATES_SLIM_CAP) -> tuple[list, dict]:
+    """Truncate a candidate list to cap size and return (sliced, meta).
+
+    meta = {"total": N, "truncated": bool, "cap": cap}
+    """
+    total = len(items)
+    if total <= cap:
+        return items, {"total": total, "truncated": False, "cap": cap}
+    return items[:cap], {"total": total, "truncated": True, "cap": cap}
+
+
 @router.get("/recommendations/current")
-def current_recommendation(db: Session = Depends(get_db)):
+def current_recommendation(full: bool = False, db: Session = Depends(get_db)):
     rec = get_current_recommendation(db)
     if not rec:
         raise HTTPException(404, "No active recommendation")
     rec = db.query(Recommendation).options(joinedload(Recommendation.actions)).filter(Recommendation.id == rec.id).first()
     meta = rec.metadata_json or {}
+
+    obs_full = meta.get("observed_candidates", []) or []
+    sup_full = meta.get("suppressed_candidates", []) or []
+
+    if full:
+        obs_list, obs_meta = obs_full, {"total": len(obs_full), "truncated": False, "cap": len(obs_full)}
+        sup_list, sup_meta = sup_full, {"total": len(sup_full), "truncated": False, "cap": len(sup_full)}
+    else:
+        obs_list, obs_meta = _slim_candidates(obs_full)
+        sup_list, sup_meta = _slim_candidates(sup_full)
+
     return {
         "id": rec.id,
         "action": rec.action,
@@ -113,8 +138,11 @@ def current_recommendation(db: Session = Depends(get_db)):
         "news_is_mock": meta.get("news_is_mock"),
         "news_provider_info": meta.get("news_provider_info", {}),
         "external_opportunities": meta.get("external_opportunities", []),
-        "observed_candidates": meta.get("observed_candidates", []),
-        "suppressed_candidates": meta.get("suppressed_candidates", []),
+        "observed_candidates": obs_list,
+        "observed_candidates_meta": obs_meta,
+        "suppressed_candidates": sup_list,
+        "suppressed_candidates_meta": sup_meta,
+        "payload_mode": "full" if full else "slim",
         "allowed_assets": meta.get("allowed_assets", {}),
         "unchanged": meta.get("unchanged", False),
         "unchanged_reason": meta.get("unchanged_reason", ""),
