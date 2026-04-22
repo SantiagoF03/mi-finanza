@@ -29,6 +29,21 @@ _US_SENSITIVE_TYPES = {"CEDEAR", "ETF"}
 
 _last_notification_at: datetime | None = None
 
+# Anti-spam: same-actionable intraday dedup
+_notified_actionable_today: set[str] = set()
+_notified_actionable_date: str | None = None  # ISO date string e.g. "2026-04-22"
+
+# Anti-spam: postclose digest max 1/day
+_last_digest_date: str | None = None  # ISO date string
+
+
+def _reset_daily_state_if_needed(today_str: str) -> None:
+    """Reset daily anti-spam counters when the calendar day changes."""
+    global _notified_actionable_today, _notified_actionable_date
+    if _notified_actionable_date != today_str:
+        _notified_actionable_today = set()
+        _notified_actionable_date = today_str
+
 
 def _severity_passes(event_severity: str, min_severity: str) -> bool:
     return SEVERITY_ORDER.get(event_severity, 0) >= SEVERITY_ORDER.get(min_severity, 1)
@@ -629,7 +644,7 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     Safety invariant: notifications NEVER execute orders. They are
     informational only. Every message includes "Solo informativo" disclaimer.
     """
-    global _last_notification_at
+    global _last_notification_at, _last_digest_date
 
     settings = get_settings()
 
@@ -732,6 +747,46 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
                 "remaining_seconds": int(effective_cooldown - elapsed),
             }
 
+    # --- Anti-spam: same-actionable intraday dedup ---
+    today_str = now.strftime("%Y-%m-%d")
+    _reset_daily_state_if_needed(today_str)
+
+    if classification["category"] == "new_actionable":
+        fresh = set(delta["new_actionable"]) - _notified_actionable_today
+        if not fresh:
+            audit["should_send"] = False
+            audit["sent"] = False
+            audit["suppress_reason"] = "intraday_dedup"
+            _persist_audit(db, rec, audit)
+            return {
+                "sent": False,
+                "reason": "intraday_dedup",
+                "category": "new_actionable",
+                "severity": classification["severity"],
+                "deduped_symbols": sorted(delta["new_actionable"]),
+            }
+        if fresh != set(delta["new_actionable"]):
+            _DISCLAIMER = "Solo informativo, no ejecuta órdenes."
+            symbols_text = ", ".join(sorted(fresh))
+            classification["title"] = f"Mi Finanza - {len(fresh)} oportunidad(es) nueva(s)"
+            classification["body"] = f"Nuevas oportunidades: {symbols_text}. {_DISCLAIMER}"
+            audit["comparison_summary"]["deduped_out"] = sorted(
+                set(delta["new_actionable"]) - fresh
+            )
+
+    # --- Anti-spam: postclose digest max 1/day ---
+    if classification["category"] == "postclose_digest" and _last_digest_date == today_str:
+        audit["should_send"] = False
+        audit["sent"] = False
+        audit["suppress_reason"] = "daily_digest_cap"
+        _persist_audit(db, rec, audit)
+        return {
+            "sent": False,
+            "reason": "daily_digest_cap",
+            "category": "postclose_digest",
+            "severity": classification["severity"],
+        }
+
     # --- Deliver via all channels ---
     title = classification["title"]
     body = classification["body"]
@@ -767,6 +822,11 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     any_sent = telegram_sent or push_result.get("sent", 0) > 0
     if any_sent:
         _last_notification_at = now
+        # Record anti-spam state on successful delivery
+        if classification["category"] == "new_actionable":
+            _notified_actionable_today.update(delta["new_actionable"])
+        elif classification["category"] == "postclose_digest":
+            _last_digest_date = today_str
 
     audit["sent"] = any_sent
     audit["telegram_sent"] = telegram_sent

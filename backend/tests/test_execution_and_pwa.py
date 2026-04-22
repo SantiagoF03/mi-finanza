@@ -1705,31 +1705,33 @@ def test_notification_channel_telegram_calls_web_push_too(db):
     from app.core.config import get_settings
 
     settings = get_settings()
+    saved_antispam = _save_and_restore_antispam()
     orig_channel = settings.notification_channel
     orig_enabled = settings.notification_enabled
     orig_token = settings.telegram_bot_token
     orig_chat = settings.telegram_chat_id
-    orig_last = disp._last_notification_at
     settings.notification_channel = "telegram"
     settings.notification_enabled = True
     settings.telegram_bot_token = "fake-token"
     settings.telegram_chat_id = "fake-chat"
-    disp._last_notification_at = None  # clear cooldown
+    disp._last_notification_at = None
+    disp._notified_actionable_today = set()
 
     rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
 
-    with patch("app.notifications.dispatcher._send_telegram", return_value=False) as mock_tg, \
-         patch("app.notifications.dispatcher.send_web_push_to_all",
-               return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
-        dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
-        mock_tg.assert_called_once()
-        mock_wp.assert_called_once()
-
-    settings.notification_channel = orig_channel
-    settings.notification_enabled = orig_enabled
-    settings.telegram_bot_token = orig_token
-    settings.telegram_chat_id = orig_chat
-    disp._last_notification_at = orig_last
+    try:
+        with patch("app.notifications.dispatcher._send_telegram", return_value=False) as mock_tg, \
+             patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_tg.assert_called_once()
+            mock_wp.assert_called_once()
+    finally:
+        settings.notification_channel = orig_channel
+        settings.notification_enabled = orig_enabled
+        settings.telegram_bot_token = orig_token
+        settings.telegram_chat_id = orig_chat
+        _restore_antispam(saved_antispam)
 
 
 def test_settings_api_rejects_invalid_channel():
@@ -1780,18 +1782,19 @@ def test_web_push_fires_when_channel_telegram_no_creds(db):
     from app.core.config import get_settings
 
     settings = get_settings()
+    saved_antispam = _save_and_restore_antispam()
     orig = {
         "channel": settings.notification_channel,
         "enabled": settings.notification_enabled,
         "token": settings.telegram_bot_token,
         "chat": settings.telegram_chat_id,
-        "last": disp._last_notification_at,
     }
     settings.notification_channel = "telegram"
     settings.notification_enabled = True
     settings.telegram_bot_token = ""  # not configured
     settings.telegram_chat_id = ""
     disp._last_notification_at = None
+    disp._notified_actionable_today = set()
 
     rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
 
@@ -1809,7 +1812,7 @@ def test_web_push_fires_when_channel_telegram_no_creds(db):
         settings.notification_enabled = orig["enabled"]
         settings.telegram_bot_token = orig["token"]
         settings.telegram_chat_id = orig["chat"]
-        disp._last_notification_at = orig["last"]
+        _restore_antispam(saved_antispam)
 
 
 def test_web_push_fires_when_channel_web_push(db):
@@ -2040,3 +2043,192 @@ def test_settings_api_shows_push_subscription_count():
     assert "push_subscriptions_active" in data
     assert isinstance(data["push_subscriptions_active"], int)
     assert "vapid_configured" in data
+
+
+# ---------------------------------------------------------------------------
+# 11. Anti-spam: intraday dedup + digest daily cap
+# ---------------------------------------------------------------------------
+
+
+def _save_and_restore_antispam():
+    """Capture and return anti-spam state for cleanup."""
+    import app.notifications.dispatcher as disp
+    return {
+        "notified_today": disp._notified_actionable_today.copy(),
+        "notified_date": disp._notified_actionable_date,
+        "digest_date": disp._last_digest_date,
+        "last_at": disp._last_notification_at,
+    }
+
+
+def _restore_antispam(saved):
+    import app.notifications.dispatcher as disp
+    disp._notified_actionable_today = saved["notified_today"]
+    disp._notified_actionable_date = saved["notified_date"]
+    disp._last_digest_date = saved["digest_date"]
+    disp._last_notification_at = saved["last_at"]
+
+
+def test_intraday_dedup_blocks_same_symbol(db):
+    """Same actionable symbol re-appearing same day → suppressed (intraday_dedup)."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from datetime import datetime, timezone
+
+    settings = get_settings()
+    saved = _save_and_restore_antispam()
+    orig_enabled = settings.notification_enabled
+    settings.notification_enabled = True
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    disp._notified_actionable_today = {"AAPL"}
+    disp._notified_actionable_date = today_str
+    disp._last_notification_at = None
+
+    # AAPL is "new" vs previous rec but already notified today
+    _make_rec_with_meta(db, actionable_items=[], superseded=True)
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_not_called()
+            assert result["sent"] is False
+            assert result["reason"] == "intraday_dedup"
+            assert "AAPL" in result["deduped_symbols"]
+
+        db.expire(rec)
+        fresh = db.query(Recommendation).filter(Recommendation.id == rec.id).first()
+        audit = fresh.metadata_json.get("notification_audit")
+        assert audit["suppress_reason"] == "intraday_dedup"
+        assert audit["sent"] is False
+    finally:
+        settings.notification_enabled = orig_enabled
+        _restore_antispam(saved)
+
+
+def test_intraday_dedup_allows_new_symbol(db):
+    """New actionable symbol same day → allowed even if other symbols were deduped."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from datetime import datetime, timezone
+
+    settings = get_settings()
+    saved = _save_and_restore_antispam()
+    orig_enabled = settings.notification_enabled
+    settings.notification_enabled = True
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    disp._notified_actionable_today = {"AAPL"}
+    disp._notified_actionable_date = today_str
+    disp._last_notification_at = None
+
+    _make_rec_with_meta(db, actionable_items=[], superseded=True)
+    rec = _make_rec_with_meta(db, actionable_items=[
+        {"symbol": "AAPL"}, {"symbol": "MSFT"},
+    ], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_called_once()
+            assert result["sent"] is True
+            assert result["category"] == "new_actionable"
+
+        assert "MSFT" in disp._notified_actionable_today
+        assert "AAPL" in disp._notified_actionable_today
+    finally:
+        settings.notification_enabled = orig_enabled
+        _restore_antispam(saved)
+
+
+def test_digest_daily_cap_blocks_second(db):
+    """Second postclose_digest same day → suppressed (daily_digest_cap)."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from datetime import datetime, timezone
+
+    settings = get_settings()
+    saved = _save_and_restore_antispam()
+    orig_enabled = settings.notification_enabled
+    settings.notification_enabled = True
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    disp._last_digest_date = today_str
+    disp._notified_actionable_date = today_str
+    disp._notified_actionable_today = set()
+    disp._last_notification_at = None
+
+    # Previous rec with same watchlist → new_watchlist is empty → digest path
+    _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "A"}, {"symbol": "B"},
+    ], superseded=True)
+    rec = _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "A"}, {"symbol": "B"},
+    ], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher._argentina_market_phase",
+                   return_value="postmarket"), \
+             patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_not_called()
+            assert result["sent"] is False
+            assert result["reason"] == "daily_digest_cap"
+
+        db.expire(rec)
+        fresh = db.query(Recommendation).filter(Recommendation.id == rec.id).first()
+        audit = fresh.metadata_json.get("notification_audit")
+        assert audit["suppress_reason"] == "daily_digest_cap"
+    finally:
+        settings.notification_enabled = orig_enabled
+        _restore_antispam(saved)
+
+
+def test_digest_allowed_next_day(db):
+    """Postclose_digest on a new calendar day → allowed."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from datetime import datetime, timezone
+
+    settings = get_settings()
+    saved = _save_and_restore_antispam()
+    orig_enabled = settings.notification_enabled
+    settings.notification_enabled = True
+
+    disp._last_digest_date = "2026-04-20"  # yesterday
+    disp._notified_actionable_date = "2026-04-21"
+    disp._notified_actionable_today = set()
+    disp._last_notification_at = None
+
+    # Previous rec with same watchlist → new_watchlist empty → digest path
+    _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "X"}, {"symbol": "Y"},
+    ], superseded=True)
+    rec = _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "X"}, {"symbol": "Y"},
+    ], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher._argentina_market_phase",
+                   return_value="postmarket"), \
+             patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_called_once()
+            assert result["sent"] is True
+            assert result["category"] == "postclose_digest"
+    finally:
+        settings.notification_enabled = orig_enabled
+        _restore_antispam(saved)
