@@ -411,12 +411,15 @@ class NotificationSettingsIn(BaseModel):
 def get_notification_settings(db: Session = Depends(get_db)):
     _load_persisted_settings(db)
     settings = get_settings()
+    push_sub_count = db.query(PushSubscription).count()
     return {
         "notification_enabled": settings.notification_enabled,
         "notification_channel": settings.notification_channel,
         "notification_min_severity": settings.notification_min_severity,
         "notification_cooldown_seconds": settings.notification_cooldown_seconds,
         "telegram_configured": bool(settings.telegram_bot_token and settings.telegram_chat_id),
+        "push_subscriptions_active": push_sub_count,
+        "vapid_configured": bool(settings.vapid_public_key and settings.vapid_private_key),
     }
 
 
@@ -503,6 +506,80 @@ def push_test(db: Session = Depends(get_db)):
         deep_link="/",
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Debug: simulate a positive alert (dev only)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/debug/simulate-alert")
+def simulate_alert(db: Session = Depends(get_db)):
+    """Simulate a new_actionable alert to test full notification pipeline.
+
+    Creates a temporary recommendation with a fake actionable item,
+    runs the real dispatch pipeline, and returns the audit trail.
+    The recommendation is immediately marked superseded so it does not
+    interfere with production flow.
+    """
+    from datetime import datetime
+    import uuid
+
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    settings = get_settings()
+
+    sim_symbol = f"SIM_{uuid.uuid4().hex[:6].upper()}"
+    rec = Recommendation(
+        action="rebalance",
+        status="pending",
+        suggested_pct=0.0,
+        confidence=0.8,
+        rationale="[SIM] Simulated alert for push validation",
+        risks="none",
+        executive_summary="[SIM] Simulated new_actionable alert",
+        metadata_json={
+            "unchanged": False,
+            "decision_summary": {
+                "review_queue": {
+                    "actionable_now": {
+                        "count": 1,
+                        "items": [{"symbol": sim_symbol, "reason": "debug simulation"}],
+                    },
+                    "watchlist_now": {"count": 0, "items": []},
+                    "suppressed_review": {"count": 0, "items": []},
+                    "total_items": 1,
+                },
+                "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+            },
+        },
+    )
+    db.add(rec)
+    db.commit()
+
+    result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+
+    db.refresh(rec)
+    audit = (rec.metadata_json or {}).get("notification_audit")
+
+    rec.superseded_at = datetime.utcnow()
+    db.commit()
+
+    push_sub_count = db.query(PushSubscription).count()
+
+    return {
+        "simulation": True,
+        "recommendation_id": rec.id,
+        "dispatch_result": result,
+        "notification_audit": audit,
+        "context": {
+            "notification_enabled": settings.notification_enabled,
+            "notification_channel": settings.notification_channel,
+            "telegram_configured": bool(settings.telegram_bot_token and settings.telegram_chat_id),
+            "push_subscriptions_active": push_sub_count,
+            "vapid_configured": bool(settings.vapid_public_key and settings.vapid_private_key),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

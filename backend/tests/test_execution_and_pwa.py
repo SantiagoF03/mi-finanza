@@ -1761,3 +1761,282 @@ def test_settings_api_accepts_web_push_channel():
         assert resp.json()["notification_channel"] == "web_push"
     finally:
         settings.notification_channel = orig
+
+
+# ---------------------------------------------------------------------------
+# 10. Web push as first-class channel — scenario tests
+# ---------------------------------------------------------------------------
+
+
+def test_web_push_fires_when_channel_telegram_no_creds(db):
+    """channel=telegram + no telegram creds + push sub active → web push fires.
+
+    This is the real-world scenario: user has channel=telegram (persisted)
+    but never configured telegram. Belt-and-suspenders means web push fires.
+    """
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig = {
+        "channel": settings.notification_channel,
+        "enabled": settings.notification_enabled,
+        "token": settings.telegram_bot_token,
+        "chat": settings.telegram_chat_id,
+        "last": disp._last_notification_at,
+    }
+    settings.notification_channel = "telegram"
+    settings.notification_enabled = True
+    settings.telegram_bot_token = ""  # not configured
+    settings.telegram_chat_id = ""
+    disp._last_notification_at = None
+
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher._send_telegram") as mock_tg, \
+             patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_tg.assert_not_called()
+            mock_wp.assert_called_once()
+            assert result["sent"] is True
+            assert result["web_push_sent"] == 1
+    finally:
+        settings.notification_channel = orig["channel"]
+        settings.notification_enabled = orig["enabled"]
+        settings.telegram_bot_token = orig["token"]
+        settings.telegram_chat_id = orig["chat"]
+        disp._last_notification_at = orig["last"]
+
+
+def test_web_push_fires_when_channel_web_push(db):
+    """channel=web_push + push sub active → web push fires, telegram skipped."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig = {
+        "channel": settings.notification_channel,
+        "enabled": settings.notification_enabled,
+        "last": disp._last_notification_at,
+    }
+    settings.notification_channel = "web_push"
+    settings.notification_enabled = True
+    disp._last_notification_at = None
+
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "SPY"}], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher._send_telegram") as mock_tg, \
+             patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_tg.assert_not_called()
+            mock_wp.assert_called_once()
+            assert result["sent"] is True
+    finally:
+        settings.notification_channel = orig["channel"]
+        settings.notification_enabled = orig["enabled"]
+        disp._last_notification_at = orig["last"]
+
+
+def test_no_delivery_when_no_subs_and_no_telegram(db):
+    """No push subs + no telegram creds → sent=False, nothing delivered."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig = {
+        "channel": settings.notification_channel,
+        "enabled": settings.notification_enabled,
+        "token": settings.telegram_bot_token,
+        "chat": settings.telegram_chat_id,
+        "last": disp._last_notification_at,
+    }
+    settings.notification_channel = "web_push"
+    settings.notification_enabled = True
+    settings.telegram_bot_token = ""
+    settings.telegram_chat_id = ""
+    disp._last_notification_at = None
+
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "MSFT"}], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 0, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_called_once()
+            assert result["sent"] is False
+            assert result["web_push_sent"] == 0
+    finally:
+        settings.notification_channel = orig["channel"]
+        settings.notification_enabled = orig["enabled"]
+        settings.telegram_bot_token = orig["token"]
+        settings.telegram_chat_id = orig["chat"]
+        disp._last_notification_at = orig["last"]
+
+
+def test_analysis_completed_silent_even_with_push_sub(db):
+    """analysis_completed (unchanged=True) NEVER sends, even if push sub exists."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig = {
+        "channel": settings.notification_channel,
+        "enabled": settings.notification_enabled,
+        "last": disp._last_notification_at,
+    }
+    settings.notification_channel = "web_push"
+    settings.notification_enabled = True
+    disp._last_notification_at = None
+
+    rec = _make_rec_with_meta(db, unchanged=True, watchlist_items=[
+        {"symbol": "AAPL"}, {"symbol": "MSFT"},
+    ])
+
+    try:
+        with patch("app.notifications.dispatcher.send_web_push_to_all") as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_not_called()
+            assert result["sent"] is False
+            assert result["reason"] == "policy_suppressed"
+
+            db.expire(rec)
+            fresh = db.query(Recommendation).filter(Recommendation.id == rec.id).first()
+            audit = fresh.metadata_json.get("notification_audit")
+            assert audit is not None
+            assert audit["category"] == "analysis_completed"
+            assert audit["severity"] == "silent"
+            assert audit["sent"] is False
+    finally:
+        settings.notification_channel = orig["channel"]
+        settings.notification_enabled = orig["enabled"]
+        disp._last_notification_at = orig["last"]
+
+
+def test_audit_always_has_sent_field(db):
+    """Audit trail ALWAYS includes 'sent' key, even on suppression paths."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig_enabled = settings.notification_enabled
+
+    # Path 1: notifications disabled
+    settings.notification_enabled = False
+    try:
+        rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "X"}])
+        dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        db.expire(rec)
+        fresh = db.query(Recommendation).filter(Recommendation.id == rec.id).first()
+        audit = fresh.metadata_json.get("notification_audit")
+        assert "sent" in audit, "audit must have 'sent' key when disabled"
+        assert audit["sent"] is False
+    finally:
+        settings.notification_enabled = orig_enabled
+
+    # Path 2: policy suppression (analysis_completed)
+    orig_enabled2 = settings.notification_enabled
+    settings.notification_enabled = True
+    try:
+        rec2 = _make_rec_with_meta(db, unchanged=True)
+        dispatch_recommendation_alerts(db, {"recommendation_id": rec2.id})
+        db.expire(rec2)
+        fresh2 = db.query(Recommendation).filter(Recommendation.id == rec2.id).first()
+        audit2 = fresh2.metadata_json.get("notification_audit")
+        assert "sent" in audit2, "audit must have 'sent' key when policy suppressed"
+        assert audit2["sent"] is False
+    finally:
+        settings.notification_enabled = orig_enabled2
+
+
+def test_execution_notification_honors_web_push():
+    """dispatch_execution_notification now accepts db kwarg for web push."""
+    from app.notifications.dispatcher import dispatch_execution_notification
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    orig = {
+        "enabled": settings.notification_enabled,
+        "channel": settings.notification_channel,
+    }
+    settings.notification_enabled = True
+    settings.notification_channel = "web_push"
+
+    class FakeExec:
+        status = "executed"
+        symbol = "AAPL"
+        side = "buy"
+
+    try:
+        result = dispatch_execution_notification(FakeExec())
+        assert result["channel"] == "web_push"
+
+        result_no_db = dispatch_execution_notification(FakeExec(), db=None)
+        assert result_no_db["web_push_sent"] == 0
+    finally:
+        settings.notification_enabled = orig["enabled"]
+        settings.notification_channel = orig["channel"]
+
+
+def test_simulate_alert_endpoint():
+    """POST /debug/simulate-alert runs full dispatch pipeline."""
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+    import app.notifications.dispatcher as disp
+
+    settings = get_settings()
+    orig = {
+        "enabled": settings.notification_enabled,
+        "channel": settings.notification_channel,
+        "last": disp._last_notification_at,
+    }
+    settings.notification_enabled = True
+    settings.notification_channel = "web_push"
+    disp._last_notification_at = None
+
+    try:
+        with patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}):
+            client = TestClient(app)
+            resp = client.post("/api/debug/simulate-alert")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["simulation"] is True
+        assert data["dispatch_result"]["category"] == "new_actionable"
+        assert data["dispatch_result"]["severity"] == "high"
+        assert data["notification_audit"] is not None
+        assert data["notification_audit"]["category"] == "new_actionable"
+        assert data["context"]["notification_channel"] == "web_push"
+    finally:
+        settings.notification_enabled = orig["enabled"]
+        settings.notification_channel = orig["channel"]
+        disp._last_notification_at = orig["last"]
+
+
+def test_settings_api_shows_push_subscription_count():
+    """GET /notifications/settings includes push_subscriptions_active."""
+    from unittest.mock import patch
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    with patch("app.api.routes._load_persisted_settings"):
+        client = TestClient(app)
+        resp = client.get("/api/notifications/settings")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "push_subscriptions_active" in data
+    assert isinstance(data["push_subscriptions_active"], int)
+    assert "vapid_configured" in data
