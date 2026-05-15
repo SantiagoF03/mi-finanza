@@ -550,7 +550,7 @@ def simulate_alert(db: Session = Depends(get_db)):
     The recommendation is immediately marked superseded so it does not
     interfere with production flow.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
     import uuid
 
     from app.notifications.dispatcher import dispatch_recommendation_alerts
@@ -590,7 +590,7 @@ def simulate_alert(db: Session = Depends(get_db)):
     db.refresh(rec)
     audit = (rec.metadata_json or {}).get("notification_audit")
 
-    rec.superseded_at = datetime.utcnow()
+    rec.superseded_at = datetime.now(timezone.utc)
     db.commit()
 
     push_sub_count = db.query(PushSubscription).count()
