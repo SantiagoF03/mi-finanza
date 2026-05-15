@@ -1705,31 +1705,33 @@ def test_notification_channel_telegram_calls_web_push_too(db):
     from app.core.config import get_settings
 
     settings = get_settings()
+    saved_antispam = _save_and_restore_antispam()
     orig_channel = settings.notification_channel
     orig_enabled = settings.notification_enabled
     orig_token = settings.telegram_bot_token
     orig_chat = settings.telegram_chat_id
-    orig_last = disp._last_notification_at
     settings.notification_channel = "telegram"
     settings.notification_enabled = True
     settings.telegram_bot_token = "fake-token"
     settings.telegram_chat_id = "fake-chat"
-    disp._last_notification_at = None  # clear cooldown
+    disp._last_notification_at = None
+    disp._notified_actionable_today = set()
 
     rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
 
-    with patch("app.notifications.dispatcher._send_telegram", return_value=False) as mock_tg, \
-         patch("app.notifications.dispatcher.send_web_push_to_all",
-               return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
-        dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
-        mock_tg.assert_called_once()
-        mock_wp.assert_called_once()
-
-    settings.notification_channel = orig_channel
-    settings.notification_enabled = orig_enabled
-    settings.telegram_bot_token = orig_token
-    settings.telegram_chat_id = orig_chat
-    disp._last_notification_at = orig_last
+    try:
+        with patch("app.notifications.dispatcher._send_telegram", return_value=False) as mock_tg, \
+             patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_tg.assert_called_once()
+            mock_wp.assert_called_once()
+    finally:
+        settings.notification_channel = orig_channel
+        settings.notification_enabled = orig_enabled
+        settings.telegram_bot_token = orig_token
+        settings.telegram_chat_id = orig_chat
+        _restore_antispam(saved_antispam)
 
 
 def test_settings_api_rejects_invalid_channel():
@@ -1780,18 +1782,19 @@ def test_web_push_fires_when_channel_telegram_no_creds(db):
     from app.core.config import get_settings
 
     settings = get_settings()
+    saved_antispam = _save_and_restore_antispam()
     orig = {
         "channel": settings.notification_channel,
         "enabled": settings.notification_enabled,
         "token": settings.telegram_bot_token,
         "chat": settings.telegram_chat_id,
-        "last": disp._last_notification_at,
     }
     settings.notification_channel = "telegram"
     settings.notification_enabled = True
     settings.telegram_bot_token = ""  # not configured
     settings.telegram_chat_id = ""
     disp._last_notification_at = None
+    disp._notified_actionable_today = set()
 
     rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
 
@@ -1809,7 +1812,7 @@ def test_web_push_fires_when_channel_telegram_no_creds(db):
         settings.notification_enabled = orig["enabled"]
         settings.telegram_bot_token = orig["token"]
         settings.telegram_chat_id = orig["chat"]
-        disp._last_notification_at = orig["last"]
+        _restore_antispam(saved_antispam)
 
 
 def test_web_push_fires_when_channel_web_push(db):
@@ -2040,3 +2043,564 @@ def test_settings_api_shows_push_subscription_count():
     assert "push_subscriptions_active" in data
     assert isinstance(data["push_subscriptions_active"], int)
     assert "vapid_configured" in data
+
+
+# ---------------------------------------------------------------------------
+# 11. Anti-spam: intraday dedup + digest daily cap
+# ---------------------------------------------------------------------------
+
+
+def _save_and_restore_antispam():
+    """Capture and return anti-spam state for cleanup."""
+    import app.notifications.dispatcher as disp
+    return {
+        "notified_today": disp._notified_actionable_today.copy(),
+        "notified_date": disp._notified_actionable_date,
+        "digest_date": disp._last_digest_date,
+        "last_at": disp._last_notification_at,
+    }
+
+
+def _restore_antispam(saved):
+    import app.notifications.dispatcher as disp
+    disp._notified_actionable_today = saved["notified_today"]
+    disp._notified_actionable_date = saved["notified_date"]
+    disp._last_digest_date = saved["digest_date"]
+    disp._last_notification_at = saved["last_at"]
+
+
+def test_intraday_dedup_blocks_same_symbol(db):
+    """Same actionable symbol re-appearing same day → suppressed (intraday_dedup)."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from datetime import datetime, timezone
+
+    settings = get_settings()
+    saved = _save_and_restore_antispam()
+    orig_enabled = settings.notification_enabled
+    settings.notification_enabled = True
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    disp._notified_actionable_today = {"AAPL"}
+    disp._notified_actionable_date = today_str
+    disp._last_notification_at = None
+
+    # AAPL is "new" vs previous rec but already notified today
+    _make_rec_with_meta(db, actionable_items=[], superseded=True)
+    rec = _make_rec_with_meta(db, actionable_items=[{"symbol": "AAPL"}], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_not_called()
+            assert result["sent"] is False
+            assert result["reason"] == "intraday_dedup"
+            assert "AAPL" in result["deduped_symbols"]
+
+        db.expire(rec)
+        fresh = db.query(Recommendation).filter(Recommendation.id == rec.id).first()
+        audit = fresh.metadata_json.get("notification_audit")
+        assert audit["suppress_reason"] == "intraday_dedup"
+        assert audit["sent"] is False
+    finally:
+        settings.notification_enabled = orig_enabled
+        _restore_antispam(saved)
+
+
+def test_intraday_dedup_allows_new_symbol(db):
+    """New actionable symbol same day → allowed even if other symbols were deduped."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from datetime import datetime, timezone
+
+    settings = get_settings()
+    saved = _save_and_restore_antispam()
+    orig_enabled = settings.notification_enabled
+    settings.notification_enabled = True
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    disp._notified_actionable_today = {"AAPL"}
+    disp._notified_actionable_date = today_str
+    disp._last_notification_at = None
+
+    _make_rec_with_meta(db, actionable_items=[], superseded=True)
+    rec = _make_rec_with_meta(db, actionable_items=[
+        {"symbol": "AAPL"}, {"symbol": "MSFT"},
+    ], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_called_once()
+            assert result["sent"] is True
+            assert result["category"] == "new_actionable"
+
+        assert "MSFT" in disp._notified_actionable_today
+        assert "AAPL" in disp._notified_actionable_today
+    finally:
+        settings.notification_enabled = orig_enabled
+        _restore_antispam(saved)
+
+
+def test_digest_daily_cap_blocks_second(db):
+    """Second postclose_digest same day → suppressed (daily_digest_cap)."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from datetime import datetime, timezone
+
+    settings = get_settings()
+    saved = _save_and_restore_antispam()
+    orig_enabled = settings.notification_enabled
+    settings.notification_enabled = True
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    disp._last_digest_date = today_str
+    disp._notified_actionable_date = today_str
+    disp._notified_actionable_today = set()
+    disp._last_notification_at = None
+
+    # Previous rec with same watchlist → new_watchlist is empty → digest path
+    _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "A"}, {"symbol": "B"},
+    ], superseded=True)
+    rec = _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "A"}, {"symbol": "B"},
+    ], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher._argentina_market_phase",
+                   return_value="postmarket"), \
+             patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_not_called()
+            assert result["sent"] is False
+            assert result["reason"] == "daily_digest_cap"
+
+        db.expire(rec)
+        fresh = db.query(Recommendation).filter(Recommendation.id == rec.id).first()
+        audit = fresh.metadata_json.get("notification_audit")
+        assert audit["suppress_reason"] == "daily_digest_cap"
+    finally:
+        settings.notification_enabled = orig_enabled
+        _restore_antispam(saved)
+
+
+def test_digest_allowed_next_day(db):
+    """Postclose_digest on a new calendar day → allowed."""
+    from unittest.mock import patch
+    from app.notifications import dispatcher as disp
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+    from app.core.config import get_settings
+    from datetime import datetime, timezone
+
+    settings = get_settings()
+    saved = _save_and_restore_antispam()
+    orig_enabled = settings.notification_enabled
+    settings.notification_enabled = True
+
+    disp._last_digest_date = "2026-04-20"  # yesterday
+    disp._notified_actionable_date = "2026-04-21"
+    disp._notified_actionable_today = set()
+    disp._last_notification_at = None
+
+    # Previous rec with same watchlist → new_watchlist empty → digest path
+    _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "X"}, {"symbol": "Y"},
+    ], superseded=True)
+    rec = _make_rec_with_meta(db, watchlist_items=[
+        {"symbol": "X"}, {"symbol": "Y"},
+    ], unchanged=False)
+
+    try:
+        with patch("app.notifications.dispatcher._argentina_market_phase",
+                   return_value="postmarket"), \
+             patch("app.notifications.dispatcher.send_web_push_to_all",
+                   return_value={"sent": 1, "failed": 0, "removed": 0}) as mock_wp:
+            result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+            mock_wp.assert_called_once()
+            assert result["sent"] is True
+            assert result["category"] == "postclose_digest"
+    finally:
+        settings.notification_enabled = orig_enabled
+        _restore_antispam(saved)
+
+
+# ---------------------------------------------------------------------------
+# 12. Payload slimming — /recommendations/current
+# ---------------------------------------------------------------------------
+
+
+def _make_rec_with_heavy_payload(db, observed_n: int = 200, suppressed_n: int = 100):
+    """Create a Recommendation with large observed/suppressed lists to test slim cap."""
+    from datetime import datetime
+    meta = {
+        "unchanged": False,
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {"count": 0, "items": [],
+                                  "relevant_not_investable_count": 0,
+                                  "investable_signal_count": 0},
+                "suppressed_review": {"count": 0, "items": []},
+                "total_items": 0,
+            },
+            "pipeline_counts": {"observed_count": observed_n, "suppressed_count": suppressed_n},
+        },
+        "observed_candidates": [
+            {"symbol": f"OBS_{i}", "priority_score": i * 0.01} for i in range(observed_n)
+        ],
+        "suppressed_candidates": [
+            {"symbol": f"SUP_{i}"} for i in range(suppressed_n)
+        ],
+    }
+    rec = Recommendation(
+        action="hold", status="pending", suggested_pct=0.0, confidence=0.5,
+        rationale="heavy", risks="", executive_summary="heavy",
+        metadata_json=meta,
+        created_at=datetime.utcnow(),
+    )
+    db.add(rec)
+    db.commit()
+    return rec
+
+
+def test_slim_mode_caps_observed_candidates():
+    """GET /recommendations/current default (slim) caps observed_candidates to 50."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_heavy_payload(db, observed_n=200, suppressed_n=150)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        # Slim caps both lists
+        assert len(data["observed_candidates"]) == 50
+        assert data["observed_candidates_meta"]["total"] == 200
+        assert data["observed_candidates_meta"]["truncated"] is True
+        assert data["observed_candidates_meta"]["cap"] == 50
+
+        assert len(data["suppressed_candidates"]) == 50
+        assert data["suppressed_candidates_meta"]["total"] == 150
+        assert data["suppressed_candidates_meta"]["truncated"] is True
+
+        assert data["payload_mode"] == "slim"
+
+        # Load-bearing fields intact
+        assert "decision_summary" in data
+        ds = data["decision_summary"]
+        assert "review_queue" in ds
+        assert "pipeline_counts" in ds
+        assert ds["pipeline_counts"]["observed_count"] == 200
+
+        # Cleanup
+        from app.models.models import Recommendation
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_full_mode_returns_all_candidates():
+    """GET /recommendations/current?full=true returns the complete lists."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_heavy_payload(db, observed_n=120, suppressed_n=80)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current?full=true")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert len(data["observed_candidates"]) == 120
+        assert data["observed_candidates_meta"]["truncated"] is False
+        assert data["observed_candidates_meta"]["total"] == 120
+
+        assert len(data["suppressed_candidates"]) == 80
+        assert data["suppressed_candidates_meta"]["truncated"] is False
+
+        assert data["payload_mode"] == "full"
+
+        from app.models.models import Recommendation
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_slim_mode_preserves_small_lists():
+    """Small lists (<= cap) returned intact in slim mode, truncated=False."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_heavy_payload(db, observed_n=5, suppressed_n=3)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert len(data["observed_candidates"]) == 5
+        assert data["observed_candidates_meta"]["truncated"] is False
+        assert data["observed_candidates_meta"]["total"] == 5
+
+        assert len(data["suppressed_candidates"]) == 3
+        assert data["suppressed_candidates_meta"]["truncated"] is False
+
+        from app.models.models import Recommendation
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_slim_function_unit():
+    """Unit test the _slim_candidates helper."""
+    from app.api.routes import _slim_candidates
+
+    # Under cap
+    items, meta = _slim_candidates([{"a": 1}, {"a": 2}], cap=10)
+    assert len(items) == 2
+    assert meta == {"total": 2, "truncated": False, "cap": 10}
+
+    # Over cap
+    big = [{"x": i} for i in range(100)]
+    items, meta = _slim_candidates(big, cap=10)
+    assert len(items) == 10
+    assert meta == {"total": 100, "truncated": True, "cap": 10}
+    # Sliced preserves order
+    assert items[0]["x"] == 0
+    assert items[9]["x"] == 9
+
+
+# ── Section 13: Weak noise exclusion from watchlist_now.items ───────────
+
+def _make_observed_item(symbol, signal_quality="weak", market_confirmation="unconfirmed",
+                        operational_status="relevant_not_investable", effective_score=0.4,
+                        observed_origin="signal", causal_link_strength="strong"):
+    return {
+        "symbol": symbol,
+        "signal_quality": signal_quality,
+        "market_confirmation": market_confirmation,
+        "operational_status": operational_status,
+        "effective_score": effective_score,
+        "observed_origin": observed_origin,
+        "causal_link_strength": causal_link_strength,
+        "signal_class": "observed_candidate",
+    }
+
+
+def _make_rec_with_watchlist_items(db, observed_items):
+    """Create a Recommendation with specific observed items in review_queue + observed_candidates."""
+    from datetime import datetime
+
+    # Build obs_signals_real (all have observed_origin="signal")
+    obs_signals_real = [i for i in observed_items if i.get("observed_origin") == "signal"]
+
+    # Mirror the orchestrator's filtering logic for watchlist_now.items
+    obs_watchlist_prominent = [
+        i for i in obs_signals_real
+        if not (i.get("signal_quality") == "weak"
+                and i.get("operational_status") == "relevant_not_investable"
+                and i.get("market_confirmation") in (None, "unconfirmed"))
+    ]
+    obs_rni = [i for i in observed_items
+               if i.get("operational_status") == "relevant_not_investable"]
+    obs_investable = [i for i in obs_signals_real
+                      if i.get("operational_status") != "relevant_not_investable"]
+
+    top_items = sorted(obs_watchlist_prominent,
+                       key=lambda x: x.get("effective_score", 0), reverse=True)[:10]
+
+    meta = {
+        "unchanged": False,
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": 0, "items": []},
+                "watchlist_now": {
+                    "count": len(obs_signals_real),
+                    "items": top_items,
+                    "relevant_not_investable_count": len(obs_rni),
+                    "investable_signal_count": len(obs_investable),
+                    "weak_noise_excluded_count": len(obs_signals_real) - len(obs_watchlist_prominent),
+                },
+                "suppressed_review": {"count": 0, "items": []},
+                "total_items": len(observed_items),
+            },
+            "pipeline_counts": {
+                "observed_count": len(observed_items),
+                "suppressed_count": 0,
+            },
+            "candidates": {
+                "watchlist_count": len(obs_signals_real),
+            },
+        },
+        "observed_candidates": observed_items,
+        "suppressed_candidates": [],
+    }
+    rec = Recommendation(
+        action="hold", status="pending", suggested_pct=0.0, confidence=0.5,
+        rationale="watchlist test", risks="", executive_summary="watchlist test",
+        metadata_json=meta,
+        created_at=datetime.utcnow(),
+    )
+    db.add(rec)
+    db.commit()
+    return rec
+
+
+def test_weak_unconfirmed_rni_excluded_from_watchlist_items():
+    """weak+unconfirmed+rni items must not appear in watchlist_now.items."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    items = [
+        _make_observed_item("BTCC", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+        _make_observed_item("AEVEX", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+        _make_observed_item("GOOD_STRONG", signal_quality="strong", market_confirmation="confirmed",
+                            operational_status=None, effective_score=0.7),
+    ]
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_watchlist_items(db, items)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        wn = data["decision_summary"]["review_queue"]["watchlist_now"]
+        item_symbols = [i["symbol"] for i in wn["items"]]
+        assert "GOOD_STRONG" in item_symbols
+        assert "BTCC" not in item_symbols
+        assert "AEVEX" not in item_symbols
+        assert wn["weak_noise_excluded_count"] == 2
+        # Total count still reflects all signal-bearing items
+        assert wn["count"] == 3
+
+        # But observed_candidates still has all items (observability preserved)
+        obs_symbols = [i["symbol"] for i in data["observed_candidates"]]
+        assert "BTCC" in obs_symbols
+        assert "AEVEX" in obs_symbols
+        assert "GOOD_STRONG" in obs_symbols
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_strong_rni_stays_in_watchlist_items():
+    """strong+rni items ARE prominent (real signal, just not investable yet)."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    items = [
+        _make_observed_item("STRONG_RNI", signal_quality="strong", market_confirmation="confirmed",
+                            operational_status="relevant_not_investable", effective_score=0.8),
+        _make_observed_item("WEAK_RNI", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+    ]
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_watchlist_items(db, items)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        wn = data["decision_summary"]["review_queue"]["watchlist_now"]
+        item_symbols = [i["symbol"] for i in wn["items"]]
+        assert "STRONG_RNI" in item_symbols
+        assert "WEAK_RNI" not in item_symbols
+        assert wn["weak_noise_excluded_count"] == 1
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_weak_confirmed_rni_stays_in_watchlist():
+    """weak+CONFIRMED+rni items stay — market confirmation gives them legitimacy."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    items = [
+        _make_observed_item("CONFIRMED_WEAK", signal_quality="weak",
+                            market_confirmation="confirmed",
+                            operational_status="relevant_not_investable",
+                            effective_score=0.5),
+    ]
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_watchlist_items(db, items)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        wn = data["decision_summary"]["review_queue"]["watchlist_now"]
+        item_symbols = [i["symbol"] for i in wn["items"]]
+        assert "CONFIRMED_WEAK" in item_symbols
+        assert wn["weak_noise_excluded_count"] == 0
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_all_weak_noise_yields_empty_watchlist_items():
+    """If ALL observed items are weak noise, watchlist_now.items is empty."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    items = [
+        _make_observed_item("FMC", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+        _make_observed_item("BAE", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+        _make_observed_item("IFC", signal_quality="weak", market_confirmation="unconfirmed",
+                            operational_status="relevant_not_investable"),
+    ]
+    db = SessionLocal()
+    try:
+        rec = _make_rec_with_watchlist_items(db, items)
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        wn = data["decision_summary"]["review_queue"]["watchlist_now"]
+        assert wn["items"] == []
+        assert wn["count"] == 3  # total signal count preserved
+        assert wn["weak_noise_excluded_count"] == 3
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()

@@ -714,6 +714,13 @@ def _build_decision_summary(
     # relevant_not_investable_count is a subcount for filtering/display.
     obs_watchlist_only = [i for i in obs_signals_real
                           if i.get("operational_status") != "relevant_not_investable"]
+    # Exclude weak+unconfirmed+rni from human-facing top items (mirrors notification filter).
+    obs_watchlist_prominent = [
+        i for i in obs_signals_real
+        if not (i.get("signal_quality") == "weak"
+                and i.get("operational_status") == "relevant_not_investable"
+                and i.get("market_confirmation") in (None, "unconfirmed"))
+    ]
     review_queue = {
         "actionable_now": {
             "count": len(ext_ops),
@@ -721,9 +728,10 @@ def _build_decision_summary(
         },
         "watchlist_now": {
             "count": len(obs_signals_real),
-            "items": _top_n(obs_signals_real, n=10, sort_key=_observed_key),
+            "items": _top_n(obs_watchlist_prominent, n=10, sort_key=_observed_key),
             "relevant_not_investable_count": len(obs_relevant_non_investable),
             "investable_signal_count": len(obs_watchlist_only),
+            "weak_noise_excluded_count": len(obs_signals_real) - len(obs_watchlist_prominent),
         },
         "suppressed_review": {
             "count": len(sup_cands),

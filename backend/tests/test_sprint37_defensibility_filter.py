@@ -1275,7 +1275,7 @@ class TestReviewQueueDedup:
         assert not actionable_syms & suppressed_syms, "actionable/suppressed overlap"
 
     def test_multiple_relevant_not_investable_in_watchlist(self):
-        """Multiple relevant_not_investable items appear in watchlist_now with correct subcount."""
+        """Weak+unconfirmed+rni items excluded from watchlist_now.items; strong items stay."""
         obs = [
             _make_strong_signal("META"),
             self._make_relevant_not_investable("LP"),
@@ -1286,13 +1286,14 @@ class TestReviewQueueDedup:
         ]
         rq = _build(observed=obs)["review_queue"]
 
-        assert rq["watchlist_now"]["count"] == 6  # all are signals
+        assert rq["watchlist_now"]["count"] == 6  # total signals preserved
         assert rq["watchlist_now"]["relevant_not_investable_count"] == 5
         assert rq["watchlist_now"]["investable_signal_count"] == 1  # META
 
-        # All items in one list, no separate section
+        # Weak+rni+unconfirmed excluded from human-facing items
         watchlist_symbols = {i["symbol"] for i in rq["watchlist_now"]["items"]}
-        assert {"LP", "JBS", "JLL", "SK", "ASX", "META"} == watchlist_symbols
+        assert watchlist_symbols == {"META"}
+        assert rq["watchlist_now"]["weak_noise_excluded_count"] == 5
         assert "relevant_not_investable_now" not in rq
 
     def test_subcounts_add_up(self):
@@ -1541,8 +1542,11 @@ class TestFrontendConsumptionShape:
         assert "relevant_not_investable_now" not in ds["review_queue"]
 
     def test_watchlist_items_include_operational_status(self):
-        """Frontend uses operational_status to show 'no invertible' badge."""
-        obs = [self._make_rni("LP"), _make_strong_signal("META")]
+        """Frontend uses operational_status to show 'no invertible' badge.
+        Only strong+rni (or confirmed+rni) appear in items; weak+unconfirmed+rni is excluded."""
+        strong_rni = self._make_rni("LP")
+        strong_rni["signal_quality"] = "strong"  # strong+rni stays in items
+        obs = [strong_rni, _make_strong_signal("META")]
         rq = _build(observed=obs)["review_queue"]
         rni_items = [i for i in rq["watchlist_now"]["items"]
                      if i.get("operational_status") == "relevant_not_investable"]
