@@ -22,7 +22,8 @@ CRITICAL INVARIANTS:
 from __future__ import annotations
 
 import math
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 
 from sqlalchemy import desc
 from sqlalchemy.orm import Session, joinedload
@@ -38,6 +39,8 @@ from app.models.models import (
     UserDecision,
 )
 from app.services.logs import app_log
+
+logger = logging.getLogger(__name__)
 
 
 def _get_fresh_quote(broker, symbol: str, side: str) -> dict:
@@ -72,8 +75,8 @@ def _get_fresh_quote(broker, symbol: str, side: str) -> dict:
             last = data.get("ultimoPrecio")
             if last and float(last) > 0:
                 return {"available": True, "price": float(last), "source": "last"}
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_get_fresh_quote failed for %s: %s", symbol, exc)
 
     return {"available": False, "price": None, "source": "none"}
 
@@ -334,7 +337,7 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
             order_exec.validation_status = "failed"
             order_exec.blocked_reason = plan["blocked_reason"]
             order_exec.error_message = plan["blocked_reason"]
-            order_exec.completed_at = datetime.utcnow()
+            order_exec.completed_at = datetime.now(timezone.utc)
 
             app_log(db, f"Orden {plan['side']} para {action.symbol} bloqueada por validación", context={
                 "order_execution_id": order_exec.id,
@@ -371,7 +374,7 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
                 f"No fresh quote available for {action.symbol}. Cannot send order without live pricing."
             )
             order_exec.error_message = order_exec.blocked_reason
-            order_exec.completed_at = datetime.utcnow()
+            order_exec.completed_at = datetime.now(timezone.utc)
 
             app_log(db, f"Orden {plan['side']} para {action.symbol} bloqueada: sin cotización fresca", context={
                 "order_execution_id": order_exec.id,
@@ -394,23 +397,23 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
             order_exec.broker_order_id = result.get("order_id", "")
             order_exec.broker_response = result.get("raw_response", {})
             order_exec.endpoint_used = result.get("endpoint_used", "")
-            order_exec.sent_at = datetime.utcnow()
+            order_exec.sent_at = datetime.now(timezone.utc)
 
             if result.get("status") == "sent":
                 order_exec.status = "execution_sent"
             elif result.get("status") == "rejected":
                 order_exec.status = "rejected_by_broker"
                 order_exec.error_message = result.get("error", "Broker rejected order")
-                order_exec.completed_at = datetime.utcnow()
+                order_exec.completed_at = datetime.now(timezone.utc)
             else:
                 order_exec.status = "failed"
                 order_exec.error_message = result.get("error", "Unknown error")
-                order_exec.completed_at = datetime.utcnow()
+                order_exec.completed_at = datetime.now(timezone.utc)
 
         except Exception as exc:
             order_exec.status = "failed"
             order_exec.error_message = str(exc)[:500]
-            order_exec.completed_at = datetime.utcnow()
+            order_exec.completed_at = datetime.now(timezone.utc)
 
         executions.append(_exec_summary(order_exec))
 
@@ -423,8 +426,8 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
             ).first()
             if exec_row:
                 dispatch_execution_notification(exec_row, db=db)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Post-approval notification dispatch failed: %s", exc)
 
     db.commit()
 

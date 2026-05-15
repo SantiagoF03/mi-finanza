@@ -172,7 +172,8 @@ def _send_telegram(message: str, bot_token: str, chat_id: str) -> bool:
     try:
         resp = httpx.post(url, json={"chat_id": chat_id, "text": message}, timeout=10)
         return resp.status_code == 200
-    except Exception:
+    except Exception as exc:
+        logger.warning("_send_telegram failed: %s", exc)
         return False
 
 
@@ -322,7 +323,8 @@ def send_web_push_to_all(
                     db.delete(sub_obj)
                     removed += 1
             db.commit()
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to remove expired push subscriptions: %s", exc)
             db.rollback()
 
     return {"sent": sent, "failed": failed, "removed": removed}
@@ -852,8 +854,8 @@ def _persist_audit(db, rec, audit: dict) -> None:
         # Refresh rec to ensure clean session state after run_cycle + app_log commits
         try:
             db.refresh(rec)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_persist_audit: db.refresh skipped: %s", exc)
         meta = rec.metadata_json or {}
         meta["notification_audit"] = audit
         rec.metadata_json = meta
@@ -864,8 +866,8 @@ def _persist_audit(db, rec, audit: dict) -> None:
         logger.warning("_persist_audit failed for rec %s: %s", getattr(rec, "id", "?"), exc)
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rb_exc:
+            logger.debug("_persist_audit: rollback also failed: %s", rb_exc)
 
 
 def dispatch_alerts(db, events: list) -> dict:

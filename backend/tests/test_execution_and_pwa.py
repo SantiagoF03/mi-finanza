@@ -453,7 +453,7 @@ def _make_rec_with_meta(db, actionable_items=None, watchlist_items=None,
         action="hold", status="pending", suggested_pct=0.0, confidence=0.7,
         rationale="test", risks="none", executive_summary="test",
         metadata_json=meta,
-        superseded_at=datetime.utcnow() if superseded else None,
+        superseded_at=datetime.now(timezone.utc) if superseded else None,
     )
     db.add(rec)
     db.commit()
@@ -2266,7 +2266,7 @@ def _make_rec_with_heavy_payload(db, observed_n: int = 200, suppressed_n: int = 
         action="hold", status="pending", suggested_pct=0.0, confidence=0.5,
         rationale="heavy", risks="", executive_summary="heavy",
         metadata_json=meta,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     db.add(rec)
     db.commit()
@@ -2460,7 +2460,7 @@ def _make_rec_with_watchlist_items(db, observed_items):
         action="hold", status="pending", suggested_pct=0.0, confidence=0.5,
         rationale="watchlist test", risks="", executive_summary="watchlist test",
         metadata_json=meta,
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     db.add(rec)
     db.commit()
