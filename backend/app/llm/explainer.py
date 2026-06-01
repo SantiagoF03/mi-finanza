@@ -62,6 +62,10 @@ def summarize_news(news_items: list[dict], snapshot: dict, analysis: dict) -> st
 
     prompt = (
         "Resumí en 4 bullets claros las noticias recientes relevantes para una cartera moderada.\n"
+        "Priorizá señales de alta convicción: las corroboradas por varias fuentes y "
+        "confirmadas por el movimiento del mercado pesan más que un rumor de fuente única. "
+        "Cada noticia trae 'conviction' (high/medium/low) y 'conviction_reasons'; usalos para "
+        "ponderar, no para inventar acciones.\n"
         f"Holdings: {[p.get('symbol') for p in safe_snapshot.get('positions', [])]}\n"
         f"Alerts análisis: {safe_analysis.get('alerts', [])}\n"
         f"Noticias: {json.dumps(safe_news[:10], ensure_ascii=False)}"
@@ -89,6 +93,8 @@ def explain_recommendation(
     prompt = (
         "Explicá en lenguaje simple la recomendación rule-based para un inversor moderado.\n"
         "No cambies acción, activos, porcentajes ni reglas. Solo explicá.\n"
+        "Si mencionás una noticia, aclarará su nivel de convicción (campo 'conviction'): "
+        "una señal de fuente única sin confirmación de mercado es de baja convicción.\n"
         f"Unchanged: {unchanged}\n"
         f"Recomendación: {json.dumps(safe_recommendation, ensure_ascii=False)}\n"
         f"Holdings: {[p.get('symbol') for p in safe_snapshot.get('positions', [])]}\n"

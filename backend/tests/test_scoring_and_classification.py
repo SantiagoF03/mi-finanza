@@ -42,8 +42,10 @@ from sqlalchemy.orm import sessionmaker
 from app.db.session import Base
 from app.recommendations.scoring import (
     classify_signal,
+    compute_conviction,
     compute_effective_score,
     compute_market_confirmation,
+    curate_llm_input,
     promote_catalog_candidate,
     score_and_classify_news,
     score_news_item,
@@ -6146,3 +6148,109 @@ def test_company_specific_keywords_cover_key_events():
                  "upgrade", "downgrade", "ceo", "lawsuit", "guidance"]
     for kw in essential:
         assert kw in COMPANY_SPECIFIC_KEYWORDS, f"Missing keyword: {kw}"
+
+
+# ---------------------------------------------------------------------------
+# Conviction tier — investor-grade discipline (corroboration + confirmation)
+# ---------------------------------------------------------------------------
+
+
+def test_conviction_multi_source_confirmed_is_high():
+    """Corroborated (3+ sources) + market-confirmed + relevant → high conviction."""
+    item = {
+        "source_count": 3,
+        "item_count": 5,
+        "relevance_score": 0.8,
+        "effective_score": 0.7,
+        "market_confirmation": {"status": "confirmed"},
+    }
+    result = compute_conviction(item)
+    assert result["tier"] == "high"
+    assert result["score"] >= 0.65
+    assert any("corroboración" in r for r in result["reasons"])
+    assert any("confirmado" in r for r in result["reasons"])
+
+
+def test_conviction_single_source_unconfirmed_is_low():
+    """A single uncorroborated, unconfirmed source is low conviction."""
+    item = {
+        "source_count": 1,
+        "item_count": 1,
+        "relevance_score": 0.2,
+        "effective_score": 0.4,
+        "market_confirmation": {"status": "unconfirmed"},
+    }
+    result = compute_conviction(item)
+    assert result["tier"] == "low"
+    assert any("fuente única" in r for r in result["reasons"])
+
+
+def test_conviction_contradicted_is_penalized():
+    """Market contradiction sharply lowers conviction even with multi-source."""
+    confirmed = compute_conviction({
+        "source_count": 2, "relevance_score": 0.6, "effective_score": 0.6,
+        "market_confirmation": {"status": "confirmed"},
+    })
+    contradicted = compute_conviction({
+        "source_count": 2, "relevance_score": 0.6, "effective_score": 0.6,
+        "market_confirmation": {"status": "contradicted"},
+    })
+    assert contradicted["score"] < confirmed["score"]
+    assert any("contradicho" in r for r in contradicted["reasons"])
+
+
+def test_conviction_score_bounded():
+    """Conviction score is always within [0, 1]."""
+    strong = compute_conviction({
+        "source_count": 9, "item_count": 9, "relevance_score": 1.0,
+        "effective_score": 1.0, "market_confirmation": {"status": "confirmed"},
+    })
+    weak = compute_conviction({
+        "source_count": 0, "relevance_score": 0.0, "effective_score": 0.0,
+        "market_confirmation": {"status": "contradicted"},
+    })
+    assert 0.0 <= strong["score"] <= 1.0
+    assert 0.0 <= weak["score"] <= 1.0
+
+
+def test_score_and_classify_attaches_conviction():
+    """score_and_classify_news enriches each item with a conviction tier/score."""
+    news = [{"title": "Test", "impact": "positivo", "related_assets": ["AAPL"],
+             "pre_score": 0.6, "source_count": 2}]
+    positions = [{"symbol": "AAPL", "pnl_pct": 0.05}]
+    result = score_and_classify_news(news, positions, _mock_allowed())
+    item = result[0]
+    assert item["conviction"] in ("high", "medium", "low")
+    assert isinstance(item["conviction_score"], float)
+    assert isinstance(item["conviction_reasons"], list)
+
+
+def test_curate_prioritizes_high_conviction_within_class():
+    """Within the same class, higher-conviction items rank ahead for GPT input."""
+    scored = [
+        {"title": "single source", "signal_class": "external_opportunity",
+         "effective_score": 0.7, "source_count": 1,
+         "market_confirmation": {"status": "unconfirmed"},
+         "conviction_score": 0.30},
+        {"title": "corroborated confirmed", "signal_class": "external_opportunity",
+         "effective_score": 0.7, "source_count": 3,
+         "market_confirmation": {"status": "confirmed"},
+         "conviction_score": 0.80},
+    ]
+    curated, meta = curate_llm_input(scored)
+    titles = [c["title"] for c in curated]
+    assert titles[0] == "corroborated confirmed"
+    assert titles[1] == "single source"
+    assert meta["sent_conviction"]["high"] >= 1
+
+
+def test_curate_meta_reports_conviction_breakdown():
+    """llm_input_meta exposes a conviction breakdown for observability."""
+    scored = [
+        {"title": "a", "signal_class": "holding_opportunity", "effective_score": 0.6,
+         "source_count": 2, "market_confirmation": {"status": "confirmed"},
+         "conviction_score": 0.7, "conviction": "high"},
+    ]
+    _, meta = curate_llm_input(scored)
+    assert "sent_conviction" in meta
+    assert set(meta["sent_conviction"].keys()) >= {"high", "medium", "low"}

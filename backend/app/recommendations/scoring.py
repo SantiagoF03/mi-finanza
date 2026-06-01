@@ -358,6 +358,97 @@ def compute_effective_score(item: dict) -> float:
     return round(base, 3)
 
 
+# ---------------------------------------------------------------------------
+# Parte C.4 — Conviction tier (discipline of top investors & financial press)
+# ---------------------------------------------------------------------------
+#
+# Encodes principles shared by the best investors (Buffett's "fat pitch",
+# Graham's margin of safety) and the editorial standards of the most
+# prestigious financial press (FT, WSJ, Reuters, Bloomberg):
+#
+#   1. Corroboration — never act on a single uncorroborated source. Serious
+#      reporting requires 2+ independent sources; conviction rises with breadth.
+#   2. Confirmation — "don't fight the tape": a thesis the market already
+#      confirms is higher conviction; one the market contradicts is much lower.
+#   3. Materiality / relevance — focus on what is genuinely material to the
+#      portfolio and investable universe, not noise.
+#
+# This layer is ADDITIVE: it does not change signal_class or promotion. It
+# produces a conviction tier + score used to prioritise what the GPT analysis
+# sees first and to explain *why* a signal is high or low conviction.
+
+_CONVICTION_HIGH = 0.65
+_CONVICTION_MEDIUM = 0.40
+
+
+def compute_conviction(item: dict) -> dict:
+    """Score the conviction behind a signal using investor-grade discipline.
+
+    Returns {"tier": "high"|"medium"|"low", "score": float 0-1, "reasons": [...]}.
+
+    Conviction is independent of classification — a holding_risk and an
+    external_opportunity can both be high or low conviction. It blends
+    corroboration (sources), market confirmation, materiality (relevance),
+    and the underlying effective_score.
+    """
+    reasons: list[str] = []
+    score = 0.0
+
+    source_count = item.get("source_count", 1) or 1
+    item_count = item.get("item_count", 1) or 1
+    relevance = float(item.get("relevance_score", 0) or 0)
+    conf_status = (item.get("market_confirmation") or {}).get("status", "")
+    eff = float(item.get("effective_score", item.get("signal_score", 0)) or 0)
+
+    # 1. Corroboration — the cardinal rule of serious financial reporting
+    if source_count >= 3:
+        score += 0.30
+        reasons.append("corroboración alta (3+ fuentes)")
+    elif source_count >= 2:
+        score += 0.18
+        reasons.append("corroboración (2 fuentes)")
+    else:
+        reasons.append("fuente única (sin corroborar)")
+
+    # Breadth of coverage reinforces a real, market-moving event
+    if item_count >= 5:
+        score += 0.10
+        reasons.append("amplia cobertura")
+    elif item_count >= 3:
+        score += 0.05
+
+    # 2. Market confirmation — don't fight the tape
+    if conf_status == "confirmed":
+        score += 0.30
+        reasons.append("confirmado por el mercado")
+    elif conf_status == "contradicted":
+        score -= 0.35
+        reasons.append("contradicho por el mercado")
+    else:
+        reasons.append("sin confirmación de mercado")
+
+    # 3. Materiality / relevance
+    if relevance >= 0.7:
+        score += 0.15
+        reasons.append("alta relevancia")
+    elif relevance >= 0.5:
+        score += 0.08
+
+    # Quality floor from the confirmation-adjusted score
+    score += eff * 0.20
+
+    score = round(min(max(score, 0.0), 1.0), 3)
+
+    if score >= _CONVICTION_HIGH:
+        tier = "high"
+    elif score >= _CONVICTION_MEDIUM:
+        tier = "medium"
+    else:
+        tier = "low"
+
+    return {"tier": tier, "score": score, "reasons": reasons}
+
+
 def score_and_classify_news(
     news: list[dict],
     positions: list[dict],
@@ -419,6 +510,12 @@ def score_and_classify_news(
                 and enriched["effective_score"] < _SUPPRESSION_THRESHOLD
                 and enriched["signal_class"] in ("external_opportunity", "observed_candidate")):
             enriched["suppressed_by_contradiction"] = True
+
+        # Conviction tier (corroboration + confirmation + materiality)
+        conviction = compute_conviction(enriched)
+        enriched["conviction"] = conviction["tier"]
+        enriched["conviction_score"] = conviction["score"]
+        enriched["conviction_reasons"] = conviction["reasons"]
 
         scored.append(enriched)
 
@@ -484,20 +581,31 @@ def curate_llm_input(
 
         eligible.append(item)
 
-    # Rank: class priority → effective_score desc → source_count desc
+    # Rank: class priority → conviction → effective_score desc → source_count desc.
+    # Conviction first (within a class) so the GPT analysis sees the most
+    # corroborated, market-confirmed signals before weaker single-source ones.
+    def _conviction_score(x):
+        if "conviction_score" in x:
+            return x["conviction_score"]
+        return compute_conviction(x)["score"]
+
     eligible.sort(key=lambda x: (
         _SIGNAL_CLASS_PRIORITY.get(x.get("signal_class", ""), 99),
+        -_conviction_score(x),
         -x.get("effective_score", 0),
         -x.get("source_count", 1),
     ))
 
     curated = eligible[:max_items]
 
-    # Observability: breakdown of what was sent by signal_class
+    # Observability: breakdown of what was sent by signal_class and conviction
     sent_classes: dict[str, int] = {}
+    sent_conviction: dict[str, int] = {"high": 0, "medium": 0, "low": 0}
     for item in curated:
         cls = item.get("signal_class", "unknown")
         sent_classes[cls] = sent_classes.get(cls, 0) + 1
+        tier = item.get("conviction") or compute_conviction(item)["tier"]
+        sent_conviction[tier] = sent_conviction.get(tier, 0) + 1
 
     llm_input_meta = {
         "total_scored": len(scored_news),
@@ -507,6 +615,7 @@ def curate_llm_input(
         "eligible_count": len(eligible),
         "sent_count": len(curated),
         "sent_classes": sent_classes,
+        "sent_conviction": sent_conviction,
         "max_items": max_items,
     }
 
@@ -676,6 +785,12 @@ def refine_with_fresh_quotes(
                         updated["signal_class"] = "observed_candidate"
                         updated["promoted_from_observed"] = False
                         demotions += 1
+
+                # Conviction reflects the refreshed confirmation/score
+                conviction = compute_conviction(updated)
+                updated["conviction"] = conviction["tier"]
+                updated["conviction_score"] = conviction["score"]
+                updated["conviction_reasons"] = conviction["reasons"]
 
                 refined_count += 1
                 for sym in related & fresh_symbols:
