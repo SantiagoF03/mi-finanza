@@ -569,7 +569,10 @@ def _build_decision_summary(
              "opportunity_quality": i.get("opportunity_quality"),
              "opportunity_rank_reason": i.get("opportunity_rank_reason"),
              "market_confirmation_reason": i.get("market_confirmation_reason"),
-             "operational_status": i.get("operational_status")}
+             "operational_status": i.get("operational_status"),
+             "conviction": i.get("conviction"),
+             "conviction_score": i.get("conviction_score"),
+             "conviction_reasons": i.get("conviction_reasons")}
             for i in source[:n]
         ]
 
@@ -1211,6 +1214,28 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
             )
         except Exception:
             recommendation_explanation_llm = None
+
+    # --- Conviction propagation: bridge scored_news → external_opportunities/observed ---
+    # scored_news has conviction fields from compute_conviction(); the engine/candidates
+    # pipeline doesn't carry them. Match back by symbol and propagate.
+    _conviction_by_symbol: dict[str, dict] = {}
+    for _sn in scored_news:
+        for _sym in _sn.get("related_assets", []):
+            _existing = _conviction_by_symbol.get(_sym)
+            if not _existing or (_sn.get("conviction_score") or 0) > (_existing.get("conviction_score") or 0):
+                _conviction_by_symbol[_sym] = {
+                    "conviction": _sn.get("conviction", "low"),
+                    "conviction_score": _sn.get("conviction_score", 0),
+                    "conviction_reasons": _sn.get("conviction_reasons", []),
+                }
+    for _item in (
+        rec.get("external_opportunities", [])
+        + rec.get("observed_candidates", [])
+        + rec.get("suppressed_candidates", [])
+    ):
+        _sym = _item.get("symbol")
+        if _sym and _sym in _conviction_by_symbol and "conviction" not in _item:
+            _item.update(_conviction_by_symbol[_sym])
 
     # --- Decision explainability summary ---
     decision_summary = _build_decision_summary(

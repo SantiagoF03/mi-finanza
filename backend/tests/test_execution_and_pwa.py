@@ -2604,3 +2604,216 @@ def test_all_weak_noise_yields_empty_watchlist_items():
         db.commit()
     finally:
         db.close()
+
+
+# ── Section 14: Conviction-based notification routing ─────────────────────
+
+
+def _make_rec_with_conviction(db, actionable_items, conviction_map=None,
+                              ext_opps=None, unchanged=False, superseded=False):
+    """Helper: create a Recommendation with actionable items that carry conviction data.
+
+    conviction_map: {symbol: "high"|"medium"|"low"} — overrides conviction on items.
+    ext_opps: full external_opportunities list (for _extract_delta to read conviction).
+    """
+    a_items = []
+    for item in actionable_items:
+        enriched = dict(item)
+        if conviction_map and enriched.get("symbol") in conviction_map:
+            enriched["conviction"] = conviction_map[enriched["symbol"]]
+        a_items.append(enriched)
+
+    meta = {
+        "unchanged": unchanged,
+        "external_opportunities": ext_opps or a_items,
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {"count": len(a_items), "items": a_items},
+                "watchlist_now": {"count": 0, "items": [],
+                                  "relevant_not_investable_count": 0,
+                                  "investable_signal_count": 0},
+                "suppressed_review": {"count": 0, "items": []},
+                "total_items": len(a_items),
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+    }
+    rec = Recommendation(
+        action="hold", status="pending", suggested_pct=0.0, confidence=0.7,
+        rationale="conviction test", risks="none", executive_summary="conviction test",
+        metadata_json=meta,
+        superseded_at=datetime.now(timezone.utc) if superseded else None,
+    )
+    db.add(rec)
+    db.commit()
+    return rec
+
+
+def test_conviction_high_new_actionable_sends_push(db):
+    """High conviction new_actionable → immediate push (not suppressed)."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    originals = _enable_notifications()
+    try:
+        items = [{"symbol": "AAPL", "reason": "test", "conviction": "high"}]
+        rec = _make_rec_with_conviction(db, items, conviction_map={"AAPL": "high"})
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["category"] == "new_actionable"
+        assert result.get("reason") != "conviction_low"
+        assert result.get("reason") != "conviction_medium_open_hours"
+    finally:
+        _restore_notifications(originals)
+
+
+def test_conviction_low_new_actionable_suppressed(db):
+    """Low conviction new_actionable → suppressed (in-app only)."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    originals = _enable_notifications()
+    try:
+        items = [{"symbol": "NEWCO", "reason": "rumor", "conviction": "low"}]
+        rec = _make_rec_with_conviction(db, items, conviction_map={"NEWCO": "low"})
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["sent"] is False
+        assert result["reason"] == "conviction_low"
+        assert result["conviction"] == "low"
+    finally:
+        _restore_notifications(originals)
+
+
+def test_conviction_medium_during_open_suppressed(db):
+    """Medium conviction new_actionable during market hours → suppressed."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    originals = _enable_notifications()
+    try:
+        items = [{"symbol": "MSFT", "reason": "signal", "conviction": "medium"}]
+        rec = _make_rec_with_conviction(db, items, conviction_map={"MSFT": "medium"})
+
+        open_time = datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc)  # Monday 14 UTC = open
+        with patch("app.notifications.dispatcher._argentina_market_phase", return_value="open"):
+            with patch("app.notifications.dispatcher.datetime") as mock_dt:
+                mock_dt.now.return_value = open_time
+                mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
+                result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["sent"] is False
+        assert result["reason"] == "conviction_medium_open_hours"
+    finally:
+        _restore_notifications(originals)
+
+
+def test_conviction_medium_premarket_sends(db):
+    """Medium conviction new_actionable during premarket → sends (not suppressed)."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    originals = _enable_notifications()
+    try:
+        items = [{"symbol": "GOOGL", "reason": "earnings", "conviction": "medium"}]
+        rec = _make_rec_with_conviction(db, items, conviction_map={"GOOGL": "medium"})
+
+        premarket_time = datetime(2026, 6, 2, 10, 0, tzinfo=timezone.utc)  # Monday 10 UTC = premarket
+        with patch("app.notifications.dispatcher._argentina_market_phase", return_value="premarket"):
+            with patch("app.notifications.dispatcher.datetime") as mock_dt:
+                mock_dt.now.return_value = premarket_time
+                mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
+                result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["category"] == "new_actionable"
+        assert result.get("reason") != "conviction_low"
+        assert result.get("reason") != "conviction_medium_open_hours"
+    finally:
+        _restore_notifications(originals)
+
+
+def test_conviction_mixed_high_and_low_uses_best(db):
+    """Mixed conviction: best=high → sends (high takes precedence)."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    originals = _enable_notifications()
+    try:
+        items = [
+            {"symbol": "AAPL", "reason": "strong signal", "conviction": "high"},
+            {"symbol": "WEAK", "reason": "rumor", "conviction": "low"},
+        ]
+        rec = _make_rec_with_conviction(
+            db, items,
+            conviction_map={"AAPL": "high", "WEAK": "low"},
+        )
+        result = dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+        assert result["category"] == "new_actionable"
+        assert result.get("reason") != "conviction_low"
+    finally:
+        _restore_notifications(originals)
+
+
+def test_conviction_audit_trail_has_routing(db):
+    """Audit trail includes conviction_routing when category=new_actionable."""
+    from app.notifications.dispatcher import dispatch_recommendation_alerts
+
+    originals = _enable_notifications()
+    try:
+        items = [{"symbol": "TSLA", "reason": "news", "conviction": "high"}]
+        rec = _make_rec_with_conviction(db, items, conviction_map={"TSLA": "high"})
+        dispatch_recommendation_alerts(db, {"recommendation_id": rec.id})
+
+        db.refresh(rec)
+        audit = (rec.metadata_json or {}).get("notification_audit", {})
+        assert "conviction_routing" in audit
+        assert audit["conviction_routing"]["best_conviction"] == "high"
+    finally:
+        _restore_notifications(originals)
+
+
+def test_extract_delta_includes_conviction():
+    """_extract_delta returns conviction data for new actionable items."""
+    from app.notifications.dispatcher import _extract_delta
+
+    meta = {
+        "external_opportunities": [
+            {"symbol": "AAPL", "conviction": "high"},
+            {"symbol": "MSFT", "conviction": "medium"},
+        ],
+        "decision_summary": {
+            "review_queue": {
+                "actionable_now": {
+                    "count": 2,
+                    "items": [
+                        {"symbol": "AAPL", "conviction": "high"},
+                        {"symbol": "MSFT", "conviction": "medium"},
+                    ],
+                },
+                "watchlist_now": {"count": 0, "items": []},
+            },
+            "pipeline_counts": {"suppressed_by_contradiction_count": 0},
+        },
+    }
+    delta = _extract_delta(meta, None)
+    assert delta["new_actionable_best_conviction"] == "high"
+    assert delta["new_actionable_conviction_breakdown"]["high"] == 1
+    assert delta["new_actionable_conviction_breakdown"]["medium"] == 1
+
+
+def test_conviction_summary_in_api_response():
+    """GET /recommendations/current includes conviction_summary."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        items = [{"symbol": "SPY", "conviction": "high", "reason": "macro"}]
+        rec = _make_rec_with_conviction(db, items, conviction_map={"SPY": "high"})
+        rec.status = "pending"
+        db.commit()
+
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/current")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "conviction_summary" in data
+        assert data["conviction_summary"]["actionable"]["high"] >= 1
+        assert "watchlist" in data["conviction_summary"]
+
+        db.query(Recommendation).filter(Recommendation.id == rec.id).delete()
+        db.commit()
+    finally:
+        db.close()
