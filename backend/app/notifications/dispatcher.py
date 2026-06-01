@@ -271,10 +271,12 @@ def send_web_push_to_all(
     body: str,
     severity: str = "medium",
     deep_link: str = "/",
+    extras: dict | None = None,
 ) -> dict:
     """Send a web push notification to all active subscriptions.
 
     Handles invalid/expired subscriptions by removing them.
+    extras: optional dict merged into the push payload (e.g. conviction tier).
     """
     from app.models.models import PushSubscription
 
@@ -293,6 +295,8 @@ def send_web_push_to_all(
         "deep_link": deep_link,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if extras:
+        payload.update(extras)
 
     sent = 0
     failed = 0
@@ -464,15 +468,49 @@ def _extract_delta(current_meta: dict, prev_meta: dict | None) -> dict:
             if i.get("symbol") and _watchlist_notification_worthy(i)
         }
 
+    new_actionable = current_actionable_symbols - prev_actionable_symbols
+
+    # --- Conviction routing data ---
+    # Build conviction map from all available sources: review_queue items +
+    # full external_opportunities list (review_queue only has top-5).
+    _CONVICTION_ORDER = {"high": 2, "medium": 1, "low": 0}
+    conviction_map: dict[str, str] = {}
+    for item in current_actionable_items:
+        sym = item.get("symbol")
+        if sym and item.get("conviction"):
+            conviction_map[sym] = item["conviction"]
+    for item in current_meta.get("external_opportunities", []):
+        sym = item.get("symbol")
+        if sym and sym not in conviction_map and item.get("conviction"):
+            conviction_map[sym] = item["conviction"]
+
+    # Backward compat: if NO items have conviction data at all, default to
+    # "high" so old recommendations still send normally. Only when conviction
+    # is present in the pipeline do we use "low" as the default for untagged items.
+    any_has_conviction = bool(conviction_map)
+    default_conviction = "low" if any_has_conviction else "high"
+    new_convictions = [conviction_map.get(s, default_conviction) for s in new_actionable]
+    best_conviction = "high"  # safe default when no data
+    if new_convictions:
+        best_conviction = max(new_convictions, key=lambda c: _CONVICTION_ORDER.get(c, 0))
+
+    conviction_breakdown = {
+        "high": sum(1 for c in new_convictions if c == "high"),
+        "medium": sum(1 for c in new_convictions if c == "medium"),
+        "low": sum(1 for c in new_convictions if c == "low"),
+    }
+
     return {
         "actionable_count": actionable.get("count", 0),
         "actionable_symbols": current_actionable_symbols,
-        "new_actionable": current_actionable_symbols - prev_actionable_symbols,
+        "new_actionable": new_actionable,
         "watchlist_count": len(current_watchlist_symbols),
         "watchlist_symbols": current_watchlist_symbols,
         "new_watchlist": current_watchlist_symbols - prev_watchlist_symbols,
         "suppressed_by_contradiction_count": pc.get("suppressed_by_contradiction_count", 0),
         "unchanged": current_meta.get("unchanged", False),
+        "new_actionable_best_conviction": best_conviction,
+        "new_actionable_conviction_breakdown": conviction_breakdown,
     }
 
 
@@ -725,6 +763,41 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
             "severity": classification["severity"],
         }
 
+    # --- Gate: conviction-based routing (new_actionable only) ---
+    # High conviction → immediate push (unchanged).
+    # Medium conviction → push only in premarket/postmarket (skip intraday noise).
+    # Low conviction → in-app only, never push.
+    if classification["category"] == "new_actionable":
+        best_conviction = delta.get("new_actionable_best_conviction", "high")
+        audit["conviction_routing"] = {
+            "best_conviction": best_conviction,
+            "breakdown": delta.get("new_actionable_conviction_breakdown", {}),
+        }
+        if best_conviction == "low":
+            audit["should_send"] = False
+            audit["sent"] = False
+            audit["suppress_reason"] = "conviction_low"
+            _persist_audit(db, rec, audit)
+            return {
+                "sent": False,
+                "reason": "conviction_low",
+                "category": "new_actionable",
+                "severity": classification["severity"],
+                "conviction": best_conviction,
+            }
+        if best_conviction == "medium" and ar_phase == "open":
+            audit["should_send"] = False
+            audit["sent"] = False
+            audit["suppress_reason"] = "conviction_medium_open_hours"
+            _persist_audit(db, rec, audit)
+            return {
+                "sent": False,
+                "reason": "conviction_medium_open_hours",
+                "category": "new_actionable",
+                "severity": classification["severity"],
+                "conviction": best_conviction,
+            }
+
     if _last_notification_at:
         tz_last = (
             _last_notification_at.replace(tzinfo=timezone.utc)
@@ -811,12 +884,16 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     push_result = {"sent": 0, "failed": 0, "removed": 0}
     if channel in ("web_push", "telegram"):
         try:
+            push_extras = {}
+            if classification["category"] == "new_actionable":
+                push_extras["conviction"] = delta.get("new_actionable_best_conviction", "medium")
             push_result = send_web_push_to_all(
                 db,
                 title=title,
                 body=body,
                 severity=classification["severity"],
                 deep_link="/recommendations",
+                extras=push_extras or None,
             )
         except Exception as exc:
             logger.warning("Recommendation push failed: %s", exc)

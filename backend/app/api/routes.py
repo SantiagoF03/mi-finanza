@@ -92,6 +92,22 @@ def recent_news(db: Session = Depends(get_db)):
 _CANDIDATES_SLIM_CAP = 50
 
 
+def _build_conviction_summary(actionable_items: list, watchlist_items: list) -> dict:
+    """Build conviction breakdown for frontend display (badge/indicator)."""
+    def _breakdown(items):
+        counts = {"high": 0, "medium": 0, "low": 0}
+        for item in items:
+            tier = item.get("conviction", "low")
+            if tier in counts:
+                counts[tier] += 1
+        return {"total": len(items), **counts}
+
+    return {
+        "actionable": _breakdown(actionable_items),
+        "watchlist": _breakdown(watchlist_items),
+    }
+
+
 def _slim_candidates(items: list, cap: int = _CANDIDATES_SLIM_CAP) -> tuple[list, dict]:
     """Truncate a candidate list to cap size and return (sliced, meta).
 
@@ -120,6 +136,14 @@ def current_recommendation(full: bool = False, db: Session = Depends(get_db)):
     else:
         obs_list, obs_meta = _slim_candidates(obs_full)
         sup_list, sup_meta = _slim_candidates(sup_full)
+
+    # --- Conviction summary for frontend badge/display ---
+    ds = ensure_review_queue(meta.get("decision_summary") or {})
+    rq = ds.get("review_queue", {})
+    conviction_summary = _build_conviction_summary(
+        rq.get("actionable_now", {}).get("items", []),
+        rq.get("watchlist_now", {}).get("items", []),
+    )
 
     return {
         "id": rec.id,
@@ -157,8 +181,9 @@ def current_recommendation(full: bool = False, db: Session = Depends(get_db)):
         "cluster_traceability": meta.get("cluster_traceability") or [],
         "scoring_summary": meta.get("scoring_summary") or {},
         "fresh_quote_meta": meta.get("fresh_quote_meta") or {},
-        "decision_summary": ensure_review_queue(meta.get("decision_summary") or {}),
+        "decision_summary": ds,
         "notification_audit": meta.get("notification_audit"),
+        "conviction_summary": conviction_summary,
         "actions": [{"symbol": a.symbol, "target_change_pct": a.target_change_pct, "reason": a.reason} for a in rec.actions],
     }
 
@@ -550,7 +575,7 @@ def simulate_alert(db: Session = Depends(get_db)):
     The recommendation is immediately marked superseded so it does not
     interfere with production flow.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
     import uuid
 
     from app.notifications.dispatcher import dispatch_recommendation_alerts
@@ -590,7 +615,7 @@ def simulate_alert(db: Session = Depends(get_db)):
     db.refresh(rec)
     audit = (rec.metadata_json or {}).get("notification_audit")
 
-    rec.superseded_at = datetime.utcnow()
+    rec.superseded_at = datetime.now(timezone.utc)
     db.commit()
 
     push_sub_count = db.query(PushSubscription).count()
