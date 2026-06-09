@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     # Cluster-aware decision pipeline (additive — legacy flow unchanged when False)
     use_clusters: bool = False
 
+    # Debug endpoints (POST /debug/simulate-alert). Disable in production.
+    debug_endpoints_enabled: bool = True
+
     whitelist_assets: List[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "AL30", "BND", "CASH"]
     )

@@ -2817,3 +2817,42 @@ def test_conviction_summary_in_api_response():
         db.commit()
     finally:
         db.close()
+
+
+# ── Section 15: Debug endpoint gating ──────────────────────────────────
+
+
+def test_simulate_alert_blocked_when_debug_disabled():
+    """POST /debug/simulate-alert returns 403 when debug_endpoints_enabled=False."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.debug_endpoints_enabled
+    try:
+        settings.debug_endpoints_enabled = False
+        client = TestClient(app)
+        resp = client.post("/api/debug/simulate-alert")
+        assert resp.status_code == 403
+        assert "deshabilitados" in resp.json()["detail"].lower()
+    finally:
+        settings.debug_endpoints_enabled = original
+
+
+def test_simulate_alert_allowed_when_debug_enabled():
+    """POST /debug/simulate-alert works when debug_endpoints_enabled=True (default)."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.debug_endpoints_enabled
+    try:
+        settings.debug_endpoints_enabled = True
+        client = TestClient(app)
+        resp = client.post("/api/debug/simulate-alert")
+        assert resp.status_code == 200
+        assert resp.json()["simulation"] is True
+    finally:
+        settings.debug_endpoints_enabled = original
