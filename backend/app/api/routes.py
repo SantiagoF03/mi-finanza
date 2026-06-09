@@ -581,6 +581,8 @@ def simulate_alert(db: Session = Depends(get_db)):
     from app.notifications.dispatcher import dispatch_recommendation_alerts
 
     settings = get_settings()
+    if not settings.debug_endpoints_enabled:
+        raise HTTPException(403, "Debug endpoints deshabilitados (DEBUG_ENDPOINTS_ENABLED=false)")
 
     sim_symbol = f"SIM_{uuid.uuid4().hex[:6].upper()}"
     rec = Recommendation(

@@ -53,8 +53,11 @@ def on_startup():
         from app.api.routes import _load_persisted_settings
         _load_persisted_settings(db)
         db.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Failed to load persisted settings at startup (using .env defaults): %s", exc
+        )
 
     start_scheduler()
 
