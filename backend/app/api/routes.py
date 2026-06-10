@@ -52,7 +52,7 @@ def broker_ping():
 
 
 @router.post("/analysis/run")
-def run_manual_analysis(db: Session = Depends(get_db)):
+def run_manual_analysis(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     cycle_result = run_cycle(db, source="manual")
     # Persist notification audit trail (best-effort, does not affect cycle result)
     try:
@@ -565,7 +565,7 @@ def get_vapid_public_key():
 
 
 @router.post("/push/test")
-def push_test(db: Session = Depends(get_db)):
+def push_test(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Send a test push notification to all active subscriptions."""
     from app.notifications.dispatcher import send_web_push_to_all
     result = send_web_push_to_all(
@@ -681,7 +681,7 @@ def get_instruments_catalog(
 
 
 @router.post("/instruments/refresh")
-def refresh_instruments(db: Session = Depends(get_db)):
+def refresh_instruments(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Refresh the instrument catalog from IOL or static seed."""
     result = refresh_instrument_catalog(db)
     return result

@@ -2951,6 +2951,126 @@ def test_api_key_blocks_decision():
         settings.api_key = original
 
 
+def test_api_key_blocks_analysis_run():
+    """POST /analysis/run is protected by API key (token/cost abuse vector)."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/analysis/run")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_push_test():
+    """POST /push/test is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/push/test")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_instruments_refresh():
+    """POST /instruments/refresh is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/instruments/refresh")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_allows_analysis_run_with_correct_key():
+    """POST /analysis/run works with correct X-API-Key header."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/analysis/run", headers={"X-API-Key": "test-secret-key-123"})
+        assert resp.status_code == 200
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_allows_push_test_with_correct_key():
+    """POST /push/test works with correct X-API-Key header."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/push/test", headers={"X-API-Key": "test-secret-key-123"})
+        assert resp.status_code == 200
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_allows_instruments_refresh_with_correct_key():
+    """POST /instruments/refresh works with correct X-API-Key header."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/instruments/refresh", headers={"X-API-Key": "test-secret-key-123"})
+        assert resp.status_code == 200
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_empty_keeps_new_endpoints_open():
+    """With API_KEY empty, /analysis/run, /push/test and /instruments/refresh stay open."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = ""
+        client = TestClient(app)
+        for path in ("/api/analysis/run", "/api/push/test", "/api/instruments/refresh"):
+            resp = client.post(path)
+            assert resp.status_code != 403, f"{path} returned 403 with empty API_KEY"
+    finally:
+        settings.api_key = original
+
+
 # ───────────────────────────────────────────────────────────────────
 # Section 17 — Scheduler observability
 # ───────────────────────────────────────────────────────────────────
