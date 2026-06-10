@@ -2856,3 +2856,142 @@ def test_simulate_alert_allowed_when_debug_enabled():
         assert resp.json()["simulation"] is True
     finally:
         settings.debug_endpoints_enabled = original
+
+
+# ───────────────────────────────────────────────────────────────────
+# Section 16 — API key protection
+# ───────────────────────────────────────────────────────────────────
+
+
+def test_api_key_blocks_approve_without_key():
+    """Protected endpoint returns 403 when API_KEY is set but not provided."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/recommendations/1/approve")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_allows_with_correct_key():
+    """Protected endpoint accepts request with correct X-API-Key header."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post(
+            "/api/recommendations/999/approve",
+            headers={"X-API-Key": "test-secret-key-123"},
+        )
+        assert resp.status_code != 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_no_auth_when_empty():
+    """When API_KEY is empty, endpoints are open (dev mode)."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = ""
+        client = TestClient(app)
+        resp = client.post("/api/recommendations/999/approve")
+        assert resp.status_code != 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_settings_put():
+    """PUT /profile/settings is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.put("/api/profile/settings", json={"investor_profile_target": "moderate"})
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_decision():
+    """POST /recommendations/{id}/decision is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/recommendations/1/decision", json={"decision": "approved"})
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+# ───────────────────────────────────────────────────────────────────
+# Section 17 — Scheduler observability
+# ───────────────────────────────────────────────────────────────────
+
+
+def test_scheduler_status_endpoint():
+    """GET /scheduler/status returns scheduler state."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    resp = client.get("/api/scheduler/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "running" in data
+    assert "phase" in data
+    assert "last_run_at" in data
+    assert "total_runs" in data
+    assert "jobs" in data
+
+
+def test_scheduler_state_updates_after_ingestion():
+    """Scheduler state updates after scheduled_ingestion runs."""
+    from app.scheduler.jobs import scheduled_ingestion, _scheduler_state
+
+    before_runs = _scheduler_state["total_runs"]
+    scheduled_ingestion()
+    assert _scheduler_state["total_runs"] == before_runs + 1
+    assert _scheduler_state["last_status"] == "ok"
+    assert _scheduler_state["last_source"] == "ingestion"
+    assert _scheduler_state["last_run_at"] is not None
+
+
+# ───────────────────────────────────────────────────────────────────
+# Section 18 — CORS configuration
+# ───────────────────────────────────────────────────────────────────
+
+
+def test_cors_origins_from_config():
+    """CORS origins are read from settings.cors_origins."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    assert hasattr(settings, "cors_origins")
