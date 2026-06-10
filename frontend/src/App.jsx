@@ -1,8 +1,6 @@
 import { useEffect, useState } from 'react'
 
-const API = import.meta.env.VITE_API_BASE
-  ? import.meta.env.VITE_API_BASE + '/api'
-  : `${window.location.protocol}//${window.location.hostname}:8000/api`
+import { API, authHeaders } from './api'
 
 function urlBase64ToUint8Array(base64String) {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
@@ -65,7 +63,7 @@ function NotificationPanel({ api }) {
       try {
         await fetch(`${api}/notifications/settings`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ notification_channel: 'web_push' }),
         })
       } catch { /* non-fatal: subscription still works */ }
@@ -81,7 +79,7 @@ function NotificationPanel({ api }) {
   const sendTest = async () => {
     setLoading(true); setMsg('')
     try {
-      const res = await fetch(`${api}/push/test`, { method: 'POST' })
+      const res = await fetch(`${api}/push/test`, { method: 'POST', headers: authHeaders() })
       const data = await res.json()
       if (res.ok) {
         const sent = data.sent ?? 0
@@ -240,7 +238,7 @@ export default function App() {
     setError('')
     setLoading(true)
     try {
-      const resp = await fetch(`${API}/analysis/run`, { method: 'POST' })
+      const resp = await fetch(`${API}/analysis/run`, { method: 'POST', headers: authHeaders() })
       if (!resp.ok) throw new Error('trigger_failed')
       const payload = await resp.json()
 
@@ -284,7 +282,7 @@ export default function App() {
     try {
       const resp = await fetch(`${API}/recommendations/${current.id}/approve`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ note: '' }),
       })
       if (!resp.ok) {
@@ -304,7 +302,7 @@ export default function App() {
     try {
       await fetch(`${API}/recommendations/${current.id}/reject`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ note: '' }),
       })
       await load()

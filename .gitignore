@@ -28,3 +28,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.db
+
+# Environment files with real credentials (templates are tracked)
+.env
+backend/.env
+frontend/.env
+frontend/.env.production
+frontend/.env.local
