@@ -3,9 +3,11 @@
 // authHeaders() solo se usa en llamadas sensibles (approve/reject/settings/
 // analysis/push-test); las lecturas públicas y push/subscribe van sin key.
 
+// Con VITE_API_BASE vacío usa /api relativo: funciona en producción
+// (Caddy reverse-proxy same-origin) y en dev (proxy de Vite → localhost:8000).
 export const API = import.meta.env.VITE_API_BASE
   ? import.meta.env.VITE_API_BASE + '/api'
-  : `${window.location.protocol}//${window.location.hostname}:8000/api`
+  : '/api'
 
 const API_KEY = import.meta.env.VITE_API_KEY || ''
 
