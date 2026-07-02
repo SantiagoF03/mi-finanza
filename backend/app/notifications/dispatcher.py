@@ -182,20 +182,38 @@ def _send_telegram(message: str, bot_token: str, chat_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _to_str(value) -> str:
+    """Normalize header values: py_vapid may return bytes."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _to_bytes(value) -> bytes:
+    """Normalize key material: py_vapid's from_raw/b64urldecode require bytes."""
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return value
+
+
 def _send_single_web_push(
     endpoint: str,
     p256dh: str,
     auth: str,
     payload: dict,
-) -> bool:
+) -> str:
     """Send a single web push notification using pywebpush or py_vapid fallback.
 
-    Returns True if sent successfully, False otherwise.
+    Returns a status string:
+    - "sent": delivered successfully
+    - "gone": provider says the subscription is invalid/expired (404/410) —
+      the caller should remove it
+    - "failed": transient or internal error — the subscription must be kept
     """
     settings = get_settings()
     if not settings.vapid_private_key or not settings.vapid_public_key:
         logger.warning("VAPID keys not configured, cannot send web push")
-        return False
+        return "failed"
 
     subscription_info = {
         "endpoint": endpoint,
@@ -209,27 +227,37 @@ def _send_single_web_push(
         "sub": f"mailto:{settings.vapid_contact_email}" if settings.vapid_contact_email else "mailto:admin@mifinanza.local",
     }
 
-    # Try pywebpush first (preferred, handles encryption)
+    # Try pywebpush first (preferred, handles payload encryption)
     try:
-        from pywebpush import webpush
-        webpush(
-            subscription_info=subscription_info,
-            data=json.dumps(payload),
-            vapid_private_key=settings.vapid_private_key,
-            vapid_claims=vapid_claims,
-        )
-        return True
+        from pywebpush import WebPushException, webpush
+        try:
+            webpush(
+                subscription_info=subscription_info,
+                data=json.dumps(payload),
+                vapid_private_key=settings.vapid_private_key,
+                vapid_claims=dict(vapid_claims),
+            )
+            return "sent"
+        except WebPushException as exc:
+            status_code = getattr(exc.response, "status_code", None)
+            if status_code in (404, 410):
+                logger.info("Push subscription gone (HTTP %d) for %s...", status_code, endpoint[:50])
+                return "gone"
+            logger.warning("pywebpush failed for %s...: %s", endpoint[:50], exc)
+            return "failed"
+        except Exception as exc:
+            logger.warning("pywebpush failed for %s...: %s", endpoint[:50], exc)
+            return "failed"
     except ImportError:
         pass
-    except Exception as exc:
-        logger.warning("pywebpush failed for %s...: %s", endpoint[:50], exc)
-        return False
 
-    # Fallback: use py_vapid for auth header + httpx for delivery
+    # Fallback: use py_vapid for auth header + httpx for delivery.
+    # Limitation: no payload encryption — providers that require encrypted
+    # payloads (FCM et al.) may reject it. pywebpush is the supported path.
     try:
         from py_vapid import Vapid
 
-        vapid = Vapid.from_raw(settings.vapid_private_key)
+        vapid = Vapid.from_raw(_to_bytes(settings.vapid_private_key))
         auth_headers = vapid.sign({
             "aud": _extract_origin(endpoint),
             "sub": vapid_claims["sub"],
@@ -237,24 +265,27 @@ def _send_single_web_push(
 
         data_bytes = json.dumps(payload).encode("utf-8")
         headers = {
-            "Authorization": auth_headers["Authorization"],
-            "Crypto-Key": auth_headers.get("Crypto-Key", ""),
+            "Authorization": _to_str(auth_headers.get("Authorization", "")),
+            "Crypto-Key": _to_str(auth_headers.get("Crypto-Key", "")),
             "Content-Type": "application/json",
             "TTL": "86400",
         }
 
         resp = httpx.post(endpoint, content=data_bytes, headers=headers, timeout=10)
         if resp.status_code in (200, 201, 202):
-            return True
+            return "sent"
+        if resp.status_code in (404, 410):
+            logger.info("Push subscription gone (HTTP %d) for %s...", resp.status_code, endpoint[:50])
+            return "gone"
         logger.warning("Web push HTTP %d for %s...", resp.status_code, endpoint[:50])
-        return False
+        return "failed"
 
     except ImportError:
         logger.warning("Neither pywebpush nor py_vapid available")
-        return False
+        return "failed"
     except Exception as exc:
         logger.warning("Web push fallback failed for %s...: %s", endpoint[:50], exc)
-        return False
+        return "failed"
 
 
 def _extract_origin(url: str) -> str:
@@ -304,19 +335,21 @@ def send_web_push_to_all(
     to_remove = []
 
     for sub in subs:
-        success = _send_single_web_push(
+        status = _send_single_web_push(
             endpoint=sub.endpoint,
             p256dh=sub.p256dh,
             auth=sub.auth,
             payload=payload,
         )
-        if success:
+        if status == "sent":
             sent += 1
-        else:
+        elif status == "gone":
+            # Provider confirmed the subscription is invalid/expired (404/410)
             failed += 1
-            # Check if subscription is expired/invalid (410 Gone)
-            # Mark for removal on repeated failures
             to_remove.append(sub.id)
+        else:
+            # Transient or internal error — keep the subscription
+            failed += 1
 
     # Remove invalid subscriptions (best-effort)
     if to_remove:
