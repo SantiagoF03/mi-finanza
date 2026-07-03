@@ -274,6 +274,14 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
 
     Returns dict with execution results or error.
     """
+    settings = get_settings()
+
+    if not settings.order_execution_enabled:
+        return {
+            "error": "Order execution disabled by safety lock",
+            "status_code": 423,
+        }
+
     rec = db.query(Recommendation).filter(Recommendation.id == recommendation_id).first()
     if not rec:
         return {"error": "Recommendation not found", "status_code": 404}
@@ -283,13 +291,6 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
 
     # Mark as approved
     rec.status = "approved"
-    settings = get_settings()
-
-    if not settings.order_execution_enabled:
-    return {
-        "error": "Order execution disabled by safety lock",
-        "status_code": 423,
-    }
     decision = UserDecision(recommendation_id=recommendation_id, decision="approved", note=note)
     db.add(decision)
     db.flush()
