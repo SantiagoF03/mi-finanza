@@ -101,8 +101,10 @@ def test_refresh_token_flow_and_real_cash_from_estadocuenta():
 def test_fallback_to_mock_if_auth_fails(monkeypatch):
     db = make_db()
     settings = get_settings()
-    settings.broker_mode = "real"
-    settings.trigger_cooldown_seconds = 0
+    # monkeypatch restores the singleton attrs after the test — a bare
+    # assignment here leaked broker_mode="real" into every later test.
+    monkeypatch.setattr(settings, "broker_mode", "real")
+    monkeypatch.setattr(settings, "trigger_cooldown_seconds", 0)
 
     orchestrator._broker_singletons.clear()
     monkeypatch.setattr(orchestrator, "IolBrokerClient", lambda: BrokenRealClient())

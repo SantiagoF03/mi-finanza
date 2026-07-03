@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     # API key — protects approve/reject/debug/settings endpoints. Empty = no auth.
     api_key: str = ""
 
+    # Safety lock — with broker_mode=real, approve does NOT send orders unless
+    # this is explicitly true. Fail closed: default false.
+    order_execution_enabled: bool = False
+
     # CORS — comma-separated origins, or "*" for dev.
     cors_origins: str = "*"
 
