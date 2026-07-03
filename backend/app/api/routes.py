@@ -27,6 +27,7 @@ from app.services.execution import (
     approve_and_execute,
     get_execution_by_id,
     get_recent_executions,
+    preview_execution_plan,
     reject_recommendation,
 )
 from app.services.orchestrator import ensure_review_queue, get_current_recommendation, run_cycle
@@ -426,6 +427,19 @@ def update_profile_settings(payload: ProfileSettingsIn, db: Session = Depends(ge
 
 class ApproveIn(BaseModel):
     note: str = ""
+
+
+@router.get("/recommendations/{recommendation_id}/execution-preview")
+def execution_preview_endpoint(
+    recommendation_id: int,
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Preview the execution plan without sending orders."""
+    result = preview_execution_plan(db, recommendation_id)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
 
 
 @router.post("/recommendations/{recommendation_id}/approve")

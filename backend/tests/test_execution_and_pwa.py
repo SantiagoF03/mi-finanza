@@ -3344,3 +3344,169 @@ def test_push_test_endpoint_success_keeps_fcm_subscription():
                 cleanup_db.commit()
         finally:
             cleanup_db.close()
+
+
+# ───────────────────────────────────────────────────────────────────
+# Section 20 — Execution preview (dry-run) + ORDER_EXECUTION_ENABLED safety lock
+# ───────────────────────────────────────────────────────────────────
+
+
+def test_preview_execution_plan_no_state_change(db):
+    """Preview computes the plan but changes NOTHING: no OrderExecution rows,
+    no status change, no UserDecision."""
+    from app.models.models import UserDecision
+    from app.services.execution import preview_execution_plan
+
+    _make_snapshot(db)
+    rec = _make_recommendation(db)
+    db.commit()
+
+    result = preview_execution_plan(db, rec.id)
+
+    assert result["dry_run"] is True
+    assert result["would_execute"] is False
+    assert result["recommendation_id"] == rec.id
+    assert result["actions_count"] == 1
+    assert len(result["orders_preview"]) == 1
+
+    order = result["orders_preview"][0]
+    assert order["symbol"] == "AAPL"
+    assert order["side"] == "sell"
+    assert order["would_execute"] is False
+    assert order["valid"] is True
+    assert order["quantity_planned"] > 0
+
+    # Nothing was persisted or mutated
+    db.expire_all()
+    assert db.query(OrderExecution).count() == 0
+    assert db.query(UserDecision).count() == 0
+    assert db.query(Recommendation).get(rec.id).status == "pending"
+
+
+def test_preview_execution_plan_never_calls_broker(db):
+    """Preview must not construct a broker client at all."""
+    from unittest import mock
+    from app.services.execution import preview_execution_plan
+
+    _make_snapshot(db)
+    rec = _make_recommendation(db)
+    db.commit()
+
+    with mock.patch("app.services.execution._get_execution_broker") as mock_broker, \
+         mock.patch("app.services.execution.IolBrokerClient") as mock_iol, \
+         mock.patch("app.services.execution.MockBrokerClient") as mock_mock:
+        result = preview_execution_plan(db, rec.id)
+
+    assert result["dry_run"] is True
+    mock_broker.assert_not_called()
+    mock_iol.assert_not_called()
+    mock_mock.assert_not_called()
+
+
+def test_preview_execution_plan_not_found(db):
+    from app.services.execution import preview_execution_plan
+    result = preview_execution_plan(db, 999999)
+    assert result["error"] == "Recommendation not found"
+    assert result["status_code"] == 404
+
+
+def test_preview_execution_plan_no_snapshot(db):
+    from app.services.execution import preview_execution_plan
+    rec = _make_recommendation(db)
+    db.commit()
+    result = preview_execution_plan(db, rec.id)
+    assert result["error"] == "No portfolio snapshot available for preview"
+    assert result["status_code"] == 400
+
+
+def test_preview_dry_run_even_if_execution_enabled(db):
+    """Even with ORDER_EXECUTION_ENABLED=true, preview stays dry-run."""
+    from app.core.config import get_settings
+    from app.services.execution import preview_execution_plan
+
+    _make_snapshot(db)
+    rec = _make_recommendation(db)
+    db.commit()
+
+    settings = get_settings()
+    original = settings.order_execution_enabled
+    try:
+        settings.order_execution_enabled = True
+        result = preview_execution_plan(db, rec.id)
+        assert result["dry_run"] is True
+        assert result["would_execute"] is False
+        assert result["order_execution_enabled"] is True
+        assert all(o["would_execute"] is False for o in result["orders_preview"])
+        assert db.query(OrderExecution).count() == 0
+    finally:
+        settings.order_execution_enabled = original
+
+
+def test_execution_preview_endpoint_requires_api_key():
+    """GET /recommendations/{id}/execution-preview is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.get("/api/recommendations/1/execution-preview")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_safety_lock_blocks_approve_with_real_broker(db):
+    """broker_mode=real + ORDER_EXECUTION_ENABLED=false → approve fails closed:
+    423, no status change, no UserDecision, no OrderExecution rows."""
+    from app.core.config import get_settings
+    from app.models.models import UserDecision
+    from app.services.execution import approve_and_execute
+
+    _make_snapshot(db)
+    rec = _make_recommendation(db)
+    db.commit()
+
+    settings = get_settings()
+    orig_mode, orig_lock = settings.broker_mode, settings.order_execution_enabled
+    try:
+        settings.broker_mode = "real"
+        settings.order_execution_enabled = False
+        result = approve_and_execute(db, rec.id)
+    finally:
+        settings.broker_mode = orig_mode
+        settings.order_execution_enabled = orig_lock
+
+    assert "error" in result
+    assert result["status_code"] == 423
+    assert "Safety lock" in result["error"]
+    db.expire_all()
+    assert db.query(Recommendation).get(rec.id).status == "pending"
+    assert db.query(UserDecision).count() == 0
+    assert db.query(OrderExecution).count() == 0
+
+
+def test_safety_lock_does_not_affect_mock_broker(db):
+    """broker_mode=mock keeps working with the lock down (tests/validation flow)."""
+    from app.core.config import get_settings
+    from app.services.execution import approve_and_execute
+
+    _make_snapshot(db)
+    rec = _make_recommendation(db)
+    db.commit()
+
+    settings = get_settings()
+    orig_mode, orig_lock = settings.broker_mode, settings.order_execution_enabled
+    try:
+        settings.broker_mode = "mock"
+        settings.order_execution_enabled = False
+        result = approve_and_execute(db, rec.id)
+    finally:
+        settings.broker_mode = orig_mode
+        settings.order_execution_enabled = orig_lock
+
+    assert result.get("status") == "approved"
+    assert "error" not in result

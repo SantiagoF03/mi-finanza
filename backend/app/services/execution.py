@@ -269,6 +269,62 @@ def _plan_order(
     }
 
 
+def preview_execution_plan(db: Session, recommendation_id: int) -> dict:
+    """Compute the order plan for a recommendation WITHOUT executing anything.
+
+    READ-ONLY by contract:
+    - no broker client, no place_order, no IOL calls
+    - no OrderExecution rows, no db.add, no db.commit
+    - no Recommendation.status change, no UserDecision, no notifications
+
+    Reuses _plan_order (pure calculation over snapshot data). Always returns
+    dry_run=True / would_execute=False, regardless of ORDER_EXECUTION_ENABLED.
+    """
+    settings = get_settings()
+
+    rec = db.query(Recommendation).filter(Recommendation.id == recommendation_id).first()
+    if not rec:
+        return {"error": "Recommendation not found", "status_code": 404}
+
+    actions = db.query(RecommendationAction).filter(
+        RecommendationAction.recommendation_id == recommendation_id
+    ).all()
+
+    snapshot = _get_latest_snapshot(db)
+    if not snapshot:
+        return {"error": "No portfolio snapshot available for preview", "status_code": 400}
+
+    orders_preview = []
+    for action in actions:
+        plan = _plan_order(action, snapshot)
+        orders_preview.append({
+            "recommendation_action_id": action.id,
+            "symbol": action.symbol,
+            "target_change_pct": action.target_change_pct,
+            "side": plan["side"],
+            "valid": plan["valid"],
+            "quantity_planned": plan["quantity_planned"],
+            "portfolio_value_used": plan["portfolio_value_used"],
+            "position_value_used": plan["position_value_used"],
+            "snapshot_price_ref": plan["snapshot_price_ref"],
+            "blocked_reason": plan["blocked_reason"],
+            "would_execute": False,
+        })
+
+    return {
+        "recommendation_id": recommendation_id,
+        "recommendation_status": rec.status,
+        "recommendation_action": rec.action,
+        "broker_mode": settings.broker_mode,
+        "order_execution_enabled": settings.order_execution_enabled,
+        "dry_run": True,
+        "would_execute": False,
+        "message": "Execution preview only. No order was sent and no state was changed.",
+        "actions_count": len(actions),
+        "orders_preview": orders_preview,
+    }
+
+
 def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> dict:
     """Approve a recommendation and trigger order execution.
 
@@ -280,6 +336,20 @@ def approve_and_execute(db: Session, recommendation_id: int, note: str = "") -> 
 
     if rec.status not in {"pending", "blocked"}:
         return {"error": f"No se puede aprobar: estado actual es '{rec.status}'", "status_code": 400}
+
+    # SAFETY LOCK — with a real broker, approve must not send orders unless
+    # ORDER_EXECUTION_ENABLED=true. Fail closed BEFORE any state change:
+    # no status change, no UserDecision, no OrderExecution rows.
+    settings = get_settings()
+    if settings.broker_mode != "mock" and not settings.order_execution_enabled:
+        return {
+            "error": (
+                "Safety lock activo: ejecución real deshabilitada "
+                "(ORDER_EXECUTION_ENABLED=false). No se aprobó la recomendación "
+                "ni se envió ninguna orden."
+            ),
+            "status_code": 423,
+        }
 
     # Mark as approved
     rec.status = "approved"
