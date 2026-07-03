@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     environment: str = "dev"
     database_url: str = "sqlite:///./mi_finanza.db"
     broker_mode: str = "mock"
-
+    order_execution_enabled: bool = False
     iol_api_base: str = "https://api.invertironline.com"
     iol_username: str = ""
     iol_password: str = ""
