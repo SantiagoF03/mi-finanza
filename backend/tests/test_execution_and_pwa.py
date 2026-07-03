@@ -2856,3 +2856,491 @@ def test_simulate_alert_allowed_when_debug_enabled():
         assert resp.json()["simulation"] is True
     finally:
         settings.debug_endpoints_enabled = original
+
+
+# ───────────────────────────────────────────────────────────────────
+# Section 16 — API key protection
+# ───────────────────────────────────────────────────────────────────
+
+
+def test_api_key_blocks_approve_without_key():
+    """Protected endpoint returns 403 when API_KEY is set but not provided."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/recommendations/1/approve")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_allows_with_correct_key():
+    """Protected endpoint accepts request with correct X-API-Key header."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post(
+            "/api/recommendations/999/approve",
+            headers={"X-API-Key": "test-secret-key-123"},
+        )
+        assert resp.status_code != 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_no_auth_when_empty():
+    """When API_KEY is empty, endpoints are open (dev mode)."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = ""
+        client = TestClient(app)
+        resp = client.post("/api/recommendations/999/approve")
+        assert resp.status_code != 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_settings_put():
+    """PUT /profile/settings is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.put("/api/profile/settings", json={"investor_profile_target": "moderate"})
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_decision():
+    """POST /recommendations/{id}/decision is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/recommendations/1/decision", json={"decision": "approved"})
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_analysis_run():
+    """POST /analysis/run is protected by API key (token/cost abuse vector)."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/analysis/run")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_push_test():
+    """POST /push/test is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/push/test")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_blocks_instruments_refresh():
+    """POST /instruments/refresh is protected by API key."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/instruments/refresh")
+        assert resp.status_code == 403
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_allows_analysis_run_with_correct_key():
+    """POST /analysis/run works with correct X-API-Key header."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/analysis/run", headers={"X-API-Key": "test-secret-key-123"})
+        assert resp.status_code == 200
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_allows_push_test_with_correct_key():
+    """POST /push/test works with correct X-API-Key header."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/push/test", headers={"X-API-Key": "test-secret-key-123"})
+        assert resp.status_code == 200
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_allows_instruments_refresh_with_correct_key():
+    """POST /instruments/refresh works with correct X-API-Key header."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = "test-secret-key-123"
+        client = TestClient(app)
+        resp = client.post("/api/instruments/refresh", headers={"X-API-Key": "test-secret-key-123"})
+        assert resp.status_code == 200
+    finally:
+        settings.api_key = original
+
+
+def test_api_key_empty_keeps_new_endpoints_open():
+    """With API_KEY empty, /analysis/run, /push/test and /instruments/refresh stay open."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    original = settings.api_key
+    try:
+        settings.api_key = ""
+        client = TestClient(app)
+        for path in ("/api/analysis/run", "/api/push/test", "/api/instruments/refresh"):
+            resp = client.post(path)
+            assert resp.status_code != 403, f"{path} returned 403 with empty API_KEY"
+    finally:
+        settings.api_key = original
+
+
+# ───────────────────────────────────────────────────────────────────
+# Section 17 — Scheduler observability
+# ───────────────────────────────────────────────────────────────────
+
+
+def test_scheduler_status_endpoint():
+    """GET /scheduler/status returns scheduler state."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    resp = client.get("/api/scheduler/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "running" in data
+    assert "phase" in data
+    assert "last_run_at" in data
+    assert "total_runs" in data
+    assert "jobs" in data
+
+
+def test_scheduler_state_updates_after_ingestion():
+    """Scheduler state updates after scheduled_ingestion runs."""
+    from app.scheduler.jobs import scheduled_ingestion, _scheduler_state
+
+    before_runs = _scheduler_state["total_runs"]
+    scheduled_ingestion()
+    assert _scheduler_state["total_runs"] == before_runs + 1
+    assert _scheduler_state["last_status"] == "ok"
+    assert _scheduler_state["last_source"] == "ingestion"
+    assert _scheduler_state["last_run_at"] is not None
+
+
+# ───────────────────────────────────────────────────────────────────
+# Section 18 — CORS configuration
+# ───────────────────────────────────────────────────────────────────
+
+
+def test_cors_origins_from_config():
+    """CORS origins are read from settings.cors_origins."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    assert hasattr(settings, "cors_origins")
+
+
+# ───────────────────────────────────────────────────────────────────
+# Section 19 — Web push str/bytes serialization + removal policy
+# ───────────────────────────────────────────────────────────────────
+
+
+def _gen_raw_vapid_key() -> str:
+    """Generate a valid raw VAPID private key str (as stored in .env)."""
+    import base64
+    import os as _os
+    return base64.urlsafe_b64encode(_os.urandom(32)).rstrip(b"=").decode("ascii")
+
+
+def _vapid_settings(private_key: str):
+    """Context manager: temporarily set VAPID keys on the settings singleton."""
+    from contextlib import contextmanager
+    from app.core.config import get_settings
+
+    @contextmanager
+    def _ctx():
+        settings = get_settings()
+        orig_priv, orig_pub, orig_email = (
+            settings.vapid_private_key, settings.vapid_public_key, settings.vapid_contact_email
+        )
+        try:
+            settings.vapid_private_key = private_key
+            settings.vapid_public_key = "test-public-key"
+            settings.vapid_contact_email = "test@example.com"
+            yield settings
+        finally:
+            settings.vapid_private_key = orig_priv
+            settings.vapid_public_key = orig_pub
+            settings.vapid_contact_email = orig_email
+
+    return _ctx()
+
+
+def test_to_str_and_to_bytes_helpers():
+    """_to_str decodes bytes; _to_bytes encodes str; both pass through."""
+    from app.notifications.dispatcher import _to_bytes, _to_str
+
+    assert _to_str(b"vapid t=abc") == "vapid t=abc"
+    assert _to_str("vapid t=abc") == "vapid t=abc"
+    assert _to_bytes("key-material") == b"key-material"
+    assert _to_bytes(b"key-material") == b"key-material"
+
+
+def test_web_push_fallback_str_key_no_type_error():
+    """REGRESSION (Railway prod bug): fallback with a str VAPID key from .env
+    must not raise "can only concatenate str (not bytes) to str".
+
+    py_vapid's Vapid.from_raw/b64urldecode require bytes; the fallback passed
+    the .env str directly. Uses the REAL py_vapid with pywebpush forced absent.
+    """
+    import sys
+    from unittest import mock
+    from app.notifications.dispatcher import _send_single_web_push
+
+    pytest.importorskip("py_vapid")
+
+    fake_resp = mock.Mock(status_code=201)
+    with _vapid_settings(_gen_raw_vapid_key()):
+        with mock.patch.dict(sys.modules, {"pywebpush": None}), \
+             mock.patch("app.notifications.dispatcher.httpx.post", return_value=fake_resp) as mock_post:
+            result = _send_single_web_push(
+                endpoint="https://fcm.googleapis.com/fcm/send/test-token",
+                p256dh="BTestP256dh",
+                auth="TestAuth",
+                payload={"title": "t", "body": "b"},
+            )
+
+    assert result == "sent"
+    # Headers must be str (bytes from py_vapid.sign get normalized)
+    _, kwargs = mock_post.call_args
+    for key, value in kwargs["headers"].items():
+        assert isinstance(value, str), f"header {key} is {type(value)}, expected str"
+
+
+def test_web_push_fallback_bytes_headers_normalized():
+    """If py_vapid.sign returns bytes header values, they are sent as str."""
+    import sys
+    from unittest import mock
+    from app.notifications.dispatcher import _send_single_web_push
+
+    fake_vapid = mock.Mock()
+    fake_vapid.sign.return_value = {
+        "Authorization": b"vapid t=bytes-token, k=bytes-key",
+        "Crypto-Key": b"p256ecdsa=bytes-crypto",
+    }
+    fake_module = mock.Mock()
+    fake_module.Vapid.from_raw = mock.Mock(return_value=fake_vapid)
+    fake_resp = mock.Mock(status_code=201)
+
+    with _vapid_settings(_gen_raw_vapid_key()):
+        with mock.patch.dict(sys.modules, {"pywebpush": None, "py_vapid": fake_module}), \
+             mock.patch("app.notifications.dispatcher.httpx.post", return_value=fake_resp) as mock_post:
+            result = _send_single_web_push(
+                endpoint="https://fcm.googleapis.com/fcm/send/test-token",
+                p256dh="BTestP256dh",
+                auth="TestAuth",
+                payload={"title": "t"},
+            )
+
+    assert result == "sent"
+    # from_raw must receive bytes even though settings hold a str
+    (raw_arg,), _ = fake_module.Vapid.from_raw.call_args
+    assert isinstance(raw_arg, bytes)
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"]["Authorization"] == "vapid t=bytes-token, k=bytes-key"
+    assert kwargs["headers"]["Crypto-Key"] == "p256ecdsa=bytes-crypto"
+
+
+def test_send_single_web_push_gone_on_410():
+    """Provider 410 Gone via pywebpush → status 'gone' (caller may remove)."""
+    from unittest import mock
+    from app.notifications.dispatcher import _send_single_web_push
+
+    pywebpush = pytest.importorskip("pywebpush")
+
+    exc = pywebpush.WebPushException("gone", response=mock.Mock(status_code=410))
+    with _vapid_settings(_gen_raw_vapid_key()):
+        with mock.patch("pywebpush.webpush", side_effect=exc):
+            result = _send_single_web_push(
+                endpoint="https://fcm.googleapis.com/fcm/send/expired",
+                p256dh="BTest", auth="TestAuth", payload={"title": "t"},
+            )
+    assert result == "gone"
+
+
+def test_send_single_web_push_internal_error_is_failed_not_gone():
+    """Internal serialization bug (TypeError) → 'failed', never 'gone'."""
+    from unittest import mock
+    from app.notifications.dispatcher import _send_single_web_push
+
+    pytest.importorskip("pywebpush")
+
+    type_err = TypeError('can only concatenate str (not "bytes") to str')
+    with _vapid_settings(_gen_raw_vapid_key()):
+        with mock.patch("pywebpush.webpush", side_effect=type_err):
+            result = _send_single_web_push(
+                endpoint="https://fcm.googleapis.com/fcm/send/x",
+                p256dh="BTest", auth="TestAuth", payload={"title": "t"},
+            )
+    assert result == "failed"
+
+
+def test_send_web_push_to_all_keeps_subscription_on_internal_error(db):
+    """Internal/transient failure must NOT delete the subscription."""
+    from unittest import mock
+    from app.notifications.dispatcher import send_web_push_to_all
+
+    db.add(PushSubscription(endpoint="https://fcm.googleapis.com/fcm/send/keep-me",
+                            p256dh="BTest", auth="TestAuth"))
+    db.commit()
+
+    with _vapid_settings(_gen_raw_vapid_key()):
+        with mock.patch("app.notifications.dispatcher._send_single_web_push", return_value="failed"):
+            result = send_web_push_to_all(db, title="T", body="B")
+
+    assert result["failed"] == 1
+    assert result["removed"] == 0
+    assert db.query(PushSubscription).count() == 1
+
+
+def test_send_web_push_to_all_removes_gone_subscription(db):
+    """Provider-confirmed 404/410 → subscription removed (removed=1)."""
+    from unittest import mock
+    from app.notifications.dispatcher import send_web_push_to_all
+
+    db.add(PushSubscription(endpoint="https://fcm.googleapis.com/fcm/send/expired",
+                            p256dh="BTest", auth="TestAuth"))
+    db.commit()
+
+    with _vapid_settings(_gen_raw_vapid_key()):
+        with mock.patch("app.notifications.dispatcher._send_single_web_push", return_value="gone"):
+            result = send_web_push_to_all(db, title="T", body="B")
+
+    assert result["failed"] == 1
+    assert result["removed"] == 1
+    assert db.query(PushSubscription).count() == 0
+
+
+def test_push_test_endpoint_success_keeps_fcm_subscription():
+    """POST /api/push/test with a valid FCM subscription and successful send:
+    sent>=1, removed=0, and the subscription stays registered."""
+    import uuid
+    from unittest import mock
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.db.session import SessionLocal
+
+    pytest.importorskip("pywebpush")
+
+    endpoint = f"https://fcm.googleapis.com/fcm/send/valid-{uuid.uuid4().hex}"
+    client = TestClient(app)
+    sub_resp = client.post("/api/push/subscribe", json={
+        "endpoint": endpoint,
+        "keys": {"p256dh": "BTestP256dh", "auth": "TestAuth"},
+    })
+    assert sub_resp.status_code == 200
+    sub_id = sub_resp.json()["id"]
+
+    try:
+        with _vapid_settings(_gen_raw_vapid_key()):
+            with mock.patch("pywebpush.webpush", return_value=mock.Mock(status_code=201)):
+                resp = client.post("/api/push/test")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sent"] >= 1
+        assert data["removed"] == 0
+
+        real_db = SessionLocal()
+        try:
+            still_there = real_db.query(PushSubscription).filter(
+                PushSubscription.endpoint == endpoint).first()
+            assert still_there is not None, "successful send must not delete the subscription"
+        finally:
+            real_db.close()
+    finally:
+        cleanup_db = SessionLocal()
+        try:
+            leftover = cleanup_db.query(PushSubscription).filter(
+                PushSubscription.id == sub_id).first()
+            if leftover:
+                cleanup_db.delete(leftover)
+                cleanup_db.commit()
+        finally:
+            cleanup_db.close()

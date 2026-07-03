@@ -1,11 +1,23 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from sqlalchemy import desc
 from sqlalchemy.orm import Session, joinedload
+import secrets as _secrets
 
 from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.core.config import get_settings
 from app.db.session import get_db
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(key: str | None = Security(_api_key_header)):
+    settings = get_settings()
+    if not settings.api_key:
+        return
+    if not key or not _secrets.compare_digest(key, settings.api_key):
+        raise HTTPException(403, "Invalid or missing API key")
 from app.market.discovery import get_catalog_instruments, get_eligible_universe_symbols, refresh_instrument_catalog
 from app.models.models import MarketEvent, NewsEvent, PortfolioSnapshot, PushSubscription, Recommendation, UserDecision, UserSettings
 from app.news.ingestion import get_active_alerts, get_recent_clusters, get_recent_events, run_ingestion
@@ -27,6 +39,12 @@ def health():
     return {"status": "ok"}
 
 
+@router.get("/scheduler/status")
+def scheduler_status():
+    from app.scheduler.jobs import get_scheduler_state
+    return get_scheduler_state()
+
+
 @router.get("/broker/ping")
 def broker_ping():
     settings = get_settings()
@@ -35,7 +53,7 @@ def broker_ping():
 
 
 @router.post("/analysis/run")
-def run_manual_analysis(db: Session = Depends(get_db)):
+def run_manual_analysis(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     cycle_result = run_cycle(db, source="manual")
     # Persist notification audit trail (best-effort, does not affect cycle result)
     try:
@@ -207,7 +225,7 @@ def history(db: Session = Depends(get_db)):
 
 
 @router.post("/recommendations/{recommendation_id}/decision")
-def recommendation_decision(recommendation_id: int, payload: DecisionIn, db: Session = Depends(get_db)):
+def recommendation_decision(recommendation_id: int, payload: DecisionIn, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Unified decision endpoint — delegates to approve_and_execute or reject_recommendation.
 
     This ensures there is exactly ONE semantic path for each decision type:
@@ -368,7 +386,7 @@ def get_profile_settings(db: Session = Depends(get_db)):
 
 
 @router.put("/profile/settings")
-def update_profile_settings(payload: ProfileSettingsIn, db: Session = Depends(get_db)):
+def update_profile_settings(payload: ProfileSettingsIn, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     settings = get_settings()
 
     if payload.investor_profile_target is not None:
@@ -411,7 +429,7 @@ class ApproveIn(BaseModel):
 
 
 @router.post("/recommendations/{recommendation_id}/approve")
-def approve_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = None, db: Session = Depends(get_db)):
+def approve_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = None, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Approve a recommendation and trigger order execution via broker.
 
     This is THE ONLY way to trigger real execution. Scheduler NEVER executes orders.
@@ -424,7 +442,7 @@ def approve_recommendation_endpoint(recommendation_id: int, payload: ApproveIn =
 
 
 @router.post("/recommendations/{recommendation_id}/reject")
-def reject_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = None, db: Session = Depends(get_db)):
+def reject_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = None, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Reject a recommendation. No orders are placed."""
     note = payload.note if payload else ""
     result = reject_recommendation(db, recommendation_id, note=note)
@@ -477,7 +495,7 @@ def get_notification_settings(db: Session = Depends(get_db)):
 
 
 @router.put("/notifications/settings")
-def update_notification_settings(payload: NotificationSettingsIn, db: Session = Depends(get_db)):
+def update_notification_settings(payload: NotificationSettingsIn, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     settings = get_settings()
 
     if payload.notification_enabled is not None:
@@ -548,7 +566,7 @@ def get_vapid_public_key():
 
 
 @router.post("/push/test")
-def push_test(db: Session = Depends(get_db)):
+def push_test(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Send a test push notification to all active subscriptions."""
     from app.notifications.dispatcher import send_web_push_to_all
     result = send_web_push_to_all(
@@ -567,7 +585,7 @@ def push_test(db: Session = Depends(get_db)):
 
 
 @router.post("/debug/simulate-alert")
-def simulate_alert(db: Session = Depends(get_db)):
+def simulate_alert(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Simulate a new_actionable alert to test full notification pipeline.
 
     Creates a temporary recommendation with a fake actionable item,
@@ -664,7 +682,7 @@ def get_instruments_catalog(
 
 
 @router.post("/instruments/refresh")
-def refresh_instruments(db: Session = Depends(get_db)):
+def refresh_instruments(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Refresh the instrument catalog from IOL or static seed."""
     result = refresh_instrument_catalog(db)
     return result

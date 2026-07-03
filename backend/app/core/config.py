@@ -83,6 +83,12 @@ class Settings(BaseSettings):
     # Debug endpoints (POST /debug/simulate-alert). Disable in production.
     debug_endpoints_enabled: bool = True
 
+    # API key — protects approve/reject/debug/settings endpoints. Empty = no auth.
+    api_key: str = ""
+
+    # CORS — comma-separated origins, or "*" for dev.
+    cors_origins: str = "*"
+
     whitelist_assets: List[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "SPY", "QQQ", "AL30", "BND", "CASH"]
     )

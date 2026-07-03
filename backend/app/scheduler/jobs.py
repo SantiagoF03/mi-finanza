@@ -22,6 +22,31 @@ from app.services.orchestrator import run_cycle
 
 scheduler = BackgroundScheduler(job_defaults={"coalesce": True, "max_instances": 1})
 
+_scheduler_state: dict = {
+    "last_run_at": None,
+    "last_status": None,
+    "last_source": None,
+    "total_runs": 0,
+    "total_errors": 0,
+}
+
+
+def get_scheduler_state() -> dict:
+    next_jobs = []
+    if scheduler.running:
+        for job in scheduler.get_jobs():
+            next_run = job.next_run_time
+            next_jobs.append({
+                "id": job.id,
+                "next_run_time": next_run.isoformat() if next_run else None,
+            })
+    return {
+        **_scheduler_state,
+        "running": scheduler.running,
+        "phase": _market_phase(),
+        "jobs": next_jobs,
+    }
+
 
 def _market_phase(now_utc: datetime | None = None) -> str:
     """Determine current market phase: premarket, open, postmarket, off."""
@@ -52,7 +77,6 @@ def scheduled_ingestion():
     try:
         run_ingestion(db, source_label="scheduler")
 
-        # Only run full cycle if there are trigger_recalc events pending
         pending = get_pending_recalc_events(db)
         if pending:
             cycle_result = run_cycle(db, source="scheduler_event")
@@ -64,6 +88,15 @@ def scheduled_ingestion():
 
             _notify_events(db, pending)
             _notify_recommendation_change(db, cycle_result)
+        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+        _scheduler_state["last_status"] = "ok"
+        _scheduler_state["last_source"] = "ingestion"
+        _scheduler_state["total_runs"] += 1
+    except Exception as exc:
+        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+        _scheduler_state["last_status"] = f"error: {exc}"
+        _scheduler_state["last_source"] = "ingestion"
+        _scheduler_state["total_errors"] += 1
     finally:
         db.close()
 
@@ -90,6 +123,15 @@ def scheduled_full_cycle():
         if should_run:
             cycle_result = run_cycle(db, source="scheduler")
             _notify_recommendation_change(db, cycle_result)
+        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+        _scheduler_state["last_status"] = "ok"
+        _scheduler_state["last_source"] = "full_cycle"
+        _scheduler_state["total_runs"] += 1
+    except Exception as exc:
+        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+        _scheduler_state["last_status"] = f"error: {exc}"
+        _scheduler_state["last_source"] = "full_cycle"
+        _scheduler_state["total_errors"] += 1
     finally:
         db.close()
 

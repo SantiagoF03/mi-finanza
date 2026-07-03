@@ -4,14 +4,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
+from app.core.config import get_settings
 from app.db.session import Base, engine
 from app.scheduler.jobs import start_scheduler
 
 app = FastAPI(title="Mi Finanza MVP")
 
+_settings = get_settings()
+_origins = [o.strip() for o in _settings.cors_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
