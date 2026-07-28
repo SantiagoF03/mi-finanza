@@ -164,6 +164,8 @@ export default function App() {
   const [executions, setExecutions] = useState([])
   const [error, setError] = useState('')
   const [currentInfo, setCurrentInfo] = useState('')
+  const [executionPreview, setExecutionPreview] = useState(null)
+  const [previewError, setPreviewError] = useState('')
   const [cooldownMessage, setCooldownMessage] = useState('')
   const [cooldownRemaining, setCooldownRemaining] = useState(0)
   const [tab, setTab] = useState('dashboard')
@@ -184,6 +186,34 @@ export default function App() {
     }, 1000)
     return () => clearInterval(timer)
   }, [cooldownRemaining])
+
+  const loadExecutionPreview = async (recommendationId) => {
+    if (!recommendationId) {
+      setExecutionPreview(null)
+      setPreviewError('')
+      return
+    }
+
+    try {
+      const res = await fetch(`${API}/recommendations/${recommendationId}/execution-preview`, {
+        headers: authHeaders(),
+      })
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        setExecutionPreview(null)
+        setPreviewError(err.detail || 'No se pudo cargar la vista previa de ejecución.')
+        return
+      }
+
+      const data = await res.json()
+      setExecutionPreview(data)
+      setPreviewError('')
+    } catch {
+      setExecutionPreview(null)
+      setPreviewError('No se pudo conectar para cargar la vista previa de ejecución.')
+    }
+  }
 
   const load = async () => {
     setError('')
@@ -213,8 +243,18 @@ export default function App() {
       if (cRes.status === 404) {
         setCurrent(null)
         setCurrentInfo('No hay recomendación abierta actualmente.')
+        setExecutionPreview(null)
+        setPreviewError('')
       } else if (cRes.ok) {
-        setCurrent(await cRes.json())
+        const currentPayload = await cRes.json()
+        setCurrent(currentPayload)
+
+        if (currentPayload?.id && (currentPayload.status === 'pending' || currentPayload.status === 'blocked')) {
+          await loadExecutionPreview(currentPayload.id)
+        } else {
+          setExecutionPreview(null)
+          setPreviewError('')
+        }
       } else {
         throw new Error('backend_unavailable')
       }
@@ -229,6 +269,8 @@ export default function App() {
       setAlerts([])
       setExecutions([])
       setCurrentInfo('')
+      setExecutionPreview(null)
+      setPreviewError('')
     }
   }
 
@@ -278,6 +320,17 @@ export default function App() {
 
   const approveRecommendation = async () => {
     if (!current?.id) return
+
+    if (!executionPreview?.order_execution_enabled) {
+      setError('Ejecución real bloqueada por safety lock. No se envió ninguna orden.')
+      return
+    }
+
+    if (!executionPreview?.would_execute) {
+      setError('La vista previa indica que no debe ejecutarse ninguna orden.')
+      return
+    }
+
     setLoading(true)
     try {
       const resp = await fetch(`${API}/recommendations/${current.id}/approve`, {
@@ -310,6 +363,9 @@ export default function App() {
       setError('Error al rechazar.')
     }
   }
+
+  const executionEnabled = executionPreview?.order_execution_enabled === true
+  const canApproveReal = executionEnabled && executionPreview?.would_execute === true
 
   const tabs = [
     { id: 'dashboard', label: 'Inicio' },
@@ -456,10 +512,55 @@ export default function App() {
                 ))}
               </ul>
 
+              {previewError && <div className="info-box info-blocked">{previewError}</div>}
+
+              {executionPreview && (
+                <div className="detail-panel">
+                  <h3>Vista previa de ejecución</h3>
+                  <p><strong>Broker:</strong> {executionPreview.broker_mode}</p>
+                  <p>
+                    <strong>Safety lock:</strong>{' '}
+                    {executionPreview.order_execution_enabled ? 'Ejecución habilitada' : 'Ejecución bloqueada'}
+                  </p>
+                  <p><strong>Dry run:</strong> {String(executionPreview.dry_run)}</p>
+                  <p><strong>Ejecutaría:</strong> {String(executionPreview.would_execute)}</p>
+                  <p><strong>Órdenes preview:</strong> {(executionPreview.orders_preview || []).length}</p>
+
+                  {(executionPreview.orders_preview || []).map((o, idx) => (
+                    <div key={`${o.symbol}-${idx}`} className="opportunity-item">
+                      <strong>{o.symbol}</strong> — {o.side}
+                      <div style={{ fontSize: '0.85em' }}>
+                        Cantidad planificada: {o.quantity_planned} · Cambio objetivo: {(Number(o.target_change_pct || 0) * 100).toFixed(2)}%
+                      </div>
+                      <div style={{ fontSize: '0.85em' }}>
+                        Portfolio usado: {Number(o.portfolio_value_used || 0).toLocaleString()} · Posición usada: {Number(o.position_value_used || 0).toLocaleString()}
+                      </div>
+                      <div style={{ fontSize: '0.85em' }}>
+                        Precio ref snapshot: {Number(o.snapshot_price_ref || 0).toLocaleString()} · Válida: {o.valid ? 'sí' : 'no'}
+                      </div>
+                      {o.blocked_reason && (
+                        <div className="info-box info-blocked">{o.blocked_reason}</div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {executionPreview && !executionPreview.order_execution_enabled && (
+                <div className="info-box info-blocked">
+                  Ejecución real bloqueada por safety lock. La app puede analizar y previsualizar, pero no enviar órdenes.
+                </div>
+              )}
+
               {(current.status === 'pending' || current.status === 'blocked') && (
                 <div className="actions">
-                  <button onClick={approveRecommendation} className="btn-success" disabled={loading}>
-                    {loading ? 'Procesando...' : 'Aprobar y Ejecutar'}
+                  <button
+                    onClick={approveRecommendation}
+                    className="btn-success"
+                    disabled={loading || !canApproveReal}
+                    title={!executionEnabled ? 'Ejecución real bloqueada por safety lock' : 'Requiere vista previa válida'}
+                  >
+                    {loading ? 'Procesando...' : executionEnabled ? 'Aprobar y Ejecutar' : 'Ejecución bloqueada'}
                   </button>
                   <button onClick={rejectRecommendation} className="btn-danger" disabled={loading}>
                     Rechazar
