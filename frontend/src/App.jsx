@@ -166,6 +166,11 @@ export default function App() {
   const [currentInfo, setCurrentInfo] = useState('')
   const [executionPreview, setExecutionPreview] = useState(null)
   const [previewError, setPreviewError] = useState('')
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [confirmText, setConfirmText] = useState('')
+  // Execution credential: React state only. Never localStorage/sessionStorage,
+  // never VITE_*, never logged. Cleared on close and after submit.
+  const [executionKeyInput, setExecutionKeyInput] = useState('')
   const [cooldownMessage, setCooldownMessage] = useState('')
   const [cooldownRemaining, setCooldownRemaining] = useState(0)
   const [tab, setTab] = useState('dashboard')
@@ -318,16 +323,53 @@ export default function App() {
     load()
   }
 
+  const closeConfirm = () => {
+    setShowConfirm(false)
+    setConfirmText('')
+    setExecutionKeyInput('')
+  }
+
+  const openConfirm = () => {
+    if (!executionPreview?.can_submit_approval) {
+      setError('La aprobación no está disponible según el preview actual.')
+      return
+    }
+    setError('')
+    setShowConfirm(true)
+  }
+
   const approveRecommendation = async () => {
     if (!current?.id) return
 
-    if (!executionPreview?.order_execution_enabled) {
-      setError('Ejecución real bloqueada por safety lock. No se envió ninguna orden.')
+    // Frontend guards — the backend remains the final authority.
+    if (!executionPreview) {
+      setError('No hay vista previa de ejecución cargada.')
       return
     }
-
-    if (!executionPreview?.would_execute) {
-      setError('La vista previa indica que no debe ejecutarse ninguna orden.')
+    if (executionPreview.can_submit_approval !== true) {
+      setError('La aprobación no está disponible según el preview actual.')
+      return
+    }
+    if (!executionPreview.preview_hash) {
+      setError('El preview no está firmado. No se puede aprobar.')
+      return
+    }
+    if (executionPreview.expires_at && new Date(executionPreview.expires_at) <= new Date()) {
+      setError('El preview venció. Refrescá para generar uno nuevo.')
+      return
+    }
+    const orders = executionPreview.orders_preview || []
+    if (!orders.length || orders.some((o) => !o.valid)) {
+      setError('No hay órdenes válidas para ejecutar.')
+      return
+    }
+    const requiredPhrase = `EJECUTAR RECOMENDACION ${current.id}`
+    if (confirmText.trim() !== requiredPhrase) {
+      setError(`Frase de confirmación incorrecta. Escribí exactamente: ${requiredPhrase}`)
+      return
+    }
+    if (!executionKeyInput) {
+      setError('Ingresá la credencial de ejecución.')
       return
     }
 
@@ -335,8 +377,16 @@ export default function App() {
     try {
       const resp = await fetch(`${API}/recommendations/${current.id}/approve`, {
         method: 'POST',
-        headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ note: '' }),
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          'X-Execution-Key': executionKeyInput,
+        }),
+        body: JSON.stringify({
+          note: '',
+          preview_hash: executionPreview.preview_hash,
+          preview_generated_at: executionPreview.generated_at,
+          confirmation_text: confirmText.trim(),
+        }),
       })
       if (!resp.ok) {
         const err = await resp.json().catch(() => ({}))
@@ -347,6 +397,7 @@ export default function App() {
       setError('Error al aprobar la recomendación.')
     } finally {
       setLoading(false)
+      closeConfirm()
     }
   }
 
@@ -365,7 +416,24 @@ export default function App() {
   }
 
   const executionEnabled = executionPreview?.order_execution_enabled === true
-  const canApproveReal = executionEnabled && executionPreview?.would_execute === true
+  const canApproveReal = executionPreview?.can_submit_approval === true
+
+  const BLOCKING_LABELS = {
+    execution_locked: 'ejecución bloqueada por safety lock',
+    execution_admin_key_not_configured: 'credencial de ejecución no configurada',
+    preview_signing_not_configured: 'firma de preview no configurada',
+    execution_limits_not_configured: 'límites de ejecución no configurados',
+    recommendation_not_pending: 'la recomendación no está pendiente',
+    recommendation_stale: 'la recomendación excede la antigüedad máxima',
+    recommendation_superseded: 'la recomendación fue reemplazada',
+    snapshot_missing: 'no hay snapshot de portfolio',
+    invalid_order: 'hay órdenes inválidas',
+    order_limit_exceeded: 'límite por orden excedido',
+    total_limit_exceeded: 'límite total excedido',
+    portfolio_pct_limit_exceeded: 'límite porcentual del portfolio excedido',
+    currency_mismatch: 'monedas incompatibles, no se convierte automáticamente',
+    already_executed: 'la recomendación ya fue ejecutada',
+  }
 
   const tabs = [
     { id: 'dashboard', label: 'Inicio' },
@@ -524,6 +592,13 @@ export default function App() {
                   </p>
                   <p><strong>Dry run:</strong> {String(executionPreview.dry_run)}</p>
                   <p><strong>Ejecutaría:</strong> {String(executionPreview.would_execute)}</p>
+                  {executionPreview.snapshot_id != null && (
+                    <p style={{ fontSize: '0.85em', color: '#888' }}>
+                      Snapshot #{executionPreview.snapshot_id}
+                      {executionPreview.generated_at && ` · Generado: ${new Date(executionPreview.generated_at).toLocaleString()}`}
+                      {executionPreview.expires_at && ` · Vence: ${new Date(executionPreview.expires_at).toLocaleString()}`}
+                    </p>
+                  )}
                   <p><strong>Órdenes preview:</strong> {(executionPreview.orders_preview || []).length}</p>
 
                   {(executionPreview.orders_preview || []).map((o, idx) => (
@@ -536,13 +611,31 @@ export default function App() {
                         Portfolio usado: {Number(o.portfolio_value_used || 0).toLocaleString()} · Posición usada: {Number(o.position_value_used || 0).toLocaleString()}
                       </div>
                       <div style={{ fontSize: '0.85em' }}>
-                        Precio ref snapshot: {Number(o.snapshot_price_ref || 0).toLocaleString()} · Válida: {o.valid ? 'sí' : 'no'}
+                        Precio ref snapshot: {Number(o.snapshot_price_ref || 0).toLocaleString()} · Monto estimado: {Number(o.estimated_notional || 0).toLocaleString()} · % portfolio: {(Number(o.portfolio_pct || 0) * 100).toFixed(2)}% · Válida: {o.valid ? 'sí' : 'no'}
                       </div>
                       {o.blocked_reason && (
                         <div className="info-box info-blocked">{o.blocked_reason}</div>
                       )}
                     </div>
                   ))}
+
+                  {executionPreview.limits && (
+                    <p style={{ fontSize: '0.85em', color: '#888' }}>
+                      Límites: por orden {Number(executionPreview.limits.max_order_value || 0).toLocaleString()} · total {Number(executionPreview.limits.max_total_value || 0).toLocaleString()} · % portfolio {(Number(executionPreview.limits.max_portfolio_pct || 0) * 100).toFixed(2)}%
+                      {' '}({executionPreview.limits.configured ? 'configurados' : 'no configurados'}) · Total estimado: {Number(executionPreview.limits.total_estimated_notional || 0).toLocaleString()}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {executionPreview && (executionPreview.blocking_reasons || []).length > 0 && (
+                <div className="info-box info-blocked">
+                  La aprobación no está disponible:
+                  <ul style={{ margin: '4px 0 0 16px' }}>
+                    {executionPreview.blocking_reasons.map((code) => (
+                      <li key={code}>{BLOCKING_LABELS[code] || code}</li>
+                    ))}
+                  </ul>
                 </div>
               )}
 
@@ -555,16 +648,66 @@ export default function App() {
               {(current.status === 'pending' || current.status === 'blocked') && (
                 <div className="actions">
                   <button
-                    onClick={approveRecommendation}
+                    onClick={openConfirm}
                     className="btn-success"
                     disabled={loading || !canApproveReal}
-                    title={!executionEnabled ? 'Ejecución real bloqueada por safety lock' : 'Requiere vista previa válida'}
+                    title={!canApproveReal ? 'Aprobación no disponible según el preview' : 'Abre la confirmación de ejecución'}
                   >
-                    {loading ? 'Procesando...' : executionEnabled ? 'Aprobar y Ejecutar' : 'Ejecución bloqueada'}
+                    {loading ? 'Procesando...' : canApproveReal ? 'Aprobar y Ejecutar' : 'Ejecución bloqueada'}
                   </button>
                   <button onClick={rejectRecommendation} className="btn-danger" disabled={loading}>
                     Rechazar
                   </button>
+                </div>
+              )}
+
+              {showConfirm && executionPreview && canApproveReal && (
+                <div className="detail-panel" style={{ border: '2px solid var(--danger, #c62828)', marginTop: 8 }}>
+                  <h3>Confirmar ejecución real</h3>
+                  <p style={{ fontSize: '0.9em' }}>
+                    Recomendación #{current.id} · Broker: {executionPreview.broker_mode} · Snapshot #{executionPreview.snapshot_id}
+                  </p>
+                  <p style={{ fontSize: '0.85em', color: '#888' }}>
+                    Generado: {executionPreview.generated_at && new Date(executionPreview.generated_at).toLocaleString()}
+                    {' '}· Vence: {executionPreview.expires_at && new Date(executionPreview.expires_at).toLocaleString()}
+                    {' '}· Hash: {(executionPreview.preview_hash || '').slice(0, 12)}…
+                  </p>
+                  <ul style={{ fontSize: '0.9em' }}>
+                    {(executionPreview.orders_preview || []).map((o, idx) => (
+                      <li key={`confirm-${o.symbol}-${idx}`}>
+                        <strong>{o.symbol}</strong> {o.side} · cantidad {o.quantity_planned} · precio ref {Number(o.snapshot_price_ref || 0).toLocaleString()} · monto {Number(o.estimated_notional || 0).toLocaleString()} · {(Number(o.portfolio_pct || 0) * 100).toFixed(2)}% del portfolio
+                      </li>
+                    ))}
+                  </ul>
+                  {executionPreview.limits && (
+                    <p style={{ fontSize: '0.85em', color: '#888' }}>
+                      Límites aplicados: por orden {Number(executionPreview.limits.max_order_value || 0).toLocaleString()} · total {Number(executionPreview.limits.max_total_value || 0).toLocaleString()} · % {(Number(executionPreview.limits.max_portfolio_pct || 0) * 100).toFixed(2)}%
+                    </p>
+                  )}
+                  <p style={{ fontSize: '0.9em' }}>
+                    Para confirmar, escribí exactamente: <code>EJECUTAR RECOMENDACION {current.id}</code>
+                  </p>
+                  <input
+                    type="text"
+                    value={confirmText}
+                    onChange={(e) => setConfirmText(e.target.value)}
+                    placeholder={`EJECUTAR RECOMENDACION ${current.id}`}
+                    style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }}
+                  />
+                  <input
+                    type="password"
+                    value={executionKeyInput}
+                    onChange={(e) => setExecutionKeyInput(e.target.value)}
+                    placeholder="Credencial de ejecución"
+                    autoComplete="off"
+                    style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }}
+                  />
+                  <div className="actions">
+                    <button onClick={approveRecommendation} className="btn-danger" disabled={loading}>
+                      {loading ? 'Ejecutando...' : 'Confirmar ejecución'}
+                    </button>
+                    <button onClick={closeConfirm} disabled={loading}>Cancelar</button>
+                  </div>
                 </div>
               )}
 
