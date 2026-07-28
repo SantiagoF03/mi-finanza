@@ -10,7 +10,6 @@ class Settings(BaseSettings):
     environment: str = "dev"
     database_url: str = "sqlite:///./mi_finanza.db"
     broker_mode: str = "mock"
-    order_execution_enabled: bool = False
     iol_api_base: str = "https://api.invertironline.com"
     iol_username: str = ""
     iol_password: str = ""
@@ -87,8 +86,26 @@ class Settings(BaseSettings):
     api_key: str = ""
 
     # Safety lock — with broker_mode=real, approve does NOT send orders unless
-    # this is explicitly true. Fail closed: default false.
+    # this is explicitly true. Fail closed: default false. Mock broker is not
+    # gated by this lock (it never touches IOL), so tests/staging can rehearse
+    # the approve flow safely.
     order_execution_enabled: bool = False
+
+    # --- Execution Authorization V1 (all fail-closed defaults) ---
+    # Secondary credential required to execute (X-Execution-Key header).
+    # Empty = real execution impossible.
+    execution_admin_key: str = ""
+    # HMAC-SHA256 secret for signing execution previews.
+    # Empty = previews unsigned = real execution impossible.
+    execution_preview_secret: str = ""
+    # How long a signed preview stays valid.
+    execution_preview_ttl_seconds: int = 300
+    # Recommendations older than this cannot be executed.
+    execution_max_recommendation_age_minutes: int = 60
+    # Hard limits. 0 means NOT CONFIGURED → real execution blocked (never "no limit").
+    execution_max_order_value: float = 0.0
+    execution_max_total_value: float = 0.0
+    execution_max_portfolio_pct: float = 0.0
 
     # CORS — comma-separated origins, or "*" for dev.
     cors_origins: str = "*"
@@ -108,6 +125,13 @@ class Settings(BaseSettings):
     def parse_csv_fields(cls, v):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
+        return v
+
+    @field_validator("execution_preview_ttl_seconds", "execution_max_recommendation_age_minutes")
+    @classmethod
+    def validate_positive_execution_windows(cls, v, info):
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be > 0")
         return v
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

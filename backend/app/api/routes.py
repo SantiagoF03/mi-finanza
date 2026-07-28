@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi import APIRouter, Depends, Header, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from sqlalchemy import desc
@@ -427,6 +427,9 @@ def update_profile_settings(payload: ProfileSettingsIn, db: Session = Depends(ge
 
 class ApproveIn(BaseModel):
     note: str = ""
+    preview_hash: str | None = None
+    preview_generated_at: str | None = None
+    confirmation_text: str | None = None
 
 
 @router.get("/recommendations/{recommendation_id}/execution-preview")
@@ -443,13 +446,31 @@ def execution_preview_endpoint(
 
 
 @router.post("/recommendations/{recommendation_id}/approve")
-def approve_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = None, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
+def approve_recommendation_endpoint(
+    recommendation_id: int,
+    payload: ApproveIn = None,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
     """Approve a recommendation and trigger order execution via broker.
 
-    This is THE ONLY way to trigger real execution. Scheduler NEVER executes orders.
+    This is THE ONLY way to trigger real execution. Scheduler NEVER executes
+    orders. For a real broker this additionally requires the Execution
+    Authorization V1 contract: X-Execution-Key header, signed non-expired
+    preview (preview_hash + preview_generated_at) and the exact confirmation
+    phrase. The execution key is never logged nor persisted.
     """
-    note = payload.note if payload else ""
-    result = approve_and_execute(db, recommendation_id, note=note)
+    payload = payload or ApproveIn()
+    result = approve_and_execute(
+        db,
+        recommendation_id,
+        note=payload.note,
+        execution_key=x_execution_key,
+        preview_hash=payload.preview_hash,
+        preview_generated_at=payload.preview_generated_at,
+        confirmation_text=payload.confirmation_text,
+    )
     if "error" in result:
         raise HTTPException(result.get("status_code", 400), result["error"])
     return result
