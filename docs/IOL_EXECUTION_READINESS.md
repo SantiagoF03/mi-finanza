@@ -81,9 +81,58 @@ EXECUTION_MAX_QUOTE_AGE_SECONDS=15
 EXECUTION_MAX_PRICE_DEVIATION_PCT=0   # 0 = bloqueado
 ```
 
+Alcance de ejecución (allowlist por instrumento, fail closed):
+
+```
+EXECUTION_SELL_ONLY=true
+EXECUTION_INSTRUMENT_POLICIES={}      # JSON; vacío = nada operable
+EXECUTION_REQUIRE_LIVE_POSITION_CHECK=true
+```
+
+`EXECUTION_INSTRUMENT_POLICIES` es un **JSON** que funciona como
+**allowlist**: un símbolo que aparece en una recomendación NO es operable
+hasta tener su política explícita. Estructura por símbolo (todos los campos
+obligatorios):
+
+```
+{"<SIMBOLO>": {
+  "asset_type": "...", "instrument_type": "...", "currency": "...",
+  "market": "<igual a IOL_ORDER_MARKET>",
+  "settlement": "<igual a IOL_ORDER_SETTLEMENT>",
+  "quantity_step": <>0, "max_quantity": <>0, "max_notional": <>0
+}}
+```
+
+`market`/`settlement` deben coincidir **exactamente** con la política global
+(`IOL_ORDER_MARKET` / `IOL_ORDER_SETTLEMENT`); si difieren se bloquea con
+`instrument_market_mismatch` / `instrument_settlement_mismatch` — nunca se
+elige uno en silencio. La identidad de la política debe coincidir además con
+la posición del snapshot y con la posición **real** verificada antes de
+enviar. Campos desconocidos invalidan la política (un typo no puede cambiar
+la semántica).
+
+Al inicio **solo se habilitarán ventas** de símbolos expresamente
+autorizados: con `EXECUTION_SELL_ONLY=true` toda compra queda bloqueada con
+`buy_execution_disabled` (no se convierte ni se ignora). Este repo no trae
+ninguna política activa ni símbolo autorizado por defecto.
+
+Guard de posición real: antes de cotizar, antes de marcar `submitting` y
+antes de cualquier POST, se relee la cartera (read-only, contrato público
+del broker) y se verifica que la posición exista, mantenga la identidad
+firmada y alcance la cantidad. Solo puede **bloquear**: nunca reduce ni
+aumenta la cantidad firmada. Sus fallos son definitivos previos al broker
+(`failed`, `quantity_sent=null`, sin POST), nunca conciliación incierta.
+
 Verificación rápida: `GET /api/broker/execution-readiness` (con X-API-Key)
-muestra ambiente, locks, qué falta configurar y los blocking reasons — sin
-exponer ningún secreto.
+muestra ambiente configurado vs efectivo, locks, sell-only, chequeo de
+posición, símbolos autorizados, qué falta configurar y los blocking
+reasons — sin exponer ningún secreto.
+
+> Ambiente efectivo: `IOL_USE_SANDBOX=true` (deprecado) hace que
+> `BROKER_MODE=real` opere como **sandbox**. Todas las decisiones (locks,
+> factory, firma del preview) usan el ambiente **efectivo**, no el
+> configurado. Las URLs de real y sandbox deben ser HTTPS, sin credenciales
+> embebidas, sin query ni fragment, y puerto 443.
 
 ## Checklist previo a considerar una orden real
 
@@ -100,6 +149,11 @@ exponer ningún secreto.
 - [ ] `tipoOrden=precioLimite` verificado (nunca precioMercado)
 - [ ] `preview_hash` verificado contra el preview revisado
 - [ ] Límites (`EXECUTION_MAX_*`) verificados con valores reales prudentes
+- [ ] `EXECUTION_INSTRUMENT_POLICIES` con SOLO los símbolos a operar, con
+      límites por símbolo prudentes y `market`/`settlement` coincidentes
+- [ ] `EXECUTION_SELL_ONLY=true` (las compras siguen fuera de alcance)
+- [ ] `EXECUTION_REQUIRE_LIVE_POSITION_CHECK=true`
+- [ ] `live_position_check` revisado en el audit de la orden sandbox
 - [ ] `EXECUTION_ADMIN_KEY` configurada (y solo en manos del operador)
 - [ ] Cola de conciliación vacía (`GET /api/executions/reconciliation-queue`)
 - [ ] `GET /api/executions/recent` revisado (sin órdenes colgadas)
