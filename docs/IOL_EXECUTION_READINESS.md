@@ -156,6 +156,39 @@ aumenta la cantidad firmada. Sus fallos son definitivos previos al broker
   `numeroOperacion` deja la orden en `manual_reconciliation_required`; un
   proceso caído con órdenes en `execution_ready` o `submitting` requiere
   revisión manual — no hay reintento automático en ninguna parte del sistema.
+- **Timestamps de cotización**: se rechazan los que no tengan zona horaria,
+  los mal formados y los que estén más adelante en el futuro que
+  `EXECUTION_QUOTE_CLOCK_SKEW_SECONDS` (0-10, default 2) →
+  `quote_timestamp_invalid`. Nunca se asume UTC en silencio.
+- **Configuración numérica validada al arranque**: ventanas
+  (`EXECUTION_PREVIEW_TTL_SECONDS`, `EXECUTION_MAX_RECOMMENDATION_AGE_MINUTES`,
+  `IOL_ORDER_VALIDITY_MINUTES`, `EXECUTION_MAX_QUOTE_AGE_SECONDS`) deben ser
+  finitas y > 0; los límites fail-closed admiten 0 (= no configurado) pero
+  nunca negativos ni `NaN`/`Infinity`. Una configuración inválida hace fallar
+  el arranque en vez de producir comparaciones ambiguas durante una orden.
+
+## `execution_ready`: estado durable PRE-POST
+
+`execution_ready` significa exactamente: **el preflight quedó persistido y
+todavía no se inició ningún POST de orden** (el flujo siempre commitea
+`submitting` antes de enviar).
+
+Si el proceso cae con órdenes en ese estado:
+
+- aparecen en la **cola de conciliación**, junto con el resto de las órdenes
+  de la misma recomendación (contexto completo del lote);
+- la recomendación queda `manual_reconciliation_required` y **nunca** vuelve
+  a `pending`, `blocked` ni `approved`;
+- la **única** resolución permitida es `confirm_not_sent` →
+  `not_sent_confirmed`, con la frase exacta
+  `CONCILIAR EJECUCION {id} COMO NO ENVIADA` y `reason_code:
+  prepared_but_not_submitted` en la auditoría;
+- `confirm_sent`, `confirm_executed` y `confirm_rejected` se rechazan con 409.
+
+**No puede reanudarse ni reenviarse**: su request preparado puede tener
+cotización vencida, validez vencida, posición cambiada o límites cambiados.
+No existen endpoints de resume/retry/resubmit, ni scheduler de reintentos.
+Para volver a operar hay que generar un preview nuevo desde cero.
 
 Verificación rápida: `GET /api/broker/execution-readiness` (con X-API-Key)
 muestra ambiente configurado vs efectivo, locks, sell-only, chequeo de
