@@ -350,6 +350,10 @@ def _canonical_preview_payload(
         "generated_at": generated_at_iso,
         "expires_at": expires_at_iso,
         "broker_mode": settings.broker_mode,
+        "configured_broker_mode": settings.broker_mode,
+        # Authoritative environment (iol_use_sandbox can make it differ from
+        # the configured mode). Changing it invalidates the signature.
+        "effective_environment": _effective_environment(settings),
         "orders": [
             {
                 "recommendation_action_id": o["recommendation_action_id"],
@@ -362,6 +366,9 @@ def _canonical_preview_payload(
                 "portfolio_value_used": o["portfolio_value_used"],
                 "position_value_used": o["position_value_used"],
                 "portfolio_pct": o["portfolio_pct"],
+                # Instrument identity + per-symbol scope are signed too.
+                "instrument_identity": o.get("instrument_identity") or {},
+                "execution_scope": o.get("execution_scope") or {},
             }
             for o in orders
         ],
@@ -438,6 +445,61 @@ def _evaluate_limit_reasons(orders: list[dict], snapshot: PortfolioSnapshot, set
 _QUOTE_POLICY = "best_bid_for_sell_best_ask_for_buy"
 
 
+def _effective_environment(settings) -> str:
+    """THE authoritative environment for every execution decision."""
+    from app.broker.environment import effective_execution_environment
+
+    return effective_execution_environment(settings)
+
+
+def _execution_locked(settings) -> bool:
+    """Lock check against the EFFECTIVE environment.
+
+    - sandbox effective → only SANDBOX_EXECUTION_ENABLED matters
+    - real effective    → only ORDER_EXECUTION_ENABLED matters
+    - mock effective    → no IOL lock applies
+    """
+    env = _effective_environment(settings)
+    if env == "mock":
+        return False
+    if env == "sandbox":
+        return not settings.sandbox_execution_enabled
+    return not settings.order_execution_enabled
+
+
+def _apply_execution_scope(orders: list[dict], snapshot, settings) -> list[str]:
+    """Attach instrument identity + scope to each order and collect blocking
+    codes. Mock effective environment is exempt (never reaches IOL)."""
+    from app.broker.instrument_scope import evaluate_order_scope, load_instrument_policies
+
+    if _effective_environment(settings) == "mock":
+        return []
+
+    policies, policy_errors = load_instrument_policies(settings)
+    codes: list[str] = list(policy_errors)
+
+    for order in orders:
+        position = _find_position(snapshot, order["symbol"]) if snapshot else None
+        scope_info, order_codes = evaluate_order_scope(
+            order=order, position=position, policies=policies, settings=settings
+        )
+        order["instrument_identity"] = scope_info["instrument_identity"]
+        order["execution_scope"] = scope_info["execution_scope"]
+        if order_codes:
+            # A scoped-out order can never be part of an approvable plan.
+            order["valid"] = False
+            existing = order.get("blocked_reason") or ""
+            order["blocked_reason"] = (
+                f"{existing} | scope: {', '.join(order_codes)}".strip(" |")
+                if existing else f"scope: {', '.join(order_codes)}"
+            )
+        for code in order_codes:
+            if code not in codes:
+                codes.append(code)
+
+    return codes
+
+
 def _execution_venue(settings) -> dict:
     """Explicit, signed order policy — market/settlement are never hardcoded."""
     return {
@@ -499,13 +561,11 @@ def get_execution_readiness() -> dict:
     env = resolve_execution_environment(settings)
     venue_reasons = _venue_blocking_reasons(settings)
 
+    from app.broker.instrument_scope import load_instrument_policies
+
     blocking: list[str] = []
-    if env["environment"] == "sandbox":
-        if not settings.sandbox_execution_enabled:
-            blocking.append("execution_locked")
-    elif env["environment"] != "mock":
-        if not settings.order_execution_enabled:
-            blocking.append("execution_locked")
+    if _execution_locked(settings):
+        blocking.append("execution_locked")
     if not settings.execution_admin_key:
         blocking.append("execution_admin_key_not_configured")
     if not settings.execution_preview_secret:
@@ -513,6 +573,14 @@ def get_execution_readiness() -> dict:
     if not _limits_configured(settings):
         blocking.append("execution_limits_not_configured")
     blocking.extend(venue_reasons)
+
+    policies, policy_errors = load_instrument_policies(settings)
+    if env["environment"] != "mock":
+        if not policies:
+            blocking.append("execution_scope_not_configured")
+        for code in policy_errors:
+            if code not in blocking:
+                blocking.append(code)
 
     policy_configured = bool(settings.iol_order_market and settings.iol_order_settlement) and not any(
         r in venue_reasons
@@ -528,7 +596,9 @@ def get_execution_readiness() -> dict:
 
     return {
         "broker_mode": settings.broker_mode,
+        "configured_broker_mode": settings.broker_mode,
         "environment": env["environment"],
+        "effective_environment": env["environment"],
         "api_host": api_host_of(env),
         "order_execution_enabled": settings.order_execution_enabled,
         "sandbox_execution_enabled": settings.sandbox_execution_enabled,
@@ -540,6 +610,11 @@ def get_execution_readiness() -> dict:
         "market": settings.iol_order_market or None,
         "settlement": settings.iol_order_settlement or None,
         "order_type": settings.iol_order_type,
+        "execution_sell_only": bool(settings.execution_sell_only),
+        "live_position_check_required": bool(settings.execution_require_live_position_check),
+        "execution_scope_configured": bool(policies) and not policy_errors,
+        "allowed_symbols": sorted(policies.keys()),
+        "instrument_policy_count": len(policies),
         "blocking_reasons": blocking,
         "ready_for_real_execution": env["environment"] == "real" and not blocking,
         "ready_for_sandbox_execution": env["environment"] == "sandbox" and not blocking,
@@ -592,20 +667,23 @@ def build_execution_preview(
     signing_configured = bool(settings.execution_preview_secret)
     limits_configured = _limits_configured(settings)
 
+    # Execution scope: attaches instrument identity + per-symbol scope to
+    # every order and invalidates any order outside the allowlist.
+    scope_reasons = _apply_execution_scope(orders_preview, snapshot, settings)
+
     # --- Blocking reasons: stable codes the frontend can rely on ---
     blocking_reasons: list[str] = []
-    if settings.broker_mode == "sandbox":
-        if not settings.sandbox_execution_enabled:
-            blocking_reasons.append("execution_locked")
-    elif settings.broker_mode != "mock":
-        if not settings.order_execution_enabled:
-            blocking_reasons.append("execution_locked")
+    if _execution_locked(settings):
+        blocking_reasons.append("execution_locked")
     if not admin_configured:
         blocking_reasons.append("execution_admin_key_not_configured")
     if not signing_configured:
         blocking_reasons.append("preview_signing_not_configured")
     blocking_reasons.extend(_evaluate_limit_reasons(orders_preview, snapshot, settings))
     blocking_reasons.extend(_venue_blocking_reasons(settings))
+    for code in scope_reasons:
+        if code not in blocking_reasons:
+            blocking_reasons.append(code)
     if rec.status not in _APPROVABLE_STATUSES:
         blocking_reasons.append("recommendation_not_pending")
     if rec.superseded_at is not None:
@@ -639,7 +717,12 @@ def build_execution_preview(
         "generated_at": generated_at_iso,
         "expires_at": expires_at_iso,
         "broker_mode": settings.broker_mode,
+        "configured_broker_mode": settings.broker_mode,
+        "effective_environment": _effective_environment(settings),
         "order_execution_enabled": settings.order_execution_enabled,
+        "sandbox_execution_enabled": settings.sandbox_execution_enabled,
+        "execution_sell_only": bool(settings.execution_sell_only),
+        "live_position_check_required": bool(settings.execution_require_live_position_check),
         "execution_admin_auth_configured": admin_configured,
         "execution_limits_configured": limits_configured,
         "dry_run": True,
@@ -760,8 +843,54 @@ def _validate_reinforced_authorization(
             "status_code": 409,
         }, None
 
-    # 16. Every order must be valid
     blocking = rebuilt.get("blocking_reasons", [])
+
+    # Server-side CONFIGURATION problems are reported as such (423) before
+    # order-level verdicts, so a missing scope/environment never masquerades
+    # as an invalid order.
+    for code in (
+        "execution_scope_not_configured",
+        "instrument_policy_invalid",
+        "broker_environment_requires_https",
+        "broker_environment_url_invalid",
+        "sandbox_environment_not_configured",
+        "sandbox_environment_invalid",
+        "sandbox_credentials_not_configured",
+        "real_environment_not_configured",
+        "real_environment_invalid",
+        "real_credentials_not_configured",
+        "unsupported_broker_mode",
+    ):
+        if code in blocking:
+            return {
+                "error": f"Ejecución bloqueada por configuración del servidor: {code}.",
+                "code": code,
+                "status_code": 423,
+            }, None
+
+    # Per-instrument scope violations reported with their specific code
+    # (they also invalidate the order, but the root cause is more useful).
+    for code in (
+        "instrument_policy_missing",
+        "symbol_not_allowed",
+        "buy_execution_disabled",
+        "instrument_identity_mismatch",
+        "instrument_currency_mismatch",
+        "instrument_market_mismatch",
+        "instrument_settlement_mismatch",
+        "quantity_step_mismatch",
+        "symbol_quantity_limit_exceeded",
+        "symbol_notional_limit_exceeded",
+        "live_position_missing",
+    ):
+        if code in blocking:
+            return {
+                "error": f"Orden fuera del alcance autorizado: {code}.",
+                "code": code,
+                "status_code": 422,
+            }, None
+
+    # 16. Every order must be valid
     if "invalid_order" in blocking:
         return {
             "error": "Hay órdenes inválidas en el plan de ejecución.",
@@ -784,8 +913,8 @@ def _validate_reinforced_authorization(
                 "status_code": 422,
             }, None
 
-    # Order policy / broker environment must be fully configured and valid
-    # for sandbox/real execution (mock is exempt — never builds IOL requests).
+    # Order policy must be fully configured and valid for sandbox/real
+    # execution (mock is exempt — it never builds IOL requests).
     for code in (
         "iol_order_policy_not_configured",
         "unsupported_iol_market",
@@ -793,17 +922,10 @@ def _validate_reinforced_authorization(
         "unsupported_iol_order_type",
         "quote_policy_not_configured",
         "price_deviation_limit_not_configured",
-        "sandbox_environment_not_configured",
-        "sandbox_environment_invalid",
-        "sandbox_credentials_not_configured",
-        "real_environment_not_configured",
-        "real_environment_invalid",
-        "real_credentials_not_configured",
-        "unsupported_broker_mode",
     ):
         if code in blocking:
             return {
-                "error": f"Ejecución bloqueada por política/ambiente de orden: {code}.",
+                "error": f"Ejecución bloqueada por política de orden: {code}.",
                 "code": code,
                 "status_code": 423,
             }, None
@@ -920,36 +1042,28 @@ def approve_and_execute(
                 "status_code": 409,
             }
 
-    # 6. SAFETY LOCKS — fail closed BEFORE any state change: no status
-    # change, no UserDecision, no OrderExecution rows, no broker, no quotes,
-    # no notifications.
-    # Real (and any unknown mode): gated by ORDER_EXECUTION_ENABLED.
-    # Sandbox: gated by its own SANDBOX_EXECUTION_ENABLED lock.
-    if settings.broker_mode == "sandbox":
-        if not settings.sandbox_execution_enabled:
-            return {
-                "error": (
-                    "Safety lock sandbox activo: ejecución simulada deshabilitada "
-                    "(SANDBOX_EXECUTION_ENABLED=false). No se aprobó la recomendación "
-                    "ni se envió ninguna orden."
-                ),
-                "code": "execution_locked",
-                "status_code": 423,
-            }
-    elif settings.broker_mode != "mock" and not settings.order_execution_enabled:
+    # 6. SAFETY LOCKS — evaluated against the EFFECTIVE environment, fail
+    # closed BEFORE any state change: no status change, no UserDecision, no
+    # OrderExecution rows, no broker, no quotes, no notifications.
+    # Real effective → ORDER_EXECUTION_ENABLED only.
+    # Sandbox effective → SANDBOX_EXECUTION_ENABLED only.
+    effective_env = _effective_environment(settings)
+    if _execution_locked(settings):
+        lock_var = "SANDBOX_EXECUTION_ENABLED" if effective_env == "sandbox" else "ORDER_EXECUTION_ENABLED"
+        kind = "simulada" if effective_env == "sandbox" else "real"
         return {
             "error": (
-                "Safety lock activo: ejecución real deshabilitada "
-                "(ORDER_EXECUTION_ENABLED=false). No se aprobó la recomendación "
+                f"Safety lock activo: ejecución {kind} deshabilitada "
+                f"({lock_var}=false). No se aprobó la recomendación "
                 "ni se envió ninguna orden."
             ),
             "code": "execution_locked",
             "status_code": 423,
         }
 
-    # 7-19. Reinforced authorization — mandatory for real broker; opt-in for
+    # 7-19. Reinforced authorization — mandatory for sandbox/real; opt-in for
     # mock (staging rehearsal) when any reinforced field is provided.
-    reinforced = settings.broker_mode != "mock" or any(
+    reinforced = effective_env != "mock" or any(
         v is not None for v in (execution_key, preview_hash, preview_generated_at, confirmation_text)
     )
     validated_preview = None
@@ -1048,6 +1162,99 @@ def _fail_order_definitive(db: Session, order_exec: OrderExecution, message: str
     db.commit()
 
 
+def _verify_live_position(db: Session, order_exec: OrderExecution, broker, preview_order: dict) -> str | None:
+    """Read-only live position re-verification before ANY submission.
+
+    Uses the public broker contract (get_portfolio_snapshot) — never private
+    internals. Purely a guard: it can only BLOCK, never adjust the order.
+    A larger live position does not increase the signed quantity; a smaller
+    one blocks instead of shrinking it.
+
+    All failures here are DEFINITIVE pre-broker failures (status=failed,
+    quantity_sent stays None, no submission ever happened) — never
+    manual_reconciliation_required.
+
+    Returns a blocking code, or None when the guard passes.
+    """
+    from app.broker.instrument_scope import normalize_symbol
+
+    identity = preview_order.get("instrument_identity") or {}
+    symbol = normalize_symbol(order_exec.symbol)
+    required_qty = order_exec.quantity_planned
+
+    try:
+        live = broker.get_portfolio_snapshot()
+        positions = (live or {}).get("positions") or []
+    except Exception as exc:
+        _fail_order_definitive(
+            db, order_exec,
+            f"live_position_verification_failed: could not read the live portfolio "
+            f"({str(exc)[:200]}). Order NOT sent.",
+        )
+        return "live_position_verification_failed"
+
+    match = None
+    for p in positions:
+        if normalize_symbol(p.get("symbol")) == symbol:
+            match = p
+            break
+
+    if match is None:
+        _fail_order_definitive(
+            db, order_exec,
+            f"live_position_missing: {symbol} is no longer in the live portfolio. Order NOT sent.",
+        )
+        return "live_position_missing"
+
+    # Identity must still match what was signed.
+    if identity:
+        if (match.get("asset_type") or "") != identity.get("asset_type") or \
+           (match.get("instrument_type") or "") != identity.get("instrument_type"):
+            _fail_order_definitive(
+                db, order_exec,
+                f"instrument_identity_mismatch: live {symbol} identity differs from the signed preview. Order NOT sent.",
+            )
+            return "instrument_identity_mismatch"
+        if (match.get("currency") or "") != identity.get("currency"):
+            _fail_order_definitive(
+                db, order_exec,
+                f"instrument_currency_mismatch: live {symbol} currency differs from the signed preview. Order NOT sent.",
+            )
+            return "instrument_currency_mismatch"
+
+    try:
+        available = float(match.get("quantity") or 0)
+    except (TypeError, ValueError):
+        available = 0.0
+
+    if available < required_qty:
+        _fail_order_definitive(
+            db, order_exec,
+            f"live_position_insufficient: live {symbol} quantity {available} < signed "
+            f"{required_qty}. Order NOT sent (quantity is never reduced automatically).",
+        )
+        return "live_position_insufficient"
+
+    # Persist ONLY the relevant position data — never the whole portfolio,
+    # never tokens or credentials.
+    br = dict(order_exec.broker_response or {})
+    request_audit = dict(br.get("request_audit") or {})
+    request_audit["live_position_check"] = {
+        "checked_at": _utcnow().isoformat(),
+        "symbol": symbol,
+        "quantity_available": available,
+        "quantity_required": required_qty,
+        "asset_type": match.get("asset_type") or "",
+        "instrument_type": match.get("instrument_type") or "",
+        "currency": match.get("currency") or "",
+        "passed": True,
+    }
+    br["request_audit"] = request_audit
+    order_exec.broker_response = br
+    db.commit()
+    return None
+
+
 def _submit_iol_validated_order(
     db: Session,
     order_exec: OrderExecution,
@@ -1077,6 +1284,15 @@ def _submit_iol_validated_order(
     side = order_exec.side
     market = settings.iol_order_market
     settlement = settings.iol_order_settlement
+
+    # --- 0. LIVE POSITION GUARD (before quoting, before 'submitting') ---
+    # Read-only re-verification that the real position still exists, still
+    # matches the signed identity and is still sufficient. It NEVER
+    # recalculates the order: quantity stays exactly the signed one.
+    if settings.execution_require_live_position_check and side == "sell":
+        guard_error = _verify_live_position(db, order_exec, broker, preview_order)
+        if guard_error:
+            return "failed"
 
     # --- 1. Executable quote (definitive failures: nothing sent yet) ---
     try:
@@ -1302,7 +1518,8 @@ def _execute_validated_orders(
     uncertain_count = 0
 
     settings = get_settings()
-    is_iol = settings.broker_mode != "mock"  # sandbox or real → canonical IOL contract
+    # Effective environment decides the contract: sandbox/real → canonical IOL.
+    is_iol = _effective_environment(settings) != "mock"
     orders_by_action = {o["recommendation_action_id"]: o for o in orders}
 
     try:

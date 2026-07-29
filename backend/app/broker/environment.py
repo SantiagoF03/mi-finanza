@@ -19,6 +19,50 @@ _REAL_IOL_HOST = "api.invertironline.com"
 _VALID_MODES = {"mock", "sandbox", "real"}
 
 
+def _validate_network_url(base: str) -> tuple[str | None, str | None]:
+    """Structurally validate a broker API base URL.
+
+    Returns (hostname, error_code). Any network environment must be HTTPS,
+    have a real hostname, carry no embedded credentials, no query string and
+    no fragment, and use the default TLS port.
+    """
+    try:
+        parsed = urlparse(base)
+    except (ValueError, TypeError):
+        return None, "broker_environment_url_invalid"
+
+    if parsed.scheme != "https":
+        return None, "broker_environment_requires_https"
+
+    try:
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        # Malformed port (e.g. "https://host:notaport")
+        return None, "broker_environment_url_invalid"
+
+    if not hostname:
+        return None, "broker_environment_url_invalid"
+    if parsed.username or parsed.password:
+        return None, "broker_environment_url_invalid"
+    if parsed.query or parsed.fragment:
+        return None, "broker_environment_url_invalid"
+    if port is not None and port != 443:
+        return None, "broker_environment_url_invalid"
+
+    return hostname, None
+
+
+def effective_execution_environment(settings) -> str:
+    """THE authoritative execution environment: mock | sandbox | real.
+
+    Never decide locks, factories or branching from settings.broker_mode
+    directly — the deprecated iol_use_sandbox flag can make the effective
+    environment differ from the configured mode.
+    """
+    return resolve_execution_environment(settings)["environment"]
+
+
 def resolve_execution_environment(settings) -> dict:
     """Resolve the effective execution environment from settings.
 
@@ -55,9 +99,13 @@ def resolve_execution_environment(settings) -> dict:
         base = (settings.iol_sandbox_api_base or "").strip().rstrip("/")
         if not base:
             errors.append("sandbox_environment_not_configured")
-        elif _REAL_IOL_HOST in base:
-            # Sandbox may NEVER point at (or through) the real IOL host.
-            errors.append("sandbox_environment_invalid")
+        else:
+            hostname, url_error = _validate_network_url(base)
+            if url_error:
+                errors.append(url_error)
+            elif hostname == _REAL_IOL_HOST:
+                # Sandbox may NEVER point at the real IOL host.
+                errors.append("sandbox_environment_invalid")
         username = (settings.iol_sandbox_username or "").strip()
         password = settings.iol_sandbox_password or ""
         if not username or not password:
@@ -73,12 +121,16 @@ def resolve_execution_environment(settings) -> dict:
     # real
     errors = []
     base = (settings.iol_real_api_base or settings.iol_api_base or "").strip().rstrip("/")
-    host = urlparse(base).netloc if base else ""
     if not base:
         errors.append("real_environment_not_configured")
-    elif host != _REAL_IOL_HOST:
-        # Real execution may ONLY talk to the real IOL API.
-        errors.append("real_environment_invalid")
+    else:
+        hostname, url_error = _validate_network_url(base)
+        if url_error:
+            errors.append(url_error)
+        elif hostname != _REAL_IOL_HOST:
+            # Exact hostname match — never a substring check, so lookalikes
+            # such as api.invertironline.com.evil.example are rejected.
+            errors.append("real_environment_invalid")
     username = (settings.iol_real_username or settings.iol_username or "").strip()
     password = settings.iol_real_password or settings.iol_password or ""
     if not username or not password:
