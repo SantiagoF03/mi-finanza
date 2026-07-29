@@ -133,11 +133,17 @@ def _sandbox_settings(**extra):
     return base
 
 
-def _live(quantity=20, asset_type="CEDEAR", instrument_type="CEDEAR", currency="USD", symbol="AAPL"):
-    return {"positions": [{
+def _live(quantity=20, asset_type="CEDEAR", instrument_type="CEDEAR", currency="USD",
+          symbol="AAPL", total_value=100000):
+    return {"total_value": total_value, "cash": 12000, "positions": [{
         "symbol": symbol, "asset_type": asset_type, "instrument_type": instrument_type,
         "currency": currency, "quantity": quantity, "market_value": 38000,
     }]}
+
+
+def _live_empty(total_value=100000):
+    """Live portfolio with a valid total but no AAPL position."""
+    return {"total_value": total_value, "cash": 12000, "positions": []}
 
 
 def _broker(live=None, quote_price=1900.0):
@@ -610,7 +616,7 @@ def test_reduced_live_position_blocks_and_never_shrinks(db):
 
 
 def test_missing_live_position_blocks(db):
-    result, oe, broker, _ = _run(db, broker=_broker(live={"positions": []}))
+    result, oe, broker, _ = _run(db, broker=_broker(live=_live_empty()))
     assert oe.status == "failed"
     assert "live_position_missing" in oe.error_message
     assert oe.quantity_sent is None
@@ -643,7 +649,7 @@ def test_live_identity_mismatch_blocks(db, live_kwargs, expected):
 def test_pre_broker_failures_never_produce_reconciliation(db):
     """Every guard failure is definitive: failed, never uncertain."""
     for broker in (
-        _broker(live={"positions": []}),
+        _broker(live=_live_empty()),
         _broker(live=_live(quantity=1)),
     ):
         engine = create_engine("sqlite:///:memory:")
@@ -674,13 +680,20 @@ def test_audit_stores_only_the_relevant_position_and_no_credentials(db):
         assert secret not in serialized
 
 
-def test_live_check_can_be_disabled_for_mock_rehearsal(db):
-    """With the check disabled the guard does not run (still no resize)."""
+def test_live_check_cannot_be_disabled_for_sandbox(db):
+    """V1: disabling the live position check blocks sandbox entirely."""
+    _make_snapshot(db)
+    rec = _make_recommendation(db)
+    db.commit()
     broker = _broker()
-    broker.get_portfolio_snapshot.side_effect = AssertionError("should not be called")
-    result, oe, b, _ = _run(db, settings_extra={"execution_require_live_position_check": False}, broker=broker)
-    assert result["status"] == "approved"
-    assert oe.quantity_sent == 2
+    broker.get_portfolio_snapshot.side_effect = AssertionError("must not be reached")
+    with exec_settings(**_sandbox_settings(execution_require_live_position_check=False)):
+        preview = build_execution_preview(db, rec.id)
+        result = _approve(db, rec, preview, broker)
+    assert "live_position_verification_required" in preview["blocking_reasons"]
+    assert preview["can_submit_approval"] is False
+    assert result["status_code"] == 423
+    assert db.query(OrderExecution).count() == 0
 
 
 def test_second_approval_does_not_post_again(db):
