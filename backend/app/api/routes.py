@@ -53,6 +53,15 @@ def broker_ping():
     return client.ping()
 
 
+@router.get("/broker/execution-readiness")
+def broker_execution_readiness(_auth=Depends(require_api_key)):
+    """Read-only execution readiness: environment, locks, configuration
+    booleans and blocking reasons. Never returns credentials or secrets,
+    and does not authenticate against IOL."""
+    from app.services.execution import get_execution_readiness
+    return get_execution_readiness()
+
+
 @router.post("/analysis/run")
 def run_manual_analysis(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     cycle_result = run_cycle(db, source="manual")

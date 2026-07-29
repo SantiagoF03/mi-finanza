@@ -17,6 +17,25 @@ class BrokerClient(ABC):
     def ping(self) -> dict:
         return {"status": "ok", "mode": "mock"}
 
+    def get_execution_quote(self, symbol: str, side: str, market: str, settlement: str) -> dict:
+        """Executable quote for a limit order.
+
+        Contract: sell uses the best bid (precioCompra), buy uses the best
+        ask (precioVenta). ultimoPrecio is NEVER an execution fallback. When
+        the needed side of the book is missing → available=False (never a
+        market order).
+
+        Returns {available, price, source, retrieved_at, market, settlement}.
+        """
+        return {
+            "available": False,
+            "price": None,
+            "source": "none",
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "market": market,
+            "settlement": settlement,
+        }
+
 
 def map_iol_estadocuenta_cash(payload: dict[str, Any]) -> float:
     """
@@ -235,11 +254,18 @@ def map_iol_portfolio_to_snapshot(
 
 
 class IolBrokerClient(BrokerClient):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        api_base: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
         settings = get_settings()
-        self.api_base = settings.iol_api_base.rstrip("/")
-        self.username = settings.iol_username
-        self.password = settings.iol_password
+        # Explicit environment injection (sandbox vs real) — defaults keep the
+        # legacy read-path behavior (real credentials from settings).
+        self.api_base = (api_base or settings.iol_api_base).rstrip("/")
+        self.username = username if username is not None else settings.iol_username
+        self.password = password if password is not None else settings.iol_password
         self.country = settings.iol_portfolio_country
         self.timeout = settings.iol_timeout_seconds
         self._client = httpx.Client(timeout=self.timeout)
@@ -434,6 +460,148 @@ class IolBrokerClient(BrokerClient):
         except Exception as exc:
             return {"order_id": order_id, "status": "error", "error": str(exc)}
 
+    def get_execution_quote(self, symbol: str, side: str, market: str, settlement: str) -> dict:
+        """Executable quote: best bid for sell, best ask for buy.
+
+        ultimoPrecio is NEVER used as an execution fallback — a missing side
+        of the book means available=False, and no order is sent.
+        """
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        base = {
+            "available": False,
+            "price": None,
+            "source": "none",
+            "retrieved_at": retrieved_at,
+            "market": market,
+            "settlement": settlement,
+        }
+        try:
+            resp = self._authorized_get(f"/api/v2/Cotizaciones/detalle/{market}/{symbol}")
+            data = resp.json()
+            if not isinstance(data, dict):
+                return base
+            puntas = data.get("puntas") or {}
+            if not isinstance(puntas, dict):
+                return base
+            raw_price = puntas.get("precioCompra") if side == "sell" else puntas.get("precioVenta")
+            if raw_price and float(raw_price) > 0:
+                return {
+                    **base,
+                    "available": True,
+                    "price": float(raw_price),
+                    "source": "bid" if side == "sell" else "ask",
+                }
+        except Exception:
+            pass
+        return base
+
+    def submit_order_request(self, order_request: dict) -> dict:
+        """Submit a canonical form-urlencoded order request (built by
+        app.broker.order_request.build_iol_order_request) EXACTLY as given.
+
+        Typed outcome classification:
+        - "sent": HTTP 2xx + valid JSON + non-empty numeroOperacion
+        - "rejected": DEFINITIVE non-acceptance (4xx after auth handling —
+          the request was evaluated and not accepted)
+        - "submission_uncertain": the request may have reached IOL but we
+          cannot prove the outcome (timeout / connection error during send,
+          5xx, 2xx without numeroOperacion, unreadable 2xx body). The caller
+          must route this to manual reconciliation — NEVER auto-retry.
+        """
+        endpoint = order_request["endpoint"]
+        form_data = order_request["form_data"]
+        url = f"{self.api_base}{endpoint}"
+
+        # Auth failures BEFORE the order POST are definitive: nothing sent.
+        try:
+            self._ensure_auth()
+        except Exception as exc:
+            return {
+                "outcome": "rejected",
+                "order_id": "",
+                "endpoint_used": endpoint,
+                "raw_response": {},
+                "error": f"Auth failed before submission: {str(exc)[:200]}",
+            }
+
+        def _post() -> httpx.Response:
+            return self._client.post(
+                url,
+                data=form_data,
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+
+        try:
+            resp = _post()
+            if resp.status_code in {401, 403} and self._refresh_access_token():
+                resp = _post()
+        except Exception as exc:
+            # The POST may have been written before the failure — uncertain.
+            return {
+                "outcome": "submission_uncertain",
+                "order_id": "",
+                "endpoint_used": endpoint,
+                "raw_response": {},
+                "error": f"Network failure during submission: {str(exc)[:200]}",
+            }
+
+        if 200 <= resp.status_code < 300:
+            try:
+                data = resp.json()
+            except Exception:
+                return {
+                    "outcome": "submission_uncertain",
+                    "order_id": "",
+                    "endpoint_used": endpoint,
+                    "raw_response": {"status_code": resp.status_code, "unparseable_body": True},
+                    "error": "2xx response with unreadable body — outcome unknown.",
+                }
+            numero = data.get("numeroOperacion") if isinstance(data, dict) else None
+            if numero:
+                return {
+                    "outcome": "sent",
+                    "order_id": str(numero),
+                    "endpoint_used": endpoint,
+                    "raw_response": data,
+                    "error": "",
+                }
+            return {
+                "outcome": "submission_uncertain",
+                "order_id": "",
+                "endpoint_used": endpoint,
+                "raw_response": data if isinstance(data, dict) else {"body": str(data)[:500]},
+                "error": "2xx response without numeroOperacion — outcome unknown.",
+            }
+
+        raw = {}
+        try:
+            raw = resp.json()
+        except Exception:
+            raw = {"status_code": resp.status_code}
+
+        if 400 <= resp.status_code < 500:
+            # Definitive: IOL evaluated the request and did not accept it.
+            return {
+                "outcome": "rejected",
+                "order_id": "",
+                "endpoint_used": endpoint,
+                "raw_response": raw,
+                "error": f"HTTP {resp.status_code}: request not accepted.",
+            }
+
+        # 5xx or anything else: no contract guarantees the order was NOT
+        # created server-side → uncertain.
+        return {
+            "outcome": "submission_uncertain",
+            "order_id": "",
+            "endpoint_used": endpoint,
+            "raw_response": raw,
+            "error": f"HTTP {resp.status_code}: outcome unknown.",
+        }
+
 
 class MockBrokerClient(BrokerClient):
     _mock_orders: list[dict] = []
@@ -508,3 +676,16 @@ class MockBrokerClient(BrokerClient):
     def get_order_status(self, order_id: str) -> dict:
         """Mock order status — always returns executed."""
         return {"order_id": order_id, "status": "terminada", "raw_response": {"mock": True}}
+
+    def get_execution_quote(self, symbol: str, side: str, market: str, settlement: str) -> dict:
+        """Mock quote — price None keeps the historical mock market-order
+        semantics (mock never builds IOL requests, so precioLimite rules do
+        not apply here)."""
+        return {
+            "available": True,
+            "price": None,
+            "source": "market_order",
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "market": market,
+            "settlement": settlement,
+        }
