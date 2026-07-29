@@ -1259,6 +1259,33 @@ def _check_live_position(order_exec: OrderExecution, preview_order: dict, live_p
     }, None
 
 
+def _quote_age_seconds(retrieved_at_raw, settings) -> tuple[float, str | None]:
+    """Age of a quote in seconds, rejecting unusable timestamps.
+
+    Returns (age_seconds, error_code). A quote dated in the future beyond the
+    allowed clock skew is `quote_timestamp_invalid`, not merely stale: a
+    broker/server clock we cannot trust must never be used to price an order.
+    Naive timestamps are rejected too — real quotes are never silently
+    assumed to be UTC.
+    """
+    if not retrieved_at_raw or not isinstance(retrieved_at_raw, str):
+        return 0.0, "quote_timestamp_invalid"
+    try:
+        retrieved_at = datetime.fromisoformat(retrieved_at_raw)
+    except (ValueError, TypeError):
+        return 0.0, "quote_timestamp_invalid"
+    if retrieved_at.tzinfo is None or retrieved_at.utcoffset() is None:
+        return 0.0, "quote_timestamp_invalid"
+
+    age_seconds = (_utcnow() - retrieved_at).total_seconds()
+    skew = settings.execution_quote_clock_skew_seconds
+    if age_seconds < -skew:
+        # Too far in the future for plausible clock skew.
+        return age_seconds, "quote_timestamp_invalid"
+    # Within the tolerated skew, treat a slightly future quote as brand new.
+    return max(age_seconds, 0.0), None
+
+
 def _preflight_one_order(
     order_exec: OrderExecution,
     preview_order: dict,
@@ -1304,15 +1331,11 @@ def _preflight_one_order(
         # Covers NaN / Infinity / zero / negative / non-numeric prices
         return None, "invalid_execution_price"
 
-    # 4. Quote freshness
-    try:
-        retrieved_at = datetime.fromisoformat(quote["retrieved_at"])
-        if retrieved_at.tzinfo is None:
-            retrieved_at = retrieved_at.replace(tzinfo=timezone.utc)
-        age_seconds = (_utcnow() - retrieved_at).total_seconds()
-    except (KeyError, ValueError, TypeError):
-        age_seconds = None
-    if age_seconds is None or age_seconds > settings.execution_max_quote_age_seconds:
+    # 4. Quote timestamp + freshness
+    age_seconds, ts_error = _quote_age_seconds(quote.get("retrieved_at"), settings)
+    if ts_error:
+        return None, ts_error
+    if age_seconds > settings.execution_max_quote_age_seconds:
         return None, "quote_stale"
 
     # 5. Deviation vs the SIGNED snapshot reference
@@ -2125,7 +2148,13 @@ def _exec_to_dict(e: OrderExecution) -> dict:
 #   NEW orders, it must not prevent resolving a past uncertain one.
 # ---------------------------------------------------------------------------
 
-_RECONCILABLE_STATUSES = {"submitting", "manual_reconciliation_required"}
+# execution_ready is durable PRE-POST state: the preflight was persisted but
+# no submission was ever started (the flow always commits 'submitting' first).
+# It is therefore reconcilable, but ONLY as confirm_not_sent.
+_RECONCILABLE_STATUSES = {"submitting", "manual_reconciliation_required", "execution_ready"}
+
+# Statuses whose only valid manual resolution is "it was never sent".
+_PREPARED_NOT_SUBMITTED_STATUSES = {"execution_ready"}
 
 _RECONCILIATION_ACTIONS = {
     "confirm_not_sent": {
@@ -2146,7 +2175,9 @@ _RECONCILIATION_ACTIONS = {
     },
 }
 
-_UNCERTAIN_ORDER_STATUSES = {"submitting", "manual_reconciliation_required", "execution_requested"}
+_UNCERTAIN_ORDER_STATUSES = {
+    "submitting", "manual_reconciliation_required", "execution_requested", "execution_ready",
+}
 _SENT_ORDER_STATUSES = {"execution_sent", "executed"}
 _DEFINITIVE_FAIL_STATUSES = {"failed", "rejected_by_broker", "not_sent_confirmed", "validation_failed"}
 
@@ -2185,9 +2216,13 @@ def _recompute_recommendation_outcome(db: Session, recommendation_id: int) -> st
 
 
 def get_reconciliation_queue(db: Session) -> list[dict]:
-    """Orders pending manual inspection: any order in submitting or
-    manual_reconciliation_required, plus every order of an execution_partial
-    recommendation (full picture for the partial batch)."""
+    """Orders pending manual inspection.
+
+    Includes any order in a reconcilable state (submitting,
+    manual_reconciliation_required, execution_ready) AND every sibling order
+    of the same recommendation, so the whole batch context is visible. Also
+    includes every order of an execution_partial recommendation.
+    """
     direct = db.query(OrderExecution).filter(
         OrderExecution.status.in_(sorted(_RECONCILABLE_STATUSES))
     ).all()
@@ -2195,10 +2230,13 @@ def get_reconciliation_queue(db: Session) -> list[dict]:
     partial_rec_ids = [
         r.id for r in db.query(Recommendation).filter(Recommendation.status == "execution_partial").all()
     ]
-    partial_orders = (
-        db.query(OrderExecution).filter(OrderExecution.recommendation_id.in_(partial_rec_ids)).all()
-        if partial_rec_ids else []
+    # Full batch context: every order of any recommendation touched above.
+    affected_rec_ids = sorted({e.recommendation_id for e in direct} | set(partial_rec_ids))
+    batch_orders = (
+        db.query(OrderExecution).filter(OrderExecution.recommendation_id.in_(affected_rec_ids)).all()
+        if affected_rec_ids else []
     )
+    partial_orders = batch_orders
 
     rec_status_cache: dict[int, str] = {}
 
@@ -2302,6 +2340,22 @@ def reconcile_execution(
             "status_code": 409,
         }
 
+    # execution_ready means the preflight was persisted but NO submission was
+    # ever started (the flow always commits 'submitting' before any POST).
+    # Its only truthful resolution is "it was never sent". Its prepared
+    # request may carry an expired quote/validity, a changed position or
+    # changed limits, so it can never be resumed or re-sent.
+    if previous_status in _PREPARED_NOT_SUBMITTED_STATUSES and action != "confirm_not_sent":
+        return {
+            "error": (
+                f"Una ejecución en '{previous_status}' fue preparada pero nunca enviada: "
+                "solo puede confirmarse como NO ENVIADA (confirm_not_sent). "
+                "No puede reanudarse ni reenviarse."
+            ),
+            "code": "not_reconcilable",
+            "status_code": 409,
+        }
+
     # Per-action evidence requirements
     clean_broker_id = (broker_order_id or "").strip()
     clean_note = (note or "").strip()
@@ -2369,6 +2423,8 @@ def reconcile_execution(
         "executed_price": executed_price,
         "source": "manual_user",
     }
+    if previous_status in _PREPARED_NOT_SUBMITTED_STATUSES:
+        audit_entry["reason_code"] = "prepared_but_not_submitted"
     br = dict(order_exec.broker_response or {})
     audit_list = list(br.get("reconciliation_audit") or [])
     audit_list.append(audit_entry)

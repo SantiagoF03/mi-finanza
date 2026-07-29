@@ -554,6 +554,8 @@ export default function App() {
     fresh_total_limit_exceeded: 'monto total del lote excedido con precio fresco',
     fresh_portfolio_pct_limit_exceeded: '% de cartera excedido con precio fresco',
     preflight_cancelled: 'cancelada: otra orden del lote falló el preflight',
+    execution_ready: 'Preparada, no enviada',
+    quote_timestamp_invalid: 'Timestamp de cotización inválido',
   }
 
   const tabs = [
@@ -1113,8 +1115,20 @@ export default function App() {
                   ))}
                 </details>
               )}
-              {(item.status === 'submitting' || item.status === 'manual_reconciliation_required') && (
-                <button className="btn-sm" onClick={() => { setReconTarget(item); setReconPhrase(''); }}>
+              {item.status === 'execution_ready' && (
+                <div className="info-box" style={{ fontSize: '0.85em', marginTop: 4 }}>
+                  Preflight completo, pero no se inició el envío. Solo puede confirmarse como no enviada.
+                </div>
+              )}
+              {(item.status === 'submitting' || item.status === 'manual_reconciliation_required' || item.status === 'execution_ready') && (
+                <button
+                  className="btn-sm"
+                  onClick={() => {
+                    setReconTarget(item)
+                    setReconPhrase('')
+                    setReconAction('confirm_not_sent')
+                  }}
+                >
                   Conciliar manualmente
                 </button>
               )}
@@ -1127,11 +1141,20 @@ export default function App() {
               <p style={{ fontSize: '0.9em' }}>
                 {reconTarget.symbol} {reconTarget.side} · cantidad {reconTarget.quantity_planned} · estado actual: {reconTarget.status}
               </p>
+              {reconTarget.status === 'execution_ready' && (
+                <div className="info-box" style={{ fontSize: '0.85em', marginBottom: 8 }}>
+                  Preflight completo, pero no se inició el envío. Solo puede confirmarse como no enviada:
+                  su request preparado puede tener cotización o validez vencida y no puede reanudarse ni reenviarse.
+                </div>
+              )}
               <select value={reconAction} onChange={(e) => { setReconAction(e.target.value); setReconPhrase(''); }}
+                      disabled={reconTarget.status === 'execution_ready'}
                       style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }}>
-                {Object.entries(RECON_ACTIONS).map(([value, cfg]) => (
-                  <option key={value} value={value}>{cfg.label}</option>
-                ))}
+                {Object.entries(RECON_ACTIONS)
+                  .filter(([value]) => reconTarget.status !== 'execution_ready' || value === 'confirm_not_sent')
+                  .map(([value, cfg]) => (
+                    <option key={value} value={value}>{cfg.label}</option>
+                  ))}
               </select>
               <p style={{ fontSize: '0.9em' }}>
                 Escribí exactamente: <code>{RECON_ACTIONS[reconAction].phrase(reconTarget.id)}</code>
