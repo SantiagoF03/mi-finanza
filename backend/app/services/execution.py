@@ -906,12 +906,19 @@ def _execute_validated_orders(
     be guaranteed — we guarantee we never auto-retry instead).
 
     Durability protocol:
-    1. Persist ALL OrderExecution intents (with request_audit traceability)
-       and COMMIT before instantiating the broker or fetching quotes.
-    2. Per order: reload → verify still eligible → mark 'submitting' → COMMIT
-       → single place_order call → persist outcome → COMMIT.
+    1. Persist ALL OrderExecution intents (with request_audit traceability,
+       quantity_sent=None — nothing was sent yet) and COMMIT before
+       instantiating the broker or fetching quotes.
+    2. Per order: reload → verify still eligible → fetch fresh quote (a
+       failure here is DEFINITIVE: place_order was never called → failed)
+       → mark 'submitting' + quantity_sent=quantity_planned + COMMIT →
+       single place_order call → persist outcome → COMMIT.
     3. A crash between 'submitting' and the outcome leaves the row in
        'submitting': visibly stuck, never auto-resent, approve returns 409.
+
+    quantity_sent semantics: None until the moment we commit 'submitting'
+    right before the broker call; it must never suggest a send happened
+    while the order is only 'execution_requested'.
 
     No snapshot re-fetch, no _plan_order re-run: symbol/side/quantity come
     verbatim from the signed preview. The fresh quote decides ONLY the price
@@ -945,8 +952,8 @@ def _execute_validated_orders(
             position_value_used=o["position_value_used"],
             quantity_planned=o["quantity_planned"],
             quantity=o["quantity_planned"],
-            quantity_sent=o["quantity_planned"],
-            broker_response={"request_audit": request_audit, "broker_result": None},
+            quantity_sent=None,
+            broker_response={"request_audit": request_audit, "broker_result": None, "reconciliation_audit": []},
         )
         db.add(order_exec)
         intents.append(order_exec)
@@ -975,20 +982,32 @@ def _execute_validated_orders(
                     uncertain_count += 1
                 continue
 
-            order_exec.status = "submitting"
-            db.commit()
+            # Fresh quote BEFORE 'submitting': any problem here is a
+            # DEFINITIVE preparation failure — place_order was never called,
+            # so this is 'failed', never 'manual_reconciliation_required'.
+            quote_error = None
+            quote = None
+            try:
+                quote = _get_fresh_quote(broker, order_exec.symbol, order_exec.side)
+            except Exception as exc:
+                quote_error = str(exc)[:300]
 
-            quote = _get_fresh_quote(broker, order_exec.symbol, order_exec.side)
-            if not quote["available"]:
-                # We KNOW nothing was sent → definitive failure, no reconciliation
+            if quote_error is not None or not quote.get("available"):
                 order_exec.status = "failed"
                 order_exec.error_message = (
-                    f"No fresh quote available for {order_exec.symbol}. Order NOT sent."
+                    f"Quote preparation failed for {order_exec.symbol} "
+                    f"({quote_error or 'no fresh quote available'}). Order NOT sent — place_order was never called."
                 )
                 order_exec.completed_at = datetime.now(timezone.utc)
                 db.commit()
                 executions.append(_exec_summary(order_exec))
                 continue
+
+            # Point of no return: from here the request may reach the broker.
+            # quantity_sent gets its value ONLY now, together with 'submitting'.
+            order_exec.status = "submitting"
+            order_exec.quantity_sent = order_exec.quantity_planned
+            db.commit()
 
             try:
                 result = broker.place_order(
@@ -1260,14 +1279,43 @@ def get_recent_executions(db: Session, limit: int = 20) -> list[dict]:
 
 
 def get_execution_by_id(db: Session, execution_id: int) -> dict | None:
-    """Get a single execution by ID."""
+    """Get a single execution by ID, with full audit detail and the
+    associated recommendation. Never includes credentials or tokens."""
     e = db.query(OrderExecution).filter(OrderExecution.id == execution_id).first()
     if not e:
         return None
-    return _exec_to_dict(e)
+    result = _exec_to_dict(e)
+    rec = db.query(Recommendation).filter(Recommendation.id == e.recommendation_id).first()
+    result["recommendation"] = {
+        "id": rec.id,
+        "status": rec.status,
+        "action": rec.action,
+        "created_at": rec.created_at.isoformat() if rec.created_at else None,
+        "superseded_at": rec.superseded_at.isoformat() if rec.superseded_at else None,
+    } if rec else None
+    return result
+
+
+def _extract_broker_response_audits(broker_response) -> dict:
+    """Safely split broker_response into its audit components.
+
+    Legacy rows may hold a raw broker payload instead of the structured
+    {request_audit, broker_result, reconciliation_audit} shape.
+    """
+    if not isinstance(broker_response, dict):
+        return {"request_audit": None, "broker_result": broker_response, "reconciliation_audit": []}
+    if "request_audit" in broker_response or "reconciliation_audit" in broker_response or "broker_result" in broker_response:
+        return {
+            "request_audit": broker_response.get("request_audit"),
+            "broker_result": broker_response.get("broker_result"),
+            "reconciliation_audit": broker_response.get("reconciliation_audit") or [],
+            "broker_status_checks": broker_response.get("broker_status_checks") or [],
+        }
+    return {"request_audit": None, "broker_result": broker_response, "reconciliation_audit": [], "broker_status_checks": []}
 
 
 def _exec_to_dict(e: OrderExecution) -> dict:
+    audits = _extract_broker_response_audits(e.broker_response)
     return {
         "id": e.id,
         "recommendation_id": e.recommendation_id,
@@ -1289,4 +1337,389 @@ def _exec_to_dict(e: OrderExecution) -> dict:
         "created_at": e.created_at.isoformat() if e.created_at else None,
         "sent_at": e.sent_at.isoformat() if e.sent_at else None,
         "completed_at": e.completed_at.isoformat() if e.completed_at else None,
+        "request_audit": audits.get("request_audit"),
+        "broker_result": audits.get("broker_result"),
+        "reconciliation_audit": audits.get("reconciliation_audit"),
+        "broker_status_checks": audits.get("broker_status_checks", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Execution Reconciliation V1 — manual resolution of uncertain orders.
+#
+# INVARIANTS:
+# - reconciliation NEVER creates orders, NEVER calls place_order, NEVER
+#   re-executes a recommendation, NEVER returns an order to execution_requested
+#   nor a recommendation to pending/blocked;
+# - only a human with the execution credential + exact phrase can reconcile;
+# - every action is appended to an append-only reconciliation_audit list;
+# - it works regardless of ORDER_EXECUTION_ENABLED: the safety lock blocks
+#   NEW orders, it must not prevent resolving a past uncertain one.
+# ---------------------------------------------------------------------------
+
+_RECONCILABLE_STATUSES = {"submitting", "manual_reconciliation_required"}
+
+_RECONCILIATION_ACTIONS = {
+    "confirm_not_sent": {
+        "target_status": "not_sent_confirmed",
+        "phrase": "CONCILIAR EJECUCION {execution_id} COMO NO ENVIADA",
+    },
+    "confirm_sent": {
+        "target_status": "execution_sent",
+        "phrase": "CONCILIAR EJECUCION {execution_id} COMO ENVIADA",
+    },
+    "confirm_rejected": {
+        "target_status": "rejected_by_broker",
+        "phrase": "CONCILIAR EJECUCION {execution_id} COMO RECHAZADA",
+    },
+    "confirm_executed": {
+        "target_status": "executed",
+        "phrase": "CONCILIAR EJECUCION {execution_id} COMO EJECUTADA",
+    },
+}
+
+_UNCERTAIN_ORDER_STATUSES = {"submitting", "manual_reconciliation_required", "execution_requested"}
+_SENT_ORDER_STATUSES = {"execution_sent", "executed"}
+_DEFINITIVE_FAIL_STATUSES = {"failed", "rejected_by_broker", "not_sent_confirmed", "validation_failed"}
+
+
+def reconciliation_phrase(execution_id: int, action: str) -> str:
+    return _RECONCILIATION_ACTIONS[action]["phrase"].format(execution_id=execution_id)
+
+
+def _recompute_recommendation_outcome(db: Session, recommendation_id: int) -> str | None:
+    """Recompute the aggregate recommendation status from ALL its orders.
+
+    Never returns the recommendation to pending/blocked (it can never become
+    approvable again).
+    """
+    rec = db.query(Recommendation).filter(Recommendation.id == recommendation_id).first()
+    if not rec:
+        return None
+    orders = db.query(OrderExecution).filter(
+        OrderExecution.recommendation_id == recommendation_id
+    ).all()
+    if not orders:
+        return rec.status
+
+    statuses = [o.status for o in orders]
+    if any(s in _UNCERTAIN_ORDER_STATUSES for s in statuses):
+        new_status = "manual_reconciliation_required"
+    elif all(s in _SENT_ORDER_STATUSES for s in statuses):
+        new_status = "approved"
+    elif any(s in _SENT_ORDER_STATUSES for s in statuses):
+        new_status = "execution_partial"
+    else:
+        new_status = "execution_failed"
+
+    rec.status = new_status
+    return new_status
+
+
+def get_reconciliation_queue(db: Session) -> list[dict]:
+    """Orders pending manual inspection: any order in submitting or
+    manual_reconciliation_required, plus every order of an execution_partial
+    recommendation (full picture for the partial batch)."""
+    direct = db.query(OrderExecution).filter(
+        OrderExecution.status.in_(sorted(_RECONCILABLE_STATUSES))
+    ).all()
+
+    partial_rec_ids = [
+        r.id for r in db.query(Recommendation).filter(Recommendation.status == "execution_partial").all()
+    ]
+    partial_orders = (
+        db.query(OrderExecution).filter(OrderExecution.recommendation_id.in_(partial_rec_ids)).all()
+        if partial_rec_ids else []
+    )
+
+    rec_status_cache: dict[int, str] = {}
+
+    def _rec_status(rec_id: int) -> str:
+        if rec_id not in rec_status_cache:
+            rec = db.query(Recommendation).filter(Recommendation.id == rec_id).first()
+            rec_status_cache[rec_id] = rec.status if rec else "unknown"
+        return rec_status_cache[rec_id]
+
+    seen: dict[int, OrderExecution] = {}
+    for e in list(direct) + list(partial_orders):
+        seen[e.id] = e
+
+    items = []
+    for e in sorted(seen.values(), key=lambda x: x.id, reverse=True):
+        audits = _extract_broker_response_audits(e.broker_response)
+        items.append({
+            "id": e.id,
+            "recommendation_id": e.recommendation_id,
+            "recommendation_status": _rec_status(e.recommendation_id),
+            "symbol": e.symbol,
+            "side": e.side,
+            "status": e.status,
+            "quantity_planned": e.quantity_planned,
+            "quantity_sent": e.quantity_sent,
+            "broker_order_id": e.broker_order_id or "",
+            "endpoint_used": e.endpoint_used or "",
+            "error_message": e.error_message or "",
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "sent_at": e.sent_at.isoformat() if e.sent_at else None,
+            "request_audit": audits.get("request_audit"),
+            "reconciliation_audit": audits.get("reconciliation_audit"),
+        })
+    return items
+
+
+def reconcile_execution(
+    db: Session,
+    execution_id: int,
+    *,
+    execution_key: str | None,
+    action: str,
+    confirmation_text: str | None,
+    note: str = "",
+    broker_order_id: str | None = None,
+    executed_quantity: float | None = None,
+    executed_price: float | None = None,
+) -> dict:
+    """Manually resolve an uncertain order. NEVER sends, retries or creates
+    orders — it only records a human decision with full audit trail.
+
+    Credentials are validated first (no information leak about rows), the
+    execution key is checked constant-time and never persisted or logged.
+    """
+    settings = get_settings()
+
+    # Credential gates first
+    if not settings.execution_admin_key:
+        return {
+            "error": "Conciliación bloqueada: credencial de ejecución no configurada en el servidor.",
+            "code": "execution_admin_key_not_configured",
+            "status_code": 423,
+        }
+    if not execution_key or not _secrets.compare_digest(str(execution_key), settings.execution_admin_key):
+        return {
+            "error": "Credencial de ejecución inválida o ausente.",
+            "code": "invalid_execution_key",
+            "status_code": 403,
+        }
+
+    if action not in _RECONCILIATION_ACTIONS:
+        return {
+            "error": f"Acción de conciliación inválida: '{action}'.",
+            "code": "invalid_reconciliation_action",
+            "status_code": 422,
+        }
+
+    order_exec = db.query(OrderExecution).filter(OrderExecution.id == execution_id).first()
+    if not order_exec:
+        return {"error": "Execution not found", "status_code": 404}
+
+    expected_phrase = reconciliation_phrase(execution_id, action)
+    if not confirmation_text or confirmation_text.strip() != expected_phrase:
+        return {
+            "error": f"Confirmación incorrecta. Frase requerida exacta: '{expected_phrase}'.",
+            "code": "confirmation_mismatch",
+            "status_code": 422,
+        }
+
+    previous_status = order_exec.status
+    # Eligibility: only uncertain states — with ONE tested exception:
+    # execution_sent may be corrected to executed with explicit evidence.
+    if action == "confirm_executed":
+        allowed_from = _RECONCILABLE_STATUSES | {"execution_sent"}
+    else:
+        allowed_from = _RECONCILABLE_STATUSES
+    if previous_status not in allowed_from:
+        return {
+            "error": f"El estado '{previous_status}' no es conciliable con la acción '{action}'.",
+            "code": "not_reconcilable",
+            "status_code": 409,
+        }
+
+    # Per-action evidence requirements
+    clean_broker_id = (broker_order_id or "").strip()
+    clean_note = (note or "").strip()
+    if action == "confirm_sent" and not clean_broker_id:
+        return {
+            "error": "confirm_sent requiere broker_order_id no vacío.",
+            "code": "broker_order_id_required",
+            "status_code": 422,
+        }
+    if action == "confirm_rejected" and not clean_note:
+        return {
+            "error": "confirm_rejected requiere una nota no vacía con el motivo.",
+            "code": "note_required",
+            "status_code": 422,
+        }
+    if action == "confirm_executed":
+        if not clean_broker_id and not (order_exec.broker_order_id or "").strip():
+            return {
+                "error": "confirm_executed requiere broker_order_id.",
+                "code": "broker_order_id_required",
+                "status_code": 422,
+            }
+        if not executed_quantity or executed_quantity <= 0:
+            return {
+                "error": "confirm_executed requiere executed_quantity > 0.",
+                "code": "executed_quantity_required",
+                "status_code": 422,
+            }
+        if not executed_price or executed_price <= 0:
+            return {
+                "error": "confirm_executed requiere executed_price > 0.",
+                "code": "executed_price_required",
+                "status_code": 422,
+            }
+
+    new_status = _RECONCILIATION_ACTIONS[action]["target_status"]
+
+    # Atomic conditional transition — a concurrent/repeated reconciliation
+    # loses the update and gets a 409; the same change is never applied twice.
+    claimed = (
+        db.query(OrderExecution)
+        .filter(OrderExecution.id == execution_id, OrderExecution.status == previous_status)
+        .update({"status": new_status}, synchronize_session=False)
+    )
+    if claimed != 1:
+        db.rollback()
+        return {
+            "error": "La ejecución fue conciliada por otra solicitud. Revisá el estado actual.",
+            "code": "reconciliation_conflict",
+            "status_code": 409,
+        }
+    db.refresh(order_exec)
+
+    now = _utcnow()
+
+    # Append-only audit entry — never includes credentials of any kind.
+    audit_entry = {
+        "timestamp": now.isoformat(),
+        "action": action,
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "note": clean_note,
+        "broker_order_id": clean_broker_id or None,
+        "executed_quantity": executed_quantity,
+        "executed_price": executed_price,
+        "source": "manual_user",
+    }
+    br = dict(order_exec.broker_response or {})
+    audit_list = list(br.get("reconciliation_audit") or [])
+    audit_list.append(audit_entry)
+    br["reconciliation_audit"] = audit_list
+    order_exec.broker_response = br
+
+    if action == "confirm_not_sent":
+        # Confirmed externally that IOL never received it. quantity_sent goes
+        # back to None: nothing was actually sent. NEVER re-sent, never back
+        # to execution_requested.
+        order_exec.quantity_sent = None
+        order_exec.completed_at = now
+    elif action == "confirm_sent":
+        order_exec.broker_order_id = clean_broker_id
+        if not order_exec.sent_at:
+            order_exec.sent_at = now
+    elif action == "confirm_rejected":
+        order_exec.error_message = clean_note
+        order_exec.completed_at = now
+    elif action == "confirm_executed":
+        if clean_broker_id:
+            order_exec.broker_order_id = clean_broker_id
+        order_exec.executed_quantity = executed_quantity
+        order_exec.executed_price = executed_price
+        order_exec.completed_at = now
+
+    db.flush()
+    recommendation_status = _recompute_recommendation_outcome(db, order_exec.recommendation_id)
+
+    app_log(db, "Conciliación manual de ejecución aplicada", context={
+        "execution_id": execution_id,
+        "recommendation_id": order_exec.recommendation_id,
+        "action": action,
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "source": "manual_user",
+    })
+    db.commit()
+
+    return {
+        "execution_id": execution_id,
+        "recommendation_id": order_exec.recommendation_id,
+        "action": action,
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "recommendation_status": recommendation_status,
+        "reconciliation_audit": audit_list,
+    }
+
+
+def refresh_broker_status(db: Session, execution_id: int, *, execution_key: str | None) -> dict:
+    """READ-ONLY broker status check by broker_order_id.
+
+    Uses the existing get_order_status (GET /api/v2/operaciones/{id} on IOL).
+    NEVER calls place_order, never creates or retries orders, and NEVER
+    changes the execution status automatically: IOL state labels are not a
+    contract we control, so mapping to 'executed' stays a manual decision
+    (conservative choice per spec). The raw result is appended to
+    broker_response.broker_status_checks for the human to inspect.
+    """
+    settings = get_settings()
+
+    if not settings.execution_admin_key:
+        return {
+            "error": "Consulta bloqueada: credencial de ejecución no configurada en el servidor.",
+            "code": "execution_admin_key_not_configured",
+            "status_code": 423,
+        }
+    if not execution_key or not _secrets.compare_digest(str(execution_key), settings.execution_admin_key):
+        return {
+            "error": "Credencial de ejecución inválida o ausente.",
+            "code": "invalid_execution_key",
+            "status_code": 403,
+        }
+
+    order_exec = db.query(OrderExecution).filter(OrderExecution.id == execution_id).first()
+    if not order_exec:
+        return {"error": "Execution not found", "status_code": 404}
+
+    if not (order_exec.broker_order_id or "").strip():
+        return {
+            "error": "La ejecución no tiene broker_order_id: no hay nada que consultar.",
+            "code": "broker_order_id_missing",
+            "status_code": 422,
+        }
+
+    broker = _get_execution_broker()
+    try:
+        result = broker.get_order_status(order_exec.broker_order_id)
+    except Exception as exc:
+        return {
+            "error": f"Consulta de estado falló: {str(exc)[:300]}",
+            "code": "broker_status_query_failed",
+            "status_code": 502,
+        }
+
+    now = _utcnow()
+    br = dict(order_exec.broker_response or {})
+    checks = list(br.get("broker_status_checks") or [])
+    checks.append({"timestamp": now.isoformat(), "raw": result})
+    br["broker_status_checks"] = checks
+    order_exec.broker_response = br
+
+    app_log(db, "Consulta read-only de estado de orden al broker", context={
+        "execution_id": execution_id,
+        "broker_order_id": order_exec.broker_order_id,
+        "broker_status": result.get("status"),
+    })
+    db.commit()
+
+    return {
+        "execution_id": execution_id,
+        "broker_order_id": order_exec.broker_order_id,
+        "broker_status": result.get("status"),
+        "status_unchanged": True,
+        "current_status": order_exec.status,
+        "raw_stored": True,
+        "message": (
+            "Consulta read-only registrada. El estado de la ejecución NO se cambió "
+            "automáticamente: la conciliación sigue siendo manual."
+        ),
     }

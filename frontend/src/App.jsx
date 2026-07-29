@@ -171,6 +171,17 @@ export default function App() {
   // Execution credential: React state only. Never localStorage/sessionStorage,
   // never VITE_*, never logged. Cleared on close and after submit.
   const [executionKeyInput, setExecutionKeyInput] = useState('')
+  // Reconciliation (Ejecuciones tab)
+  const [reconQueue, setReconQueue] = useState([])
+  const [reconTarget, setReconTarget] = useState(null)
+  const [reconAction, setReconAction] = useState('confirm_not_sent')
+  const [reconPhrase, setReconPhrase] = useState('')
+  const [reconNote, setReconNote] = useState('')
+  const [reconBrokerId, setReconBrokerId] = useState('')
+  const [reconQty, setReconQty] = useState('')
+  const [reconPrice, setReconPrice] = useState('')
+  // Same rules as executionKeyInput: React state only, cleared on close/submit.
+  const [reconKeyInput, setReconKeyInput] = useState('')
   const [cooldownMessage, setCooldownMessage] = useState('')
   const [cooldownRemaining, setCooldownRemaining] = useState(0)
   const [tab, setTab] = useState('dashboard')
@@ -224,7 +235,7 @@ export default function App() {
     setError('')
     setCurrentInfo('')
     try {
-      const [sRes, aRes, nRes, cRes, hRes, evRes, alRes, exRes] = await Promise.all([
+      const [sRes, aRes, nRes, cRes, hRes, evRes, alRes, exRes, rqRes] = await Promise.all([
         fetch(`${API}/portfolio/summary`),
         fetch(`${API}/portfolio/analysis`),
         fetch(`${API}/news/recent`),
@@ -232,7 +243,8 @@ export default function App() {
         fetch(`${API}/history`),
         fetch(`${API}/events/recent`),
         fetch(`${API}/alerts/current`),
-        fetch(`${API}/executions/recent`),
+        fetch(`${API}/executions/recent`, { headers: authHeaders() }),
+        fetch(`${API}/executions/reconciliation-queue`, { headers: authHeaders() }),
       ])
 
       if (!sRes.ok || !aRes.ok || !nRes.ok || !hRes.ok) throw new Error('backend_unavailable')
@@ -244,6 +256,7 @@ export default function App() {
       if (evRes.ok) setEvents(await evRes.json())
       if (alRes.ok) setAlerts(await alRes.json())
       if (exRes.ok) setExecutions(await exRes.json())
+      if (rqRes.ok) setReconQueue(await rqRes.json())
 
       if (cRes.status === 404) {
         setCurrent(null)
@@ -276,10 +289,86 @@ export default function App() {
       setCurrentInfo('')
       setExecutionPreview(null)
       setPreviewError('')
+      setReconQueue([])
     }
   }
 
   useEffect(() => { load() }, [])
+
+  const RECON_ACTIONS = {
+    confirm_not_sent: { label: 'Confirmar NO enviada', phrase: (id) => `CONCILIAR EJECUCION ${id} COMO NO ENVIADA` },
+    confirm_sent: { label: 'Confirmar enviada', phrase: (id) => `CONCILIAR EJECUCION ${id} COMO ENVIADA` },
+    confirm_rejected: { label: 'Confirmar rechazada', phrase: (id) => `CONCILIAR EJECUCION ${id} COMO RECHAZADA` },
+    confirm_executed: { label: 'Confirmar ejecutada', phrase: (id) => `CONCILIAR EJECUCION ${id} COMO EJECUTADA` },
+  }
+
+  const closeRecon = () => {
+    setReconTarget(null)
+    setReconAction('confirm_not_sent')
+    setReconPhrase('')
+    setReconNote('')
+    setReconBrokerId('')
+    setReconQty('')
+    setReconPrice('')
+    setReconKeyInput('')
+  }
+
+  const submitReconciliation = async () => {
+    if (!reconTarget?.id) return
+    const required = RECON_ACTIONS[reconAction]?.phrase(reconTarget.id)
+    // Frontend guards — the backend remains the final authority.
+    if (reconPhrase.trim() !== required) {
+      setError(`Frase de conciliación incorrecta. Escribí exactamente: ${required}`)
+      return
+    }
+    if (!reconNote.trim()) {
+      setError('La nota de conciliación es obligatoria (motivo y evidencia).')
+      return
+    }
+    if (!reconKeyInput) {
+      setError('Ingresá la credencial de ejecución.')
+      return
+    }
+    if (reconAction === 'confirm_sent' && !reconBrokerId.trim()) {
+      setError('confirm_sent requiere el broker order id.')
+      return
+    }
+    if (reconAction === 'confirm_executed' && (!reconBrokerId.trim() || !(Number(reconQty) > 0) || !(Number(reconPrice) > 0))) {
+      setError('confirm_executed requiere broker order id, cantidad y precio positivos.')
+      return
+    }
+
+    setLoading(true)
+    try {
+      const resp = await fetch(`${API}/executions/${reconTarget.id}/reconcile`, {
+        method: 'POST',
+        headers: authHeaders({
+          'Content-Type': 'application/json',
+          'X-Execution-Key': reconKeyInput,
+        }),
+        body: JSON.stringify({
+          action: reconAction,
+          confirmation_text: reconPhrase.trim(),
+          note: reconNote.trim(),
+          broker_order_id: reconBrokerId.trim() || null,
+          executed_quantity: reconQty ? Number(reconQty) : null,
+          executed_price: reconPrice ? Number(reconPrice) : null,
+        }),
+      })
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}))
+        setError(err.detail || 'Error al conciliar la ejecución.')
+      } else {
+        setError('')
+      }
+      await load()
+    } catch {
+      setError('Error al conciliar la ejecución.')
+    } finally {
+      setLoading(false)
+      closeRecon()
+    }
+  }
 
   const triggerAnalysis = async () => {
     setError('')
@@ -897,6 +986,90 @@ export default function App() {
       )}
 
       {/* EXECUTIONS TAB */}
+      {tab === 'executions' && reconQueue.length > 0 && (
+        <section>
+          <h2>Conciliación pendiente <span style={{ fontSize: '0.7em', color: '#888' }}>({reconQueue.length})</span></h2>
+          <p style={{ fontSize: '0.85em', color: '#888' }}>
+            Órdenes con resultado incierto. Conciliar registra una decisión manual: nunca reenvía ni crea órdenes.
+          </p>
+          {reconQueue.map((item) => (
+            <div key={`recon-${item.id}`} className="opportunity-item">
+              <Badge type={item.status}>{item.status}</Badge>{' '}
+              <strong>{item.symbol}</strong> {item.side} · ejecución #{item.id} · rec #{item.recommendation_id} ({item.recommendation_status})
+              <div style={{ fontSize: '0.85em' }}>
+                Cantidad planificada: {item.quantity_planned} · Enviada: {item.quantity_sent ?? '—'} · Broker order: {item.broker_order_id || '—'}
+              </div>
+              <div style={{ fontSize: '0.85em', color: '#888' }}>
+                Snapshot #{item.request_audit?.snapshot_id ?? '—'} · Hash: {(item.request_audit?.preview_hash || '').slice(0, 12) || '—'}…
+                {' '}· Monto est.: {Number(item.request_audit?.estimated_notional || 0).toLocaleString()} · {item.created_at && new Date(item.created_at).toLocaleString()}
+              </div>
+              {item.error_message && <div style={{ fontSize: '0.85em', color: 'var(--danger)' }}>{item.error_message}</div>}
+              {(item.reconciliation_audit || []).length > 0 && (
+                <details style={{ fontSize: '0.8em', color: '#888' }}>
+                  <summary style={{ cursor: 'pointer' }}>Auditoría previa ({item.reconciliation_audit.length})</summary>
+                  {item.reconciliation_audit.map((a, i) => (
+                    <div key={i}>{a.timestamp}: {a.action} ({a.previous_status} → {a.new_status}) — {a.note}</div>
+                  ))}
+                </details>
+              )}
+              {(item.status === 'submitting' || item.status === 'manual_reconciliation_required') && (
+                <button className="btn-sm" onClick={() => { setReconTarget(item); setReconPhrase(''); }}>
+                  Conciliar manualmente
+                </button>
+              )}
+            </div>
+          ))}
+
+          {reconTarget && (
+            <div className="detail-panel" style={{ border: '2px solid var(--danger, #c62828)', marginTop: 8 }}>
+              <h3>Conciliar ejecución #{reconTarget.id}</h3>
+              <p style={{ fontSize: '0.9em' }}>
+                {reconTarget.symbol} {reconTarget.side} · cantidad {reconTarget.quantity_planned} · estado actual: {reconTarget.status}
+              </p>
+              <select value={reconAction} onChange={(e) => { setReconAction(e.target.value); setReconPhrase(''); }}
+                      style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }}>
+                {Object.entries(RECON_ACTIONS).map(([value, cfg]) => (
+                  <option key={value} value={value}>{cfg.label}</option>
+                ))}
+              </select>
+              <p style={{ fontSize: '0.9em' }}>
+                Escribí exactamente: <code>{RECON_ACTIONS[reconAction].phrase(reconTarget.id)}</code>
+              </p>
+              <input type="text" value={reconPhrase} onChange={(e) => setReconPhrase(e.target.value)}
+                     placeholder={RECON_ACTIONS[reconAction].phrase(reconTarget.id)}
+                     style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }} />
+              <input type="text" value={reconNote} onChange={(e) => setReconNote(e.target.value)}
+                     placeholder="Nota obligatoria: motivo y evidencia"
+                     style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }} />
+              {(reconAction === 'confirm_sent' || reconAction === 'confirm_executed') && (
+                <input type="text" value={reconBrokerId} onChange={(e) => setReconBrokerId(e.target.value)}
+                       placeholder="Broker order id (IOL)"
+                       style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }} />
+              )}
+              {reconAction === 'confirm_executed' && (
+                <>
+                  <input type="number" value={reconQty} onChange={(e) => setReconQty(e.target.value)}
+                         placeholder="Cantidad ejecutada" min="0"
+                         style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }} />
+                  <input type="number" value={reconPrice} onChange={(e) => setReconPrice(e.target.value)}
+                         placeholder="Precio ejecutado" min="0"
+                         style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }} />
+                </>
+              )}
+              <input type="password" value={reconKeyInput} onChange={(e) => setReconKeyInput(e.target.value)}
+                     placeholder="Credencial de ejecución" autoComplete="off"
+                     style={{ display: 'block', width: '100%', marginBottom: 8, padding: 6 }} />
+              <div className="actions">
+                <button onClick={submitReconciliation} className="btn-danger" disabled={loading}>
+                  {loading ? 'Conciliando...' : 'Confirmar conciliación'}
+                </button>
+                <button onClick={closeRecon} disabled={loading}>Cancelar</button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
       {tab === 'executions' && (
         <section>
           <h2>Ejecuciones recientes</h2>
