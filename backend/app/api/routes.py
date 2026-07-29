@@ -227,20 +227,23 @@ def history(db: Session = Depends(get_db)):
 
 @router.post("/recommendations/{recommendation_id}/decision")
 def recommendation_decision(recommendation_id: int, payload: DecisionIn, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
-    """Unified decision endpoint — delegates to approve_and_execute or reject_recommendation.
+    """Decision endpoint — rejections only.
 
-    This ensures there is exactly ONE semantic path for each decision type:
-    - approved → delegates to approve_and_execute (triggers real execution)
-    - rejected → delegates to reject_recommendation (no execution)
+    There is exactly ONE executable approval route:
+    POST /recommendations/{id}/approve (reinforced contract: X-Execution-Key,
+    signed preview, exact confirmation phrase). decision=approved here is
+    permanently gone so no alternative path can bypass that contract.
     """
     if payload.decision not in {"approved", "rejected"}:
         raise HTTPException(400, "Decision debe ser approved o rejected")
 
     if payload.decision == "approved":
-        result = approve_and_execute(db, recommendation_id, note=payload.note or "")
-        if "error" in result:
-            raise HTTPException(result.get("status_code", 400), result["error"])
-        return result
+        raise HTTPException(
+            410,
+            "Aprobación por /decision deshabilitada. Usá POST "
+            f"/recommendations/{recommendation_id}/approve con el contrato reforzado "
+            "(X-Execution-Key, preview firmado y frase de confirmación).",
+        )
 
     # rejected
     result = reject_recommendation(db, recommendation_id, note=payload.note or "")

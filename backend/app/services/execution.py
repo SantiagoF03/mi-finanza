@@ -563,8 +563,13 @@ def _validate_reinforced_authorization(
     preview_hash: str | None,
     preview_generated_at: str | None,
     confirmation_text: str | None,
-) -> dict | None:
-    """Execution Authorization V1 checks. Returns an error dict or None if OK.
+) -> tuple[dict | None, dict | None]:
+    """Execution Authorization checks.
+
+    Returns (error, validated_preview):
+    - (error_dict, None) when any check fails
+    - (None, rebuilt_preview) when everything passes — the caller MUST execute
+      exactly these validated orders, never a recalculated plan (V2).
 
     Runs BEFORE any state change or broker interaction. The execution
     credential is never persisted, logged, or echoed back.
@@ -575,7 +580,7 @@ def _validate_reinforced_authorization(
             "error": "Ejecución bloqueada: credencial de ejecución no configurada en el servidor.",
             "code": "execution_admin_key_not_configured",
             "status_code": 423,
-        }
+        }, None
 
     # 8. X-Execution-Key must match (constant-time)
     if not execution_key or not _secrets.compare_digest(str(execution_key), settings.execution_admin_key):
@@ -583,7 +588,7 @@ def _validate_reinforced_authorization(
             "error": "Credencial de ejecución inválida o ausente.",
             "code": "invalid_execution_key",
             "status_code": 403,
-        }
+        }, None
 
     # 9. Preview signing must be configured
     if not settings.execution_preview_secret:
@@ -591,7 +596,7 @@ def _validate_reinforced_authorization(
             "error": "Ejecución bloqueada: firma de preview no configurada en el servidor.",
             "code": "preview_signing_not_configured",
             "status_code": 423,
-        }
+        }, None
 
     # 10. Exact confirmation phrase
     expected = confirmation_phrase(rec.id)
@@ -600,7 +605,7 @@ def _validate_reinforced_authorization(
             "error": f"Confirmación incorrecta. Frase requerida exacta: '{expected}'.",
             "code": "confirmation_mismatch",
             "status_code": 422,
-        }
+        }, None
 
     # 11. Preview must exist and not be expired
     if not preview_hash or not preview_generated_at:
@@ -608,7 +613,7 @@ def _validate_reinforced_authorization(
             "error": "Se requiere preview_hash y preview_generated_at del preview revisado.",
             "code": "preview_required",
             "status_code": 409,
-        }
+        }, None
     try:
         gen_dt = datetime.fromisoformat(preview_generated_at)
     except (ValueError, TypeError):
@@ -616,7 +621,7 @@ def _validate_reinforced_authorization(
             "error": "preview_generated_at inválido.",
             "code": "preview_invalid",
             "status_code": 409,
-        }
+        }, None
     if gen_dt.tzinfo is None:
         gen_dt = gen_dt.replace(tzinfo=timezone.utc)
     now = _utcnow()
@@ -625,14 +630,14 @@ def _validate_reinforced_authorization(
             "error": "El preview venció. Generá y revisá un preview nuevo.",
             "code": "preview_expired",
             "status_code": 409,
-        }
+        }, None
 
     # 12-15. Rebuild the preview server-side and require an exact signature match.
     # Any drift (new snapshot, changed actions/quantities, tampered hash,
     # different limits) produces a different HMAC.
     rebuilt = build_execution_preview(db, rec.id, generated_at=gen_dt)
     if "error" in rebuilt:
-        return {**rebuilt, "code": rebuilt.get("code", "preview_rebuild_failed")}
+        return {**rebuilt, "code": rebuilt.get("code", "preview_rebuild_failed")}, None
     server_hash = rebuilt.get("preview_hash") or ""
     if not server_hash or not _secrets.compare_digest(server_hash, str(preview_hash)):
         return {
@@ -642,7 +647,7 @@ def _validate_reinforced_authorization(
             ),
             "code": "preview_mismatch",
             "status_code": 409,
-        }
+        }, None
 
     # 16. Every order must be valid
     blocking = rebuilt.get("blocking_reasons", [])
@@ -651,7 +656,7 @@ def _validate_reinforced_authorization(
             "error": "Hay órdenes inválidas en el plan de ejecución.",
             "code": "invalid_order",
             "status_code": 422,
-        }
+        }, None
 
     # 17-19. Limits must be configured and respected
     if "execution_limits_not_configured" in blocking:
@@ -659,15 +664,47 @@ def _validate_reinforced_authorization(
             "error": "Ejecución bloqueada: límites de ejecución no configurados.",
             "code": "execution_limits_not_configured",
             "status_code": 423,
-        }
+        }, None
     for code in ("currency_mismatch", "order_limit_exceeded", "total_limit_exceeded", "portfolio_pct_limit_exceeded"):
         if code in blocking:
             return {
                 "error": f"Límite de ejecución violado: {code}.",
                 "code": code,
                 "status_code": 422,
-            }
+            }, None
 
+    return None, rebuilt
+
+
+def _crosscheck_validated_orders(actions: list, validated_orders: list[dict]) -> dict | None:
+    """Belt-and-suspenders re-verification of the validated preview against
+    the recommendation's actions. The HMAC already guarantees consistency;
+    any mismatch here means something is deeply wrong → fail closed."""
+    action_by_id = {a.id: a for a in actions}
+    if len(validated_orders) != len(actions):
+        return {
+            "error": "El preview validado no cubre exactamente las acciones de la recomendación.",
+            "code": "validated_orders_inconsistent",
+            "status_code": 409,
+        }
+    for o in validated_orders:
+        action = action_by_id.get(o.get("recommendation_action_id"))
+        expected_side = None
+        if action is not None:
+            expected_side = "sell" if action.target_change_pct < 0 else "buy"
+        if (
+            action is None
+            or action.symbol != o.get("symbol")
+            or expected_side != o.get("side")
+            or not o.get("valid")
+            or not o.get("quantity_planned")
+            or o.get("quantity_planned") <= 0
+        ):
+            return {
+                "error": "Inconsistencia entre el preview validado y las acciones de la recomendación.",
+                "code": "validated_orders_inconsistent",
+                "status_code": 409,
+            }
     return None
 
 
@@ -683,13 +720,18 @@ def approve_and_execute(
 ) -> dict:
     """Approve a recommendation and trigger order execution.
 
-    Execution Authorization V1:
+    Execution Authorization V2 (durability):
     - Real broker: ALWAYS requires the reinforced contract (execution key,
       signed non-expired preview, exact confirmation phrase, limits) on top
-      of the ORDER_EXECUTION_ENABLED safety lock.
+      of the ORDER_EXECUTION_ENABLED safety lock, and executes EXACTLY the
+      validated preview orders — never a recalculated plan.
     - Mock broker: legacy direct approve still works (tests/staging); if the
       reinforced fields are provided, they are fully validated so staging can
       rehearse the real flow without touching IOL.
+
+    Submission semantics: at-most-once automatic submission + manual
+    reconciliation on uncertain outcome. An interrupted or dubious order is
+    NEVER re-sent automatically.
 
     All validations run BEFORE any state change or broker interaction.
     Returns dict with execution results or error.
@@ -701,17 +743,29 @@ def approve_and_execute(
     if not rec:
         return {"error": "Recommendation not found", "status_code": 404}
 
-    # 2. Allowed state
-    if rec.status not in _APPROVABLE_STATUSES:
-        return {"error": f"No se puede aprobar: estado actual es '{rec.status}'", "status_code": 400}
-
-    # 3. Never executed before (server-side double-execution protection)
+    # 2. Never executed before (server-side double-execution protection).
+    # Checked BEFORE the status check so an interrupted execution (rec in
+    # execution_pending/manual_reconciliation_required with persisted intents)
+    # answers 409, never re-submits.
     if _has_prior_execution(db, recommendation_id):
         return {
-            "error": "La recomendación ya tiene ejecuciones o una aprobación previa.",
+            "error": "La recomendación ya tiene ejecuciones o una aprobación previa. No se reenvía automáticamente.",
             "code": "already_executed",
             "status_code": 409,
         }
+
+    # 3. Allowed state
+    if rec.status not in _APPROVABLE_STATUSES:
+        if rec.status in {"execution_pending", "submitting", "manual_reconciliation_required"}:
+            return {
+                "error": (
+                    f"La recomendación está en estado '{rec.status}': hay una ejecución en curso o "
+                    "con resultado incierto. Requiere conciliación manual, no se reenvía."
+                ),
+                "code": "already_executed_or_in_progress",
+                "status_code": 409,
+            }
+        return {"error": f"No se puede aprobar: estado actual es '{rec.status}'", "status_code": 400}
 
     # 4. Must be the current recommendation (not superseded)
     if rec.superseded_at is not None:
@@ -751,10 +805,23 @@ def approve_and_execute(
     reinforced = settings.broker_mode != "mock" or any(
         v is not None for v in (execution_key, preview_hash, preview_generated_at, confirmation_text)
     )
+    validated_preview = None
     if reinforced:
-        err = _validate_reinforced_authorization(
+        err, validated_preview = _validate_reinforced_authorization(
             db, rec, settings, execution_key, preview_hash, preview_generated_at, confirmation_text
         )
+        if err:
+            return err
+
+    # Load actions (needed for the cross-check BEFORE claiming)
+    actions = db.query(RecommendationAction).filter(
+        RecommendationAction.recommendation_id == recommendation_id
+    ).all()
+
+    # V2: re-verify the validated orders against the recommendation's actions.
+    # Fail closed pre-claim on any inconsistency.
+    if validated_preview is not None and actions and rec.action != "mantener":
+        err = _crosscheck_validated_orders(actions, validated_preview.get("orders_preview", []))
         if err:
             return err
 
@@ -789,11 +856,6 @@ def approve_and_execute(
         "action": rec.action,
     })
 
-    # Load actions
-    actions = db.query(RecommendationAction).filter(
-        RecommendationAction.recommendation_id == recommendation_id
-    ).all()
-
     if not actions or rec.action == "mantener":
         rec.status = "approved"
         db.commit()
@@ -803,6 +865,11 @@ def approve_and_execute(
             "executions": [],
             "message": "Aprobada sin órdenes (acción: mantener o sin activos afectados).",
         }
+
+    if validated_preview is not None:
+        # Durable reinforced path: persist intents, then submit exactly the
+        # validated preview orders. Internal errors resolve conservatively.
+        return _execute_validated_orders(db, rec, validated_preview, preview_generated_at)
 
     try:
         return _execute_claimed_orders(db, rec, actions, note)
@@ -822,8 +889,189 @@ def approve_and_execute(
         }
 
 
+# States from which an order must NEVER be automatically re-submitted.
+_NO_RESUBMIT_STATUSES = {"submitting", "execution_sent", "manual_reconciliation_required"}
+
+
+def _execute_validated_orders(
+    db: Session,
+    rec: Recommendation,
+    validated_preview: dict,
+    preview_generated_at: str | None,
+) -> dict:
+    """Durable execution of EXACTLY the validated preview orders (V2).
+
+    Semantics: at-most-once automatic submission + manual reconciliation on
+    uncertain outcome (IOL offers no idempotency keys, so exactly-once cannot
+    be guaranteed — we guarantee we never auto-retry instead).
+
+    Durability protocol:
+    1. Persist ALL OrderExecution intents (with request_audit traceability)
+       and COMMIT before instantiating the broker or fetching quotes.
+    2. Per order: reload → verify still eligible → mark 'submitting' → COMMIT
+       → single place_order call → persist outcome → COMMIT.
+    3. A crash between 'submitting' and the outcome leaves the row in
+       'submitting': visibly stuck, never auto-resent, approve returns 409.
+
+    No snapshot re-fetch, no _plan_order re-run: symbol/side/quantity come
+    verbatim from the signed preview. The fresh quote decides ONLY the price
+    (limit vs market), never symbol/side/quantity.
+    """
+    recommendation_id = rec.id
+    orders = validated_preview.get("orders_preview", [])
+    preview_hash = validated_preview.get("preview_hash", "")
+    snapshot_id = validated_preview.get("snapshot_id")
+
+    # --- Phase 1: persist intents, then COMMIT (durability point) ---
+    intents: list[OrderExecution] = []
+    for o in orders:
+        request_audit = {
+            "snapshot_id": snapshot_id,
+            "preview_hash": preview_hash,
+            "preview_generated_at": preview_generated_at,
+            "estimated_notional": o.get("estimated_notional"),
+            "portfolio_pct": o.get("portfolio_pct"),
+            "execution_request_id": f"rec{recommendation_id}-act{o['recommendation_action_id']}-{preview_hash[:16]}",
+        }
+        order_exec = OrderExecution(
+            recommendation_id=recommendation_id,
+            recommendation_action_id=o["recommendation_action_id"],
+            symbol=o["symbol"],
+            side=o["side"],
+            target_change_pct=o["target_change_pct"],
+            status="execution_requested",
+            validation_status="passed",
+            portfolio_value_used=o["portfolio_value_used"],
+            position_value_used=o["position_value_used"],
+            quantity_planned=o["quantity_planned"],
+            quantity=o["quantity_planned"],
+            quantity_sent=o["quantity_planned"],
+            broker_response={"request_audit": request_audit, "broker_result": None},
+        )
+        db.add(order_exec)
+        intents.append(order_exec)
+
+    # Claim + UserDecision + intents survive a process crash from here on.
+    db.commit()
+
+    # --- Phase 2: submit each intent at most once ---
+    executions = []
+    sent_count = 0
+    uncertain_count = 0
+
+    try:
+        broker = _get_execution_broker()
+
+        for order_exec in intents:
+            # Reload the persisted row and verify single-attempt eligibility
+            db.refresh(order_exec)
+            if order_exec.status != "execution_requested":
+                # submitting / sent / manual_reconciliation_required etc.
+                # → never auto-resubmit
+                executions.append(_exec_summary(order_exec))
+                if order_exec.status == "execution_sent":
+                    sent_count += 1
+                elif order_exec.status in ("submitting", "manual_reconciliation_required"):
+                    uncertain_count += 1
+                continue
+
+            order_exec.status = "submitting"
+            db.commit()
+
+            quote = _get_fresh_quote(broker, order_exec.symbol, order_exec.side)
+            if not quote["available"]:
+                # We KNOW nothing was sent → definitive failure, no reconciliation
+                order_exec.status = "failed"
+                order_exec.error_message = (
+                    f"No fresh quote available for {order_exec.symbol}. Order NOT sent."
+                )
+                order_exec.completed_at = datetime.now(timezone.utc)
+                db.commit()
+                executions.append(_exec_summary(order_exec))
+                continue
+
+            try:
+                result = broker.place_order(
+                    symbol=order_exec.symbol,
+                    side=order_exec.side,
+                    quantity=order_exec.quantity_planned,
+                    price=quote["price"],
+                )
+            except Exception as exc:
+                # Uncertain outcome: IOL may or may not have received the
+                # order. NEVER assume it is safe to retry.
+                order_exec.status = "manual_reconciliation_required"
+                order_exec.error_message = (
+                    f"Resultado incierto del broker: {str(exc)[:300]}. "
+                    "Requiere conciliación manual. NO se reintenta automáticamente."
+                )
+                order_exec.completed_at = datetime.now(timezone.utc)
+                db.commit()
+                uncertain_count += 1
+                executions.append(_exec_summary(order_exec))
+                continue
+
+            # Persist the broker outcome immediately, preserving request_audit
+            order_exec.broker_order_id = result.get("order_id", "")
+            order_exec.endpoint_used = result.get("endpoint_used", "")
+            order_exec.sent_at = datetime.now(timezone.utc)
+            order_exec.broker_response = {
+                **(order_exec.broker_response or {}),
+                "broker_result": result.get("raw_response", result),
+            }
+            if result.get("status") == "sent":
+                order_exec.status = "execution_sent"
+                sent_count += 1
+            elif result.get("status") == "rejected":
+                order_exec.status = "rejected_by_broker"
+                order_exec.error_message = result.get("error", "Broker rejected order")
+                order_exec.completed_at = datetime.now(timezone.utc)
+            else:
+                order_exec.status = "failed"
+                order_exec.error_message = result.get("error", "Unknown error")
+                order_exec.completed_at = datetime.now(timezone.utc)
+            db.commit()
+            executions.append(_exec_summary(order_exec))
+
+    except Exception as exc:
+        # Infrastructure failure mid-loop: conservative resolution. Intents
+        # already persisted; nothing gets re-sent automatically.
+        logger.error("Infrastructure failure during validated execution of rec %s: %s", recommendation_id, exc)
+        uncertain_count += 1
+
+    # --- Phase 3: recommendation outcome ---
+    total = len(intents)
+    if uncertain_count > 0:
+        rec.status = "manual_reconciliation_required"
+    elif sent_count == total and total > 0:
+        rec.status = "approved"
+    elif sent_count == 0:
+        rec.status = "execution_failed"
+    else:
+        rec.status = "execution_partial"
+    db.commit()
+
+    # Best-effort notification (notifications NEVER execute orders)
+    try:
+        from app.notifications.dispatcher import dispatch_execution_notification
+        for order_exec in intents:
+            dispatch_execution_notification(order_exec, db=db)
+    except Exception as exc:
+        logger.warning("Post-execution notification dispatch failed: %s", exc)
+
+    return {
+        "recommendation_id": recommendation_id,
+        "status": rec.status,
+        "executions": executions,
+        "message": (
+            f"{len(executions)} órdenes procesadas: {sent_count} enviadas, "
+            f"{uncertain_count} con resultado incierto."
+        ),
+    }
+
+
 def _execute_claimed_orders(db: Session, rec: Recommendation, actions: list, note: str) -> dict:
-    """Run the order loop for an already-claimed recommendation."""
+    """Legacy order loop (mock broker without reinforced fields — never IOL)."""
     recommendation_id = rec.id
 
     # Load latest snapshot for order planning
