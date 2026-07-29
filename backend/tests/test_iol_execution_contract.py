@@ -124,9 +124,28 @@ def _sandbox_settings(**extra):
         iol_order_validity_minutes=10,
         execution_max_quote_age_seconds=15,
         execution_max_price_deviation_pct=0.05,
+        # Execution scope: AAPL explicitly authorized FOR TESTS ONLY.
+        execution_sell_only=True,
+        execution_require_live_position_check=True,
+        execution_instrument_policies={
+            "AAPL": {
+                "asset_type": "CEDEAR", "instrument_type": "CEDEAR", "currency": "USD",
+                "market": "bCBA", "settlement": "t1",
+                "quantity_step": 1, "max_quantity": 100, "max_notional": 1_000_000,
+            }
+        },
     )
     base.update(extra)
     return base
+
+
+def _live_positions(quantity=20, asset_type="CEDEAR", instrument_type="CEDEAR", currency="USD"):
+    """Live portfolio payload matching the test snapshot identity."""
+    return {"positions": [{
+        "symbol": "AAPL", "asset_type": asset_type, "instrument_type": instrument_type,
+        "currency": currency, "quantity": quantity, "market_value": 38000,
+        "avg_price": 180, "pnl_pct": 0.11,
+    }]}
 
 
 def _reinforced_approve(db, rec, preview, key=TEST_ADMIN_KEY):
@@ -165,9 +184,13 @@ def test_sandbox_never_uses_real_host():
     with exec_settings(**_sandbox_settings(iol_sandbox_api_base="https://api.invertironline.com")):
         env = resolve_execution_environment(get_settings())
     assert "sandbox_environment_invalid" in env["errors"]
-    with exec_settings(**_sandbox_settings(iol_sandbox_api_base="https://proxy.example/api.invertironline.com")):
+    # Exact hostname comparison: a lookalike host is NOT the real API, but it
+    # is also never accepted for real (see test_real_never_uses_sandbox_host).
+    with exec_settings(broker_mode="real", iol_use_sandbox=False,
+                       iol_real_api_base="https://api.invertironline.com.evil.example",
+                       iol_real_username="u", iol_real_password="p"):
         env = resolve_execution_environment(get_settings())
-    assert "sandbox_environment_invalid" in env["errors"]
+    assert "real_environment_invalid" in env["errors"]
 
 
 def test_real_never_uses_sandbox_host():
@@ -301,6 +324,7 @@ def _run_iol_flow(db, broker_quote, submit_result=None, settings_extra=None):
     db.commit()
     fake_broker = mock.MagicMock()
     fake_broker.get_execution_quote.return_value = broker_quote
+    fake_broker.get_portfolio_snapshot.return_value = _live_positions()
     fake_broker.submit_order_request.return_value = submit_result or {
         "outcome": "sent", "order_id": "SBX-1", "raw_response": {"numeroOperacion": "SBX-1"},
         "endpoint_used": "/api/v2/operar/Vender", "error": "",
@@ -498,6 +522,13 @@ def test_end_to_end_sandbox_flow_with_mock_transport(db):
         assert request.url.host == "sandbox.iol-test.local", "must NEVER touch another host"
         if request.url.path == "/token":
             return _token_response()
+        if request.url.path.startswith("/api/v2/portafolio/"):
+            return httpx.Response(200, json={"activos": [{
+                "titulo": {"simbolo": "AAPL", "tipo": "cedears", "moneda": "dolar_estadounidense"},
+                "cantidad": 20, "valorizado": 38000, "ppc": 180, "gananciaPorcentaje": 11,
+            }]})
+        if request.url.path == "/api/v2/estadocuenta":
+            return httpx.Response(200, json={"disponible": 12000})
         if request.url.path.startswith("/api/v2/Cotizaciones/detalle/bCBA/AAPL"):
             return httpx.Response(200, json={"puntas": {"precioCompra": 1900.0, "precioVenta": 1910.0}})
         if request.url.path == "/api/v2/operar/Vender":
@@ -585,6 +616,13 @@ def test_uncertain_e2e_never_retries_and_blocks_second_approve(db):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/token":
             return _token_response()
+        if request.url.path.startswith("/api/v2/portafolio/"):
+            return httpx.Response(200, json={"activos": [{
+                "titulo": {"simbolo": "AAPL", "tipo": "cedears", "moneda": "dolar_estadounidense"},
+                "cantidad": 20, "valorizado": 38000, "ppc": 180, "gananciaPorcentaje": 11,
+            }]})
+        if request.url.path == "/api/v2/estadocuenta":
+            return httpx.Response(200, json={"disponible": 12000})
         if request.url.path.startswith("/api/v2/Cotizaciones/"):
             return httpx.Response(200, json={"puntas": {"precioCompra": 1900.0}})
         if request.url.path == "/api/v2/operar/Vender":

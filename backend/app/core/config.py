@@ -45,6 +45,32 @@ class Settings(BaseSettings):
     # 0 = NOT CONFIGURED → real/sandbox execution blocked (never "no limit").
     execution_max_price_deviation_pct: float = 0.0
 
+    # --- Execution scope & instrument guard (fail closed) ---
+    # Initial phase: sells only. Buys are blocked for sandbox/real.
+    execution_sell_only: bool = True
+    # Per-symbol allowlist, loaded from JSON. Empty = no instrument may be
+    # traded (blocks sandbox and real). Never ship a productive policy here.
+    execution_instrument_policies: dict = Field(default_factory=dict)
+    # Re-verify the live position (read-only) right before submitting.
+    execution_require_live_position_check: bool = True
+
+    @field_validator("execution_instrument_policies", mode="before")
+    @classmethod
+    def parse_instrument_policies(cls, v):
+        if isinstance(v, str):
+            raw = v.strip()
+            if not raw:
+                return {}
+            import json as _json
+            try:
+                parsed = _json.loads(raw)
+            except ValueError as exc:
+                raise ValueError(f"EXECUTION_INSTRUMENT_POLICIES must be valid JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("EXECUTION_INSTRUMENT_POLICIES must be a JSON object")
+            return parsed
+        return v
+
     news_provider: str = "mock"  # mock | rss
     news_rss_urls: List[str] = Field(
         default_factory=lambda: [

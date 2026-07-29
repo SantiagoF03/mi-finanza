@@ -525,6 +525,24 @@ export default function App() {
     portfolio_pct_limit_exceeded: 'límite porcentual del portfolio excedido',
     currency_mismatch: 'monedas incompatibles, no se convierte automáticamente',
     already_executed: 'la recomendación ya fue ejecutada',
+    execution_scope_not_configured: 'no hay instrumentos autorizados para operar',
+    instrument_policy_missing: 'el símbolo no tiene política de ejecución',
+    instrument_policy_invalid: 'política de instrumento inválida',
+    symbol_not_allowed: 'símbolo no autorizado',
+    buy_execution_disabled: 'compras deshabilitadas (fase sell-only)',
+    instrument_identity_mismatch: 'la identidad del instrumento no coincide',
+    instrument_currency_mismatch: 'la moneda del instrumento no coincide',
+    instrument_market_mismatch: 'el mercado del instrumento no coincide',
+    instrument_settlement_mismatch: 'el plazo del instrumento no coincide',
+    quantity_step_mismatch: 'la cantidad no respeta el step permitido',
+    symbol_quantity_limit_exceeded: 'cantidad máxima por símbolo excedida',
+    symbol_notional_limit_exceeded: 'monto máximo por símbolo excedido',
+    live_position_verification_required: 'falta verificar la posición real',
+    live_position_verification_failed: 'no se pudo verificar la posición real',
+    live_position_missing: 'la posición real ya no existe',
+    live_position_insufficient: 'la posición real es insuficiente',
+    broker_environment_requires_https: 'el ambiente del broker requiere HTTPS',
+    broker_environment_url_invalid: 'la URL del ambiente del broker es inválida',
   }
 
   const tabs = [
@@ -705,6 +723,16 @@ export default function App() {
                       <div style={{ fontSize: '0.85em' }}>
                         Precio ref snapshot: {Number(o.snapshot_price_ref || 0).toLocaleString()} · Monto estimado: {Number(o.estimated_notional || 0).toLocaleString()} · % portfolio: {(Number(o.portfolio_pct || 0) * 100).toFixed(2)}% · Válida: {o.valid ? 'sí' : 'no'}
                       </div>
+                      {o.instrument_identity?.symbol && (
+                        <div style={{ fontSize: '0.85em', color: '#888' }}>
+                          Instrumento: {o.instrument_identity.symbol} · activo {o.instrument_identity.asset_type} · instrumento {o.instrument_identity.instrument_type} · moneda {o.instrument_identity.currency} · mercado {o.instrument_identity.market} · plazo {o.instrument_identity.settlement}
+                        </div>
+                      )}
+                      {o.execution_scope?.quantity_step != null && (
+                        <div style={{ fontSize: '0.85em', color: '#888' }}>
+                          Alcance: {o.execution_scope.sell_only ? 'solo venta' : 'compra y venta'} · step {o.execution_scope.quantity_step} · máx cantidad {Number(o.execution_scope.max_quantity || 0).toLocaleString()} · máx monto {Number(o.execution_scope.max_notional || 0).toLocaleString()}
+                        </div>
+                      )}
                       {o.blocked_reason && (
                         <div className="info-box info-blocked">{o.blocked_reason}</div>
                       )}
@@ -1000,7 +1028,16 @@ export default function App() {
           <h2>Estado de ejecución</h2>
           <div style={{ fontSize: '0.9em' }}>
             <p>
-              Broker: <strong>{execReadiness.broker_mode}</strong> ({execReadiness.environment}) · Host: {execReadiness.api_host || '—'}
+              Broker configurado: <strong>{execReadiness.configured_broker_mode || execReadiness.broker_mode}</strong>
+              {' '}· Ambiente efectivo: <strong>{execReadiness.effective_environment || execReadiness.environment}</strong>
+              {' '}· Host: {execReadiness.api_host || '—'}
+              {' '}· HTTPS: {(execReadiness.blocking_reasons || []).some((r) => r.startsWith('broker_environment_')) ? '✗' : '✓'}
+            </p>
+            <p style={{ fontSize: '0.9em' }}>
+              Sell-only: <strong>{execReadiness.execution_sell_only ? 'sí' : 'no'}</strong>
+              {' '}· Chequeo de posición real: <strong>{execReadiness.live_position_check_required ? 'sí' : 'no'}</strong>
+              {' '}· Instrumentos autorizados: <strong>{execReadiness.instrument_policy_count ?? 0}</strong>
+              {(execReadiness.allowed_symbols || []).length > 0 && ` (${execReadiness.allowed_symbols.join(', ')})`}
             </p>
             <p style={{ fontSize: '0.9em' }}>
               Lock real: <strong>{execReadiness.order_execution_enabled ? 'ABIERTO' : 'cerrado'}</strong>

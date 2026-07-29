@@ -678,6 +678,10 @@ def test_simulated_real_flow_reaches_place_order_only_after_all_validations(db):
         "outcome": "sent", "order_id": "SIM-1", "raw_response": {"numeroOperacion": "SIM-1"},
         "endpoint_used": "/api/v2/operar/Vender", "error": "",
     }
+    fake_broker.get_portfolio_snapshot.return_value = {"positions": [{
+        "symbol": "AAPL", "asset_type": "CEDEAR", "instrument_type": "CEDEAR",
+        "currency": "USD", "quantity": 20, "market_value": 38000,
+    }]}
     real_env = dict(
         broker_mode="real", order_execution_enabled=True,
         iol_real_username="test-user", iol_real_password="test-pass",
@@ -685,6 +689,15 @@ def test_simulated_real_flow_reaches_place_order_only_after_all_validations(db):
         iol_order_type="precioLimite", iol_order_validity_minutes=10,
         execution_max_quote_age_seconds=15,
         execution_max_price_deviation_pct=0.05,
+        execution_sell_only=True,
+        execution_require_live_position_check=True,
+        execution_instrument_policies={
+            "AAPL": {
+                "asset_type": "CEDEAR", "instrument_type": "CEDEAR", "currency": "USD",
+                "market": "bCBA", "settlement": "t1",
+                "quantity_step": 1, "max_quantity": 100, "max_notional": 1_000_000,
+            }
+        },
     )
     with exec_settings(**_full_auth_settings(**real_env)):
         preview = build_execution_preview(db, rec.id)
