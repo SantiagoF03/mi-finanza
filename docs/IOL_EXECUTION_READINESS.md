@@ -123,6 +123,40 @@ firmada y alcance la cantidad. Solo puede **bloquear**: nunca reduce ni
 aumenta la cantidad firmada. Sus fallos son definitivos previos al broker
 (`failed`, `quantity_sent=null`, sin POST), nunca conciliación incierta.
 
+## Invariantes V1 (no configurables para sandbox/real)
+
+- **Live position check obligatorio**: `EXECUTION_REQUIRE_LIVE_POSITION_CHECK`
+  en `false` bloquea preview, readiness y approve (423,
+  `live_position_verification_required`) antes de cualquier escritura.
+- **Fase estrictamente sell-only**: `EXECUTION_SELL_ONLY` en `false` bloquea
+  igual (`sell_only_mode_required`) — todavía no existe guard de saldo/cash
+  para compras, así que las compras quedan fuera de alcance por completo.
+  Aun con sell-only activo, toda orden `buy` se bloquea con
+  `buy_execution_disabled`.
+- **Preflight total antes de enviar**: la cartera live se lee **una sola vez
+  por lote**; luego se validan todas las posiciones, todas las cotizaciones,
+  todos los notionals y límites, y se construyen todos los requests. Recién
+  cuando **todas** las órdenes quedan en `execution_ready` empieza la fase
+  de envío.
+- **Ningún POST si falla una orden del lote**: la orden causante queda
+  `failed` con su código específico y las demás `preflight_cancelled`; la
+  recomendación queda `execution_failed`, con `quantity_sent=null` en todas.
+- **Límites revalidados con la cotización fresca** (`Decimal`, nunca float):
+  por orden (`fresh_order_limit_exceeded`), por símbolo
+  (`fresh_symbol_notional_limit_exceeded`), por porcentaje de cartera live
+  (`fresh_portfolio_pct_limit_exceeded`) y por total del lote
+  (`fresh_total_limit_exceeded`). Los límites del snapshot siguen aplicando
+  antes, en el preview.
+- **Validación numérica estricta**: `NaN`, `Infinity`, negativos, cero donde
+  no corresponde y valores no numéricos se rechazan explícitamente
+  (`invalid_live_position_quantity`, `invalid_execution_quantity`,
+  `invalid_execution_price`, `invalid_portfolio_value`,
+  `invalid_execution_notional`).
+- **Los estados inciertos no se reintentan**: un timeout o un 2xx sin
+  `numeroOperacion` deja la orden en `manual_reconciliation_required`; un
+  proceso caído con órdenes en `execution_ready` o `submitting` requiere
+  revisión manual — no hay reintento automático en ninguna parte del sistema.
+
 Verificación rápida: `GET /api/broker/execution-readiness` (con X-API-Key)
 muestra ambiente configurado vs efectivo, locks, sell-only, chequeo de
 posición, símbolos autorizados, qué falta configurar y los blocking
