@@ -1,8 +1,30 @@
+import math
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import List
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _finite_number(value) -> float | None:
+    """Parse a setting into a finite float, rejecting NaN/Infinity/bools/junk.
+
+    Booleans are rejected explicitly: True must never stand in for 1 in a
+    financial threshold.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        dec = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError, AttributeError):
+        return None
+    if not dec.is_finite():
+        return None
+    num = float(dec)
+    if not math.isfinite(num):
+        return None
+    return num
 
 
 class Settings(BaseSettings):
@@ -42,6 +64,9 @@ class Settings(BaseSettings):
     iol_order_type: str = "precioLimite"
     iol_order_validity_minutes: int = 10
     execution_max_quote_age_seconds: int = 15
+    # Tolerance for a quote timestamp slightly ahead of our clock (broker
+    # clock skew). Anything further in the future is rejected.
+    execution_quote_clock_skew_seconds: int = 2
     # 0 = NOT CONFIGURED → real/sandbox execution blocked (never "no limit").
     execution_max_price_deviation_pct: float = 0.0
 
@@ -181,11 +206,44 @@ class Settings(BaseSettings):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
 
-    @field_validator("execution_preview_ttl_seconds", "execution_max_recommendation_age_minutes")
+    @field_validator(
+        "execution_preview_ttl_seconds",
+        "execution_max_recommendation_age_minutes",
+        "iol_order_validity_minutes",
+        "execution_max_quote_age_seconds",
+        mode="before",
+    )
     @classmethod
     def validate_positive_execution_windows(cls, v, info):
-        if v <= 0:
-            raise ValueError(f"{info.field_name} must be > 0")
+        """Strictly positive finite windows — a zero/NaN window would make
+        order timing comparisons ambiguous during an execution."""
+        num = _finite_number(v)
+        if num is None or num <= 0:
+            raise ValueError(f"{info.field_name} must be a finite number > 0 (got {v!r})")
+        return v
+
+    @field_validator(
+        "execution_max_price_deviation_pct",
+        "execution_max_order_value",
+        "execution_max_total_value",
+        "execution_max_portfolio_pct",
+        mode="before",
+    )
+    @classmethod
+    def validate_fail_closed_limits(cls, v, info):
+        """0 is allowed and means NOT CONFIGURED (blocks execution); negative
+        or non-finite values are always rejected."""
+        num = _finite_number(v)
+        if num is None or num < 0:
+            raise ValueError(f"{info.field_name} must be a finite number >= 0 (got {v!r})")
+        return v
+
+    @field_validator("execution_quote_clock_skew_seconds", mode="before")
+    @classmethod
+    def validate_clock_skew(cls, v, info):
+        num = _finite_number(v)
+        if num is None or num < 0 or num > 10:
+            raise ValueError(f"{info.field_name} must be a finite number between 0 and 10 (got {v!r})")
         return v
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
