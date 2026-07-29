@@ -171,6 +171,7 @@ export default function App() {
   // Execution credential: React state only. Never localStorage/sessionStorage,
   // never VITE_*, never logged. Cleared on close and after submit.
   const [executionKeyInput, setExecutionKeyInput] = useState('')
+  const [execReadiness, setExecReadiness] = useState(null)
   // Reconciliation (Ejecuciones tab)
   const [reconQueue, setReconQueue] = useState([])
   const [reconTarget, setReconTarget] = useState(null)
@@ -235,7 +236,7 @@ export default function App() {
     setError('')
     setCurrentInfo('')
     try {
-      const [sRes, aRes, nRes, cRes, hRes, evRes, alRes, exRes, rqRes] = await Promise.all([
+      const [sRes, aRes, nRes, cRes, hRes, evRes, alRes, exRes, rqRes, erRes] = await Promise.all([
         fetch(`${API}/portfolio/summary`),
         fetch(`${API}/portfolio/analysis`),
         fetch(`${API}/news/recent`),
@@ -245,6 +246,7 @@ export default function App() {
         fetch(`${API}/alerts/current`),
         fetch(`${API}/executions/recent`, { headers: authHeaders() }),
         fetch(`${API}/executions/reconciliation-queue`, { headers: authHeaders() }),
+        fetch(`${API}/broker/execution-readiness`, { headers: authHeaders() }),
       ])
 
       if (!sRes.ok || !aRes.ok || !nRes.ok || !hRes.ok) throw new Error('backend_unavailable')
@@ -257,6 +259,7 @@ export default function App() {
       if (alRes.ok) setAlerts(await alRes.json())
       if (exRes.ok) setExecutions(await exRes.json())
       if (rqRes.ok) setReconQueue(await rqRes.json())
+      if (erRes.ok) setExecReadiness(await erRes.json())
 
       if (cRes.status === 404) {
         setCurrent(null)
@@ -714,6 +717,12 @@ export default function App() {
                       {' '}({executionPreview.limits.configured ? 'configurados' : 'no configurados'}) · Total estimado: {Number(executionPreview.limits.total_estimated_notional || 0).toLocaleString()}
                     </p>
                   )}
+                  {executionPreview.execution_venue && (
+                    <p style={{ fontSize: '0.85em', color: '#888' }}>
+                      Política de orden: mercado {executionPreview.execution_venue.market || '—'} · plazo {executionPreview.execution_venue.settlement || '—'} · tipo {executionPreview.execution_venue.order_type || '—'} · validez {executionPreview.execution_venue.validity_minutes} min
+                      {' '}· cotización: {executionPreview.execution_venue.quote_policy} (máx {executionPreview.execution_venue.max_quote_age_seconds}s) · desviación máx {(Number(executionPreview.execution_venue.max_price_deviation_pct || 0) * 100).toFixed(2)}%
+                    </p>
+                  )}
                 </div>
               )}
 
@@ -986,6 +995,38 @@ export default function App() {
       )}
 
       {/* EXECUTIONS TAB */}
+      {tab === 'executions' && execReadiness && (
+        <section>
+          <h2>Estado de ejecución</h2>
+          <div style={{ fontSize: '0.9em' }}>
+            <p>
+              Broker: <strong>{execReadiness.broker_mode}</strong> ({execReadiness.environment}) · Host: {execReadiness.api_host || '—'}
+            </p>
+            <p style={{ fontSize: '0.9em' }}>
+              Lock real: <strong>{execReadiness.order_execution_enabled ? 'ABIERTO' : 'cerrado'}</strong>
+              {' '}· Lock sandbox: <strong>{execReadiness.sandbox_execution_enabled ? 'ABIERTO' : 'cerrado'}</strong>
+              {' '}· Credenciales: {execReadiness.credentials_configured ? '✓' : '✗'}
+              {' '}· Execution key: {execReadiness.execution_admin_key_configured ? '✓' : '✗'}
+              {' '}· Firma preview: {execReadiness.preview_secret_configured ? '✓' : '✗'}
+              {' '}· Límites: {execReadiness.limits_configured ? '✓' : '✗'}
+              {' '}· Política de orden: {execReadiness.order_policy_configured ? `✓ ${execReadiness.market}/${execReadiness.settlement}` : '✗'}
+            </p>
+            <p>
+              Listo para ejecución real: <strong>{execReadiness.ready_for_real_execution ? 'SÍ' : 'no'}</strong>
+              {' '}· Listo para sandbox: <strong>{execReadiness.ready_for_sandbox_execution ? 'SÍ' : 'no'}</strong>
+            </p>
+            {(execReadiness.blocking_reasons || []).length > 0 && (
+              <details style={{ fontSize: '0.85em', color: '#888' }}>
+                <summary style={{ cursor: 'pointer' }}>Motivos de bloqueo ({execReadiness.blocking_reasons.length})</summary>
+                <ul style={{ margin: '4px 0 0 16px' }}>
+                  {execReadiness.blocking_reasons.map((code) => <li key={code}>{code}</li>)}
+                </ul>
+              </details>
+            )}
+          </div>
+        </section>
+      )}
+
       {tab === 'executions' && reconQueue.length > 0 && (
         <section>
           <h2>Conciliación pendiente <span style={{ fontSize: '0.7em', color: '#888' }}>({reconQueue.length})</span></h2>
