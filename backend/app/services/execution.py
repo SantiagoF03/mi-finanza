@@ -34,6 +34,7 @@ from sqlalchemy import desc
 from sqlalchemy.orm import Session, joinedload
 
 from app.broker.clients import IolBrokerClient, MockBrokerClient
+from app.broker.numeric import decimal_str, non_negative_decimal, positive_decimal, to_finite_decimal
 from app.core.config import get_settings
 from app.models.models import (
     OrderExecution,
@@ -513,6 +514,24 @@ def _execution_venue(settings) -> dict:
     }
 
 
+def _preflight_policy_reasons(settings) -> list[str]:
+    """V1 non-negotiable execution policy for sandbox/real.
+
+    - the live position guard can NOT be disabled;
+    - the phase is strictly sell-only (there is no cash/balance guard for
+      buys yet, so buys stay out of scope entirely).
+    Mock effective environment is exempt (never reaches IOL).
+    """
+    if _effective_environment(settings) == "mock":
+        return []
+    reasons = []
+    if not settings.execution_require_live_position_check:
+        reasons.append("live_position_verification_required")
+    if not settings.execution_sell_only:
+        reasons.append("sell_only_mode_required")
+    return reasons
+
+
 def _venue_blocking_reasons(settings) -> list[str]:
     """Order-policy and environment blocking codes for sandbox/real brokers.
 
@@ -559,7 +578,7 @@ def get_execution_readiness() -> dict:
 
     settings = get_settings()
     env = resolve_execution_environment(settings)
-    venue_reasons = _venue_blocking_reasons(settings)
+    venue_reasons = _venue_blocking_reasons(settings) + _preflight_policy_reasons(settings)
 
     from app.broker.instrument_scope import load_instrument_policies
 
@@ -612,6 +631,10 @@ def get_execution_readiness() -> dict:
         "order_type": settings.iol_order_type,
         "execution_sell_only": bool(settings.execution_sell_only),
         "live_position_check_required": bool(settings.execution_require_live_position_check),
+        # V1 invariants (not configurable away for sandbox/real)
+        "sell_only_mode_required": True,
+        "batch_preflight_enabled": True,
+        "fresh_limit_revalidation_enabled": True,
         "execution_scope_configured": bool(policies) and not policy_errors,
         "allowed_symbols": sorted(policies.keys()),
         "instrument_policy_count": len(policies),
@@ -681,6 +704,7 @@ def build_execution_preview(
         blocking_reasons.append("preview_signing_not_configured")
     blocking_reasons.extend(_evaluate_limit_reasons(orders_preview, snapshot, settings))
     blocking_reasons.extend(_venue_blocking_reasons(settings))
+    blocking_reasons.extend(_preflight_policy_reasons(settings))
     for code in scope_reasons:
         if code not in blocking_reasons:
             blocking_reasons.append(code)
@@ -849,6 +873,8 @@ def _validate_reinforced_authorization(
     # order-level verdicts, so a missing scope/environment never masquerades
     # as an invalid order.
     for code in (
+        "live_position_verification_required",
+        "sell_only_mode_required",
         "execution_scope_not_configured",
         "instrument_policy_invalid",
         "broker_environment_requires_https",
@@ -1061,6 +1087,24 @@ def approve_and_execute(
             "status_code": 423,
         }
 
+    # 6b. V1 execution policy — non-negotiable for sandbox/real. Checked
+    # BEFORE any DB write: no claim, no UserDecision, no OrderExecution,
+    # no quote, no broker, no POST.
+    policy_reasons = _preflight_policy_reasons(settings)
+    if policy_reasons:
+        code = policy_reasons[0]
+        detail = (
+            "El chequeo de posición real es obligatorio "
+            "(EXECUTION_REQUIRE_LIVE_POSITION_CHECK=true)."
+            if code == "live_position_verification_required"
+            else "La fase V1 es estrictamente sell-only (EXECUTION_SELL_ONLY=true)."
+        )
+        return {
+            "error": f"Ejecución bloqueada por política V1: {detail}",
+            "code": code,
+            "status_code": 423,
+        }
+
     # 7-19. Reinforced authorization — mandatory for sandbox/real; opt-in for
     # mock (staging rehearsal) when any reinforced field is provided.
     reinforced = effective_env != "mock" or any(
@@ -1151,7 +1195,11 @@ def approve_and_execute(
 
 
 # States from which an order must NEVER be automatically re-submitted.
-_NO_RESUBMIT_STATUSES = {"submitting", "execution_sent", "manual_reconciliation_required"}
+# execution_ready is included: a crash after preflight requires manual
+# review, never an automatic retry.
+_NO_RESUBMIT_STATUSES = {
+    "submitting", "execution_sent", "manual_reconciliation_required", "execution_ready",
+}
 
 
 def _fail_order_definitive(db: Session, order_exec: OrderExecution, message: str) -> None:
@@ -1162,120 +1210,69 @@ def _fail_order_definitive(db: Session, order_exec: OrderExecution, message: str
     db.commit()
 
 
-def _verify_live_position(db: Session, order_exec: OrderExecution, broker, preview_order: dict) -> str | None:
-    """Read-only live position re-verification before ANY submission.
+def _check_live_position(order_exec: OrderExecution, preview_order: dict, live_positions: list) -> tuple[dict | None, str | None]:
+    """Verify ONE order against the already-fetched live portfolio.
 
-    Uses the public broker contract (get_portfolio_snapshot) — never private
-    internals. Purely a guard: it can only BLOCK, never adjust the order.
-    A larger live position does not increase the signed quantity; a smaller
-    one blocks instead of shrinking it.
-
-    All failures here are DEFINITIVE pre-broker failures (status=failed,
-    quantity_sent stays None, no submission ever happened) — never
-    manual_reconciliation_required.
-
-    Returns a blocking code, or None when the guard passes.
+    Pure check (no DB writes): returns (live_position_check_audit, error_code).
+    It can only BLOCK — the signed quantity is never resized.
     """
     from app.broker.instrument_scope import normalize_symbol
 
     identity = preview_order.get("instrument_identity") or {}
     symbol = normalize_symbol(order_exec.symbol)
-    required_qty = order_exec.quantity_planned
 
-    try:
-        live = broker.get_portfolio_snapshot()
-        positions = (live or {}).get("positions") or []
-    except Exception as exc:
-        _fail_order_definitive(
-            db, order_exec,
-            f"live_position_verification_failed: could not read the live portfolio "
-            f"({str(exc)[:200]}). Order NOT sent.",
-        )
-        return "live_position_verification_failed"
+    required_qty = positive_decimal(order_exec.quantity_planned)
+    if required_qty is None:
+        return None, "invalid_execution_quantity"
 
     match = None
-    for p in positions:
+    for p in live_positions:
         if normalize_symbol(p.get("symbol")) == symbol:
             match = p
             break
-
     if match is None:
-        _fail_order_definitive(
-            db, order_exec,
-            f"live_position_missing: {symbol} is no longer in the live portfolio. Order NOT sent.",
-        )
-        return "live_position_missing"
+        return None, "live_position_missing"
 
-    # Identity must still match what was signed.
     if identity:
         if (match.get("asset_type") or "") != identity.get("asset_type") or \
            (match.get("instrument_type") or "") != identity.get("instrument_type"):
-            _fail_order_definitive(
-                db, order_exec,
-                f"instrument_identity_mismatch: live {symbol} identity differs from the signed preview. Order NOT sent.",
-            )
-            return "instrument_identity_mismatch"
+            return None, "instrument_identity_mismatch"
         if (match.get("currency") or "") != identity.get("currency"):
-            _fail_order_definitive(
-                db, order_exec,
-                f"instrument_currency_mismatch: live {symbol} currency differs from the signed preview. Order NOT sent.",
-            )
-            return "instrument_currency_mismatch"
+            return None, "instrument_currency_mismatch"
 
-    try:
-        available = float(match.get("quantity") or 0)
-    except (TypeError, ValueError):
-        available = 0.0
-
+    available = non_negative_decimal(match.get("quantity"))
+    if available is None:
+        # NaN / Infinity / negative / non-numeric live quantity
+        return None, "invalid_live_position_quantity"
     if available < required_qty:
-        _fail_order_definitive(
-            db, order_exec,
-            f"live_position_insufficient: live {symbol} quantity {available} < signed "
-            f"{required_qty}. Order NOT sent (quantity is never reduced automatically).",
-        )
-        return "live_position_insufficient"
+        return None, "live_position_insufficient"
 
-    # Persist ONLY the relevant position data — never the whole portfolio,
-    # never tokens or credentials.
-    br = dict(order_exec.broker_response or {})
-    request_audit = dict(br.get("request_audit") or {})
-    request_audit["live_position_check"] = {
+    return {
         "checked_at": _utcnow().isoformat(),
         "symbol": symbol,
-        "quantity_available": available,
-        "quantity_required": required_qty,
+        "quantity_available": float(available),
+        "quantity_required": float(required_qty),
         "asset_type": match.get("asset_type") or "",
         "instrument_type": match.get("instrument_type") or "",
         "currency": match.get("currency") or "",
         "passed": True,
-    }
-    br["request_audit"] = request_audit
-    order_exec.broker_response = br
-    db.commit()
-    return None
+    }, None
 
 
-def _submit_iol_validated_order(
-    db: Session,
+def _preflight_one_order(
     order_exec: OrderExecution,
+    preview_order: dict,
     broker,
     settings,
-    preview_order: dict,
-) -> str:
-    """Submit ONE validated order through the canonical IOL contract.
+    live_positions: list,
+    live_portfolio_value: Decimal,
+    policies: dict,
+) -> tuple[dict | None, str | None]:
+    """Prepare ONE order completely, without sending anything.
 
-    Returns "sent" | "uncertain" | "failed" (definitive, nothing sent).
-
-    Sequence (fail closed at every step):
-    1. executable quote (bid for sell / ask for buy — never ultimoPrecio),
-       validated for age and deviation vs the signed snapshot_price_ref;
-    2. deterministic validity (ART timezone, same operating day);
-    3. canonical form-urlencoded request built by build_iol_order_request
-       (precioLimite only, exact integer quantity, stable Decimal price);
-    4. request_audit updated with execution_quote + the EXACT iol_request,
-       then 'submitting' + quantity_sent committed — the body can never be
-       rebuilt with different data after this commit;
-    5. single submit_order_request call with typed outcome classification.
+    Returns (prepared, error_code). `prepared` carries the exact IOL request
+    plus every audit fragment. NOTHING here touches the network except the
+    executable quote query, and no order is ever submitted.
     """
     from app.broker.environment import api_host_of, resolve_execution_environment
     from app.broker.order_request import build_iol_order_request, compute_order_validity
@@ -1285,34 +1282,29 @@ def _submit_iol_validated_order(
     market = settings.iol_order_market
     settlement = settings.iol_order_settlement
 
-    # --- 0. LIVE POSITION GUARD (before quoting, before 'submitting') ---
-    # Read-only re-verification that the real position still exists, still
-    # matches the signed identity and is still sufficient. It NEVER
-    # recalculates the order: quantity stays exactly the signed one.
-    if settings.execution_require_live_position_check and side == "sell":
-        guard_error = _verify_live_position(db, order_exec, broker, preview_order)
-        if guard_error:
-            return "failed"
+    # 1-2. Live identity + quantity
+    live_check, err = _check_live_position(order_exec, preview_order, live_positions)
+    if err:
+        return None, err
 
-    # --- 1. Executable quote (definitive failures: nothing sent yet) ---
+    quantity = positive_decimal(order_exec.quantity_planned)
+    if quantity is None:
+        return None, "invalid_execution_quantity"
+
+    # 3. Executable quote (bid for sell / ask for buy — never last price)
     try:
         quote = broker.get_execution_quote(symbol, side, market, settlement)
-    except Exception as exc:
-        _fail_order_definitive(
-            db, order_exec,
-            f"quote_unavailable: quote query failed for {symbol} ({str(exc)[:200]}). Order NOT sent.",
-        )
-        return "failed"
+    except Exception:
+        return None, "quote_unavailable"
+    if not quote or not quote.get("available") or quote.get("source") not in ("bid", "ask"):
+        return None, "quote_unavailable"
 
-    if not quote.get("available") or quote.get("source") not in ("bid", "ask") or not quote.get("price"):
-        _fail_order_definitive(
-            db, order_exec,
-            f"quote_unavailable: no executable {'bid' if side == 'sell' else 'ask'} for {symbol}. "
-            "Order NOT sent — a missing book side is never converted into a market order.",
-        )
-        return "failed"
+    fresh_price = positive_decimal(quote.get("price"))
+    if fresh_price is None:
+        # Covers NaN / Infinity / zero / negative / non-numeric prices
+        return None, "invalid_execution_price"
 
-    # Quote age
+    # 4. Quote freshness
     try:
         retrieved_at = datetime.fromisoformat(quote["retrieved_at"])
         if retrieved_at.tzinfo is None:
@@ -1321,86 +1313,248 @@ def _submit_iol_validated_order(
     except (KeyError, ValueError, TypeError):
         age_seconds = None
     if age_seconds is None or age_seconds > settings.execution_max_quote_age_seconds:
-        _fail_order_definitive(
-            db, order_exec,
-            f"quote_stale: quote for {symbol} is older than "
-            f"{settings.execution_max_quote_age_seconds}s. Order NOT sent.",
-        )
-        return "failed"
+        return None, "quote_stale"
 
-    # Price deviation vs the signed snapshot reference
-    fresh_price = Decimal(str(quote["price"]))
-    snapshot_ref = preview_order.get("snapshot_price_ref")
-    if not snapshot_ref or snapshot_ref <= 0:
-        _fail_order_definitive(
-            db, order_exec,
-            f"price_deviation_exceeded: no snapshot price reference for {symbol}. Order NOT sent.",
-        )
-        return "failed"
-    deviation = abs(fresh_price - Decimal(str(snapshot_ref))) / Decimal(str(snapshot_ref))
+    # 5. Deviation vs the SIGNED snapshot reference
+    snapshot_ref = positive_decimal(preview_order.get("snapshot_price_ref"))
+    if snapshot_ref is None:
+        return None, "invalid_execution_price"
+    deviation = abs(fresh_price - snapshot_ref) / snapshot_ref
     deviation_pct = float(deviation.quantize(Decimal("0.000001")))
     if deviation_pct > settings.execution_max_price_deviation_pct:
-        _fail_order_definitive(
-            db, order_exec,
-            f"price_deviation_exceeded: fresh price {fresh_price} deviates {deviation_pct:.4%} "
-            f"from snapshot ref {snapshot_ref} (max {settings.execution_max_price_deviation_pct:.4%}). Order NOT sent.",
-        )
-        return "failed"
+        return None, "price_deviation_exceeded"
 
-    # --- 2. Deterministic validity (ART, same operating day) ---
+    # 6. Deterministic validity (ART, same operating day)
     validity, validity_err = compute_order_validity(settings.iol_order_validity_minutes)
     if validity_err:
-        _fail_order_definitive(
-            db, order_exec,
-            f"{validity_err}: computed order validity is not usable. Order NOT sent.",
-        )
-        return "failed"
+        return None, validity_err
 
-    # --- 3. Canonical request (pure builder, fail closed) ---
+    # 7. Canonical form-urlencoded request (precioLimite only)
     order_request, build_err = build_iol_order_request(
-        side=side,
-        symbol=symbol,
-        quantity=order_exec.quantity_planned,
-        price=fresh_price,
-        market=market,
-        settlement=settlement,
-        order_type=settings.iol_order_type,
-        validity=validity,
+        side=side, symbol=symbol, quantity=quantity, price=fresh_price,
+        market=market, settlement=settlement,
+        order_type=settings.iol_order_type, validity=validity,
     )
     if build_err:
-        _fail_order_definitive(
-            db, order_exec,
-            f"{build_err}: cannot build a valid IOL order request. Order NOT sent.",
-        )
-        return "failed"
+        return None, build_err
 
-    # --- 4. Exact request audit + submitting, ONE commit before the POST ---
+    # 8. ACTUAL notional with the FRESH price (Decimal, never float)
+    actual_notional = (quantity * fresh_price).quantize(Decimal("0.01"))
+    if to_finite_decimal(actual_notional) is None or actual_notional <= 0:
+        return None, "invalid_execution_notional"
+    fresh_portfolio_pct = (actual_notional / live_portfolio_value).quantize(Decimal("0.000001"))
+
+    # 9. Re-validate limits against the FRESH notional
+    policy = policies.get(_normalized(symbol))
+    if policy is None:
+        return None, "instrument_policy_missing"
+    if actual_notional > Decimal(str(policy["max_notional"])):
+        return None, "fresh_symbol_notional_limit_exceeded"
+    max_order_value = positive_decimal(settings.execution_max_order_value)
+    if max_order_value is None or actual_notional > max_order_value:
+        return None, "fresh_order_limit_exceeded"
+    max_pct = positive_decimal(settings.execution_max_portfolio_pct)
+    if max_pct is None or fresh_portfolio_pct > max_pct:
+        return None, "fresh_portfolio_pct_limit_exceeded"
+
+    # 10. Request audit (exactly what will be sent; never credentials)
     env = resolve_execution_environment(settings)
-    br = dict(order_exec.broker_response or {})
-    request_audit = dict(br.get("request_audit") or {})
-    request_audit["execution_quote"] = {
-        "price": float(fresh_price),
-        "source": quote["source"],
-        "retrieved_at": quote["retrieved_at"],
-        "market": market,
-        "settlement": settlement,
-        "deviation_pct": deviation_pct,
+    return {
+        "order_exec": order_exec,
+        "order_request": order_request,
+        "actual_notional": actual_notional,
+        "audit": {
+            "live_position_check": live_check,
+            "execution_quote": {
+                "price": float(fresh_price),
+                "source": quote["source"],
+                "retrieved_at": quote["retrieved_at"],
+                "market": market,
+                "settlement": settlement,
+                "deviation_pct": deviation_pct,
+            },
+            "actual_notional": decimal_str(actual_notional),
+            "fresh_portfolio_pct": decimal_str(fresh_portfolio_pct, "0.000001"),
+            "live_portfolio_value_used": decimal_str(live_portfolio_value),
+            "iol_request": {
+                "environment": env["environment"],
+                "api_host": api_host_of(env),
+                "endpoint": order_request["endpoint"],
+                "content_type": order_request["content_type"],
+                **order_request["form_data"],
+            },
+        },
+    }, None
+
+
+def _normalized(symbol) -> str:
+    from app.broker.instrument_scope import normalize_symbol
+    return normalize_symbol(symbol)
+
+
+def _live_portfolio_total(live: dict, live_positions: list) -> Decimal | None:
+    """Finite positive live portfolio total, used ONLY for the percentage.
+
+    Prefers an explicit total_value; otherwise derives it deterministically
+    from the live positions plus cash (the broker snapshot contract does not
+    always carry a precomputed total). Any non-finite component invalidates
+    the whole value — fail closed.
+    """
+    explicit = positive_decimal(live.get("total_value"))
+    if explicit is not None:
+        return explicit
+    if live.get("total_value") is not None:
+        # Present but not a positive finite number → do NOT silently derive.
+        return None
+
+    total = Decimal("0")
+    for p in live_positions:
+        value = to_finite_decimal(p.get("market_value"))
+        if value is None or value < 0:
+            return None
+        total += value
+    cash = live.get("cash")
+    if cash is not None:
+        cash_dec = to_finite_decimal(cash)
+        if cash_dec is None or cash_dec < 0:
+            return None
+        total += cash_dec
+    return total if total > 0 else None
+
+
+def prepare_validated_execution_batch(
+    db: Session,
+    intents: list,
+    orders_by_action: dict,
+    broker,
+    settings,
+) -> tuple[list[dict] | None, str | None]:
+    """Full preflight for the WHOLE batch — no order is submitted here.
+
+    Reads the live portfolio ONCE, validates every position, quote, notional
+    and limit, builds every IOL request, checks the batch total, and only
+    then commits every order as execution_ready.
+
+    Returns (prepared_orders, error_code). On any failure NOTHING is
+    submitted: the causing order is marked failed with its specific code and
+    every other order becomes preflight_cancelled.
+    """
+    from app.broker.instrument_scope import load_instrument_policies
+
+    policies, _ = load_instrument_policies(settings)
+
+    # --- Single live portfolio read for the whole batch ---
+    try:
+        live = broker.get_portfolio_snapshot() or {}
+        live_positions = live.get("positions") or []
+    except Exception as exc:
+        _cancel_batch(db, intents, None, "live_position_verification_failed",
+                      f"could not read the live portfolio ({str(exc)[:150]})")
+        return None, "live_position_verification_failed"
+
+    live_portfolio_value = _live_portfolio_total(live, live_positions)
+    if live_portfolio_value is None:
+        # Missing / zero / negative / NaN / Infinity portfolio value
+        _cancel_batch(db, intents, None, "invalid_portfolio_value",
+                      "live portfolio total value is not a positive finite number")
+        return None, "invalid_portfolio_value"
+
+    prepared: list[dict] = []
+    for order_exec in intents:
+        preview_order = orders_by_action.get(order_exec.recommendation_action_id) or {}
+        result, err = _preflight_one_order(
+            order_exec, preview_order, broker, settings,
+            live_positions, live_portfolio_value, policies,
+        )
+        if err:
+            _cancel_batch(db, intents, order_exec, err, "preflight validation failed")
+            return None, err
+        prepared.append(result)
+
+    # --- Batch total limit against FRESH notionals ---
+    total_actual = sum((p["actual_notional"] for p in prepared), Decimal("0"))
+    max_total = positive_decimal(settings.execution_max_total_value)
+    if max_total is None or total_actual > max_total:
+        # Batch-level limit: no order may be sent.
+        _cancel_batch(db, intents, None, "fresh_total_limit_exceeded",
+                      f"batch total {total_actual} exceeds {settings.execution_max_total_value}")
+        return None, "fresh_total_limit_exceeded"
+
+    batch_audit = {
+        "total_actual_notional": decimal_str(total_actual),
+        "max_total_value": decimal_str(max_total),
+        "passed": True,
     }
-    # Exactly what will be sent — never credentials/tokens.
-    request_audit["iol_request"] = {
-        "environment": env["environment"],
-        "api_host": api_host_of(env),
-        "endpoint": order_request["endpoint"],
-        "content_type": order_request["content_type"],
-        **order_request["form_data"],
-    }
-    br["request_audit"] = request_audit
-    order_exec.broker_response = br
+
+    # --- Commit the FULL preflight: every order becomes execution_ready ---
+    for p in prepared:
+        order_exec = p["order_exec"]
+        br = dict(order_exec.broker_response or {})
+        request_audit = dict(br.get("request_audit") or {})
+        request_audit.update(p["audit"])
+        request_audit["batch_preflight"] = batch_audit
+        br["request_audit"] = request_audit
+        order_exec.broker_response = br
+        order_exec.status = "execution_ready"
+    db.commit()
+
+    return prepared, None
+
+
+def _cancel_batch(db: Session, intents: list, failed_order, code: str, detail: str) -> None:
+    """Abort the whole batch before ANY submission.
+
+    The causing order gets `failed` with its specific code; every other
+    not-yet-submitted order becomes `preflight_cancelled`. quantity_sent
+    stays None everywhere — nothing was ever sent, so this can never be a
+    manual reconciliation case.
+    """
+    now = datetime.now(timezone.utc)
+    for order_exec in intents:
+        if order_exec.status in ("execution_sent", "manual_reconciliation_required", "submitting"):
+            continue
+        # failed_order None → batch-level failure (portfolio read, portfolio
+        # value, batch total): every order failed for the same definitive
+        # reason, so all of them carry the specific code.
+        if failed_order is None or order_exec is failed_order:
+            order_exec.status = "failed"
+            order_exec.error_message = (
+                f"{code}: {detail}. Order NOT sent — no order in this batch was submitted."
+            )[:500]
+        else:
+            order_exec.status = "preflight_cancelled"
+            order_exec.error_message = (
+                f"preflight_cancelled: another order in the batch failed preflight ({code}). "
+                "No order in this batch was submitted."
+            )[:500]
+        order_exec.quantity_sent = None
+        order_exec.completed_at = now
+    db.commit()
+
+
+def _submit_prepared_order(db: Session, prepared: dict, broker) -> str:
+    """Submit ONE already-prepared (execution_ready) order, at most once.
+
+    Returns "sent" | "rejected" | "uncertain". The request body was fixed at
+    preflight time and is sent verbatim — it is never rebuilt here.
+    """
+    order_exec = prepared["order_exec"]
+    order_request = prepared["order_request"]
+
+    db.refresh(order_exec)
+    if order_exec.status != "execution_ready":
+        # Never submit anything that is not execution_ready.
+        if order_exec.status == "execution_sent":
+            return "sent"
+        if order_exec.status in ("submitting", "manual_reconciliation_required"):
+            return "uncertain"
+        return "skipped"
+
+    # Point of no return: quantity_sent is set together with 'submitting'.
     order_exec.status = "submitting"
     order_exec.quantity_sent = order_exec.quantity_planned
     db.commit()
 
-    # --- 5. Single submission with typed classification ---
     try:
         result = broker.submit_order_request(order_request)
     except Exception as exc:
@@ -1432,8 +1586,8 @@ def _submit_iol_validated_order(
         db.commit()
         return "rejected"
 
-    # submission_uncertain (or anything unclassified): IOL may have received
-    # the order. Manual reconciliation, NEVER auto-retry.
+    # submission_uncertain: IOL may have received the order. Manual
+    # reconciliation, NEVER auto-retry.
     order_exec.status = "manual_reconciliation_required"
     order_exec.error_message = (
         f"Resultado incierto del broker: {result.get('error', 'unknown')[:300]}. "
@@ -1525,6 +1679,63 @@ def _execute_validated_orders(
     try:
         broker = _get_execution_broker()
 
+        if is_iol:
+            # ---- BATCH PREFLIGHT: prepare EVERYTHING before any POST ----
+            # One live portfolio read, all positions/quotes/notionals/limits
+            # validated, all requests built, all orders committed as
+            # execution_ready. If anything fails, NO order is submitted.
+            prepared_batch, preflight_error = prepare_validated_execution_batch(
+                db, intents, orders_by_action, broker, settings
+            )
+            if preflight_error:
+                for order_exec in intents:
+                    db.refresh(order_exec)
+                    executions.append(_exec_summary(order_exec))
+                rec.status = "execution_failed"
+                db.commit()
+                return {
+                    "recommendation_id": recommendation_id,
+                    "status": rec.status,
+                    "executions": executions,
+                    "message": (
+                        f"Preflight falló ({preflight_error}): ninguna orden del lote fue enviada."
+                    ),
+                }
+
+            # ---- SUBMISSION: only execution_ready orders, one POST each ----
+            for prepared in prepared_batch:
+                outcome = _submit_prepared_order(db, prepared, broker)
+                if outcome == "sent":
+                    sent_count += 1
+                elif outcome == "uncertain":
+                    uncertain_count += 1
+                executions.append(_exec_summary(prepared["order_exec"]))
+
+            rec.status = (
+                "manual_reconciliation_required" if uncertain_count
+                else "approved" if sent_count == len(intents) and intents
+                else "execution_failed" if sent_count == 0
+                else "execution_partial"
+            )
+            db.commit()
+
+            try:
+                from app.notifications.dispatcher import dispatch_execution_notification
+                for order_exec in intents:
+                    dispatch_execution_notification(order_exec, db=db)
+            except Exception as exc:
+                logger.warning("Post-execution notification dispatch failed: %s", exc)
+
+            return {
+                "recommendation_id": recommendation_id,
+                "status": rec.status,
+                "executions": executions,
+                "message": (
+                    f"{len(executions)} órdenes procesadas: {sent_count} enviadas, "
+                    f"{uncertain_count} con resultado incierto."
+                ),
+            }
+
         for order_exec in intents:
             # Reload the persisted row and verify single-attempt eligibility
             db.refresh(order_exec)
@@ -1536,18 +1747,6 @@ def _execute_validated_orders(
                     sent_count += 1
                 elif order_exec.status in ("submitting", "manual_reconciliation_required"):
                     uncertain_count += 1
-                continue
-
-            if is_iol:
-                outcome = _submit_iol_validated_order(
-                    db, order_exec, broker, settings,
-                    orders_by_action.get(order_exec.recommendation_action_id) or {},
-                )
-                if outcome == "sent":
-                    sent_count += 1
-                elif outcome == "uncertain":
-                    uncertain_count += 1
-                executions.append(_exec_summary(order_exec))
                 continue
 
             # ---- Mock path (never IOL): historical market-order semantics ----
