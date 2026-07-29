@@ -543,6 +543,17 @@ export default function App() {
     live_position_insufficient: 'la posición real es insuficiente',
     broker_environment_requires_https: 'el ambiente del broker requiere HTTPS',
     broker_environment_url_invalid: 'la URL del ambiente del broker es inválida',
+    sell_only_mode_required: 'la fase V1 exige modo sell-only',
+    invalid_live_position_quantity: 'cantidad de posición real inválida',
+    invalid_execution_quantity: 'cantidad de ejecución inválida',
+    invalid_execution_price: 'precio de ejecución inválido',
+    invalid_portfolio_value: 'valor de cartera inválido',
+    invalid_execution_notional: 'monto de ejecución inválido',
+    fresh_symbol_notional_limit_exceeded: 'monto por símbolo excedido con precio fresco',
+    fresh_order_limit_exceeded: 'monto por orden excedido con precio fresco',
+    fresh_total_limit_exceeded: 'monto total del lote excedido con precio fresco',
+    fresh_portfolio_pct_limit_exceeded: '% de cartera excedido con precio fresco',
+    preflight_cancelled: 'cancelada: otra orden del lote falló el preflight',
   }
 
   const tabs = [
@@ -1035,7 +1046,10 @@ export default function App() {
             </p>
             <p style={{ fontSize: '0.9em' }}>
               Sell-only: <strong>{execReadiness.execution_sell_only ? 'sí' : 'no'}</strong>
+              {execReadiness.sell_only_mode_required && ' (obligatorio en V1)'}
               {' '}· Chequeo de posición real: <strong>{execReadiness.live_position_check_required ? 'sí' : 'no'}</strong>
+              {execReadiness.batch_preflight_enabled && ' · preflight de lote: sí'}
+              {execReadiness.fresh_limit_revalidation_enabled && ' · límites revalidados con precio fresco: sí'}
               {' '}· Instrumentos autorizados: <strong>{execReadiness.instrument_policy_count ?? 0}</strong>
               {(execReadiness.allowed_symbols || []).length > 0 && ` (${execReadiness.allowed_symbols.join(', ')})`}
             </p>
@@ -1081,6 +1095,15 @@ export default function App() {
                 Snapshot #{item.request_audit?.snapshot_id ?? '—'} · Hash: {(item.request_audit?.preview_hash || '').slice(0, 12) || '—'}…
                 {' '}· Monto est.: {Number(item.request_audit?.estimated_notional || 0).toLocaleString()} · {item.created_at && new Date(item.created_at).toLocaleString()}
               </div>
+              {item.request_audit?.actual_notional && (
+                <div style={{ fontSize: '0.85em', color: '#888' }}>
+                  Preflight: monto real {Number(item.request_audit.actual_notional).toLocaleString()}
+                  {' '}· % real {(Number(item.request_audit.fresh_portfolio_pct || 0) * 100).toFixed(2)}%
+                  {item.request_audit.batch_preflight && (
+                    <> · total del lote {Number(item.request_audit.batch_preflight.total_actual_notional || 0).toLocaleString()} / {Number(item.request_audit.batch_preflight.max_total_value || 0).toLocaleString()} ({item.request_audit.batch_preflight.passed ? 'OK' : 'bloqueado'})</>
+                  )}
+                </div>
+              )}
               {item.error_message && <div style={{ fontSize: '0.85em', color: 'var(--danger)' }}>{item.error_message}</div>}
               {(item.reconciliation_audit || []).length > 0 && (
                 <details style={{ fontSize: '0.8em', color: '#888' }}>
