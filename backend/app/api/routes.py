@@ -489,16 +489,81 @@ def reject_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = 
     return result
 
 
+class ReconcileIn(BaseModel):
+    action: str
+    confirmation_text: str
+    note: str = ""
+    broker_order_id: str | None = None
+    executed_quantity: float | None = None
+    executed_price: float | None = None
+
+
 @router.get("/executions/recent")
-def recent_executions(db: Session = Depends(get_db)):
+def recent_executions(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     return get_recent_executions(db, limit=20)
 
 
+@router.get("/executions/reconciliation-queue")
+def reconciliation_queue(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
+    """Orders awaiting manual reconciliation (submitting /
+    manual_reconciliation_required, plus orders of execution_partial
+    recommendations). Read-only; never touches the broker."""
+    from app.services.execution import get_reconciliation_queue
+    return get_reconciliation_queue(db)
+
+
 @router.get("/executions/{execution_id}")
-def get_execution(execution_id: int, db: Session = Depends(get_db)):
+def get_execution(execution_id: int, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     result = get_execution_by_id(db, execution_id)
     if not result:
         raise HTTPException(404, "Execution not found")
+    return result
+
+
+@router.post("/executions/{execution_id}/reconcile")
+def reconcile_execution_endpoint(
+    execution_id: int,
+    payload: ReconcileIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Manually resolve an uncertain order. NEVER sends, retries or creates
+    orders. Requires X-API-Key AND X-Execution-Key plus the exact
+    confirmation phrase. The execution key is never logged nor persisted.
+    Deliberately NOT gated on ORDER_EXECUTION_ENABLED: the safety lock blocks
+    new orders, not the resolution of a past uncertain one."""
+    from app.services.execution import reconcile_execution
+    result = reconcile_execution(
+        db,
+        execution_id,
+        execution_key=x_execution_key,
+        action=payload.action,
+        confirmation_text=payload.confirmation_text,
+        note=payload.note,
+        broker_order_id=payload.broker_order_id,
+        executed_quantity=payload.executed_quantity,
+        executed_price=payload.executed_price,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.post("/executions/{execution_id}/refresh-broker-status")
+def refresh_broker_status_endpoint(
+    execution_id: int,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """READ-ONLY broker order-status query by broker_order_id. Never calls
+    place_order, never creates or retries orders, never auto-changes the
+    execution status — the raw result is stored for manual reconciliation."""
+    from app.services.execution import refresh_broker_status
+    result = refresh_broker_status(db, execution_id, execution_key=x_execution_key)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
     return result
 
 
