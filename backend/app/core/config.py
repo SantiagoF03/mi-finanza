@@ -15,7 +15,35 @@ class Settings(BaseSettings):
     iol_password: str = ""
     iol_portfolio_country: str = "argentina"
     iol_timeout_seconds: int = 15
+    # DEPRECATED: iol_use_sandbox=true is mapped to broker_mode=sandbox by
+    # app.broker.environment.resolve_execution_environment. Prefer
+    # BROKER_MODE=sandbox explicitly.
     iol_use_sandbox: bool = False
+
+    # --- Explicit broker environments (IOL Execution Contract V1) ---
+    # Real: falls back to the legacy iol_api_base/iol_username/iol_password
+    # so the current production deploy keeps working unchanged.
+    iol_real_api_base: str = "https://api.invertironline.com"
+    iol_real_username: str = ""
+    iol_real_password: str = ""
+    # Sandbox: fail closed — empty base/credentials make sandbox unusable.
+    # Never shares tokens or credentials with real.
+    iol_sandbox_api_base: str = ""
+    iol_sandbox_username: str = ""
+    iol_sandbox_password: str = ""
+    # Separate lock for simulated (sandbox) order submission.
+    sandbox_execution_enabled: bool = False
+
+    # --- IOL order policy (fail closed: empty/zero blocks execution) ---
+    # Market and settlement MUST be configured explicitly — never hardcoded.
+    iol_order_market: str = ""
+    iol_order_settlement: str = ""
+    # Only limit orders are supported in this version. precioMercado is banned.
+    iol_order_type: str = "precioLimite"
+    iol_order_validity_minutes: int = 10
+    execution_max_quote_age_seconds: int = 15
+    # 0 = NOT CONFIGURED → real/sandbox execution blocked (never "no limit").
+    execution_max_price_deviation_pct: float = 0.0
 
     news_provider: str = "mock"  # mock | rss
     news_rss_urls: List[str] = Field(

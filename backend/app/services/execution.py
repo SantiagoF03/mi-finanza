@@ -49,48 +49,39 @@ logger = logging.getLogger(__name__)
 
 
 def _get_fresh_quote(broker, symbol: str, side: str) -> dict:
-    """Attempt to get a fresh tradeable price from the broker.
+    """Fresh quote for the LEGACY mock flow (never reaches IOL).
 
-    Returns dict with:
-    - available: bool
-    - price: float | None  (best bid for sell, best ask for buy, or last)
-    - source: str           (e.g. "bid", "ask", "last", "none")
-
-    In mock mode: returns a synthetic quote so tests proceed.
-    In real mode: would query IOL cotizaciones for fresh pricing.
-    If no fresh quote is available, returns available=False.
+    Delegates to the broker's public get_execution_quote contract — the
+    service never accesses private broker internals. Mock brokers keep the
+    historical market-order semantics (price None).
     """
-    # MockBrokerClient — always provide a quote so mock flow isn't blocked
+    # MockBrokerClient (and test doubles marked with _mock_orders) — always
+    # provide a quote so the mock flow isn't blocked.
     if hasattr(broker, "_mock_orders"):
         return {"available": True, "price": None, "source": "market_order"}
 
-    # Real broker — attempt to get fresh quote from IOL
-    try:
-        resp = broker._authorized_get(f"/api/v2/Cotizaciones/detalle/bCBA/{symbol}")
-        data = resp.json()
-        if isinstance(data, dict):
-            if side == "sell":
-                price = data.get("puntas", {}).get("precioCompra") or data.get("ultimoPrecio")
-            else:
-                price = data.get("puntas", {}).get("precioVenta") or data.get("ultimoPrecio")
-            if price and float(price) > 0:
-                source = "bid" if side == "sell" else "ask"
-                return {"available": True, "price": float(price), "source": source}
-            # Has data but no usable price
-            last = data.get("ultimoPrecio")
-            if last and float(last) > 0:
-                return {"available": True, "price": float(last), "source": "last"}
-    except Exception as exc:
-        logger.warning("_get_fresh_quote failed for %s: %s", symbol, exc)
-
-    return {"available": False, "price": None, "source": "none"}
+    settings = get_settings()
+    return broker.get_execution_quote(
+        symbol, side, settings.iol_order_market, settings.iol_order_settlement
+    )
 
 
 def _get_execution_broker():
+    """Unambiguous broker factory: mock | sandbox | real, fail closed."""
+    from app.broker.environment import resolve_execution_environment
+
     settings = get_settings()
-    if settings.broker_mode == "mock":
+    env = resolve_execution_environment(settings)
+    if env["environment"] == "mock":
         return MockBrokerClient()
-    return IolBrokerClient()
+    if env["errors"]:
+        # Defensive: preview/approve block these earlier via blocking reasons.
+        raise RuntimeError(f"Broker environment not usable: {','.join(env['errors'])}")
+    return IolBrokerClient(
+        api_base=env["api_base"],
+        username=env["username"],
+        password=env["password"],
+    )
 
 
 def _get_latest_snapshot(db: Session) -> PortfolioSnapshot | None:
@@ -379,6 +370,9 @@ def _canonical_preview_payload(
             "max_total_value": settings.execution_max_total_value,
             "max_portfolio_pct": settings.execution_max_portfolio_pct,
         },
+        # Signed order policy: any change to market/settlement/order type/
+        # validity/quote policy/deviation limit invalidates the hash.
+        "execution_venue": _execution_venue(settings),
     }
 
 
@@ -441,6 +435,117 @@ def _evaluate_limit_reasons(orders: list[dict], snapshot: PortfolioSnapshot, set
     return reasons
 
 
+_QUOTE_POLICY = "best_bid_for_sell_best_ask_for_buy"
+
+
+def _execution_venue(settings) -> dict:
+    """Explicit, signed order policy — market/settlement are never hardcoded."""
+    return {
+        "market": settings.iol_order_market or "",
+        "settlement": settings.iol_order_settlement or "",
+        "order_type": settings.iol_order_type or "",
+        "validity_minutes": settings.iol_order_validity_minutes,
+        "quote_policy": _QUOTE_POLICY,
+        "max_quote_age_seconds": settings.execution_max_quote_age_seconds,
+        "max_price_deviation_pct": settings.execution_max_price_deviation_pct,
+    }
+
+
+def _venue_blocking_reasons(settings) -> list[str]:
+    """Order-policy and environment blocking codes for sandbox/real brokers.
+
+    Mock mode is exempt: it never builds IOL requests, so the policy does not
+    gate it (existing mock/staging flows stay usable).
+    """
+    from app.broker.environment import resolve_execution_environment
+    from app.broker.order_request import (
+        KNOWN_IOL_MARKETS,
+        KNOWN_IOL_SETTLEMENTS,
+        SUPPORTED_ORDER_TYPES,
+    )
+
+    env = resolve_execution_environment(settings)
+    if env["environment"] == "mock":
+        return []
+
+    reasons: list[str] = list(env["errors"])
+
+    market = settings.iol_order_market or ""
+    settlement = settings.iol_order_settlement or ""
+    if not market or not settlement or settings.iol_order_validity_minutes <= 0:
+        reasons.append("iol_order_policy_not_configured")
+    if market and market not in KNOWN_IOL_MARKETS:
+        reasons.append("unsupported_iol_market")
+    if settlement and settlement not in KNOWN_IOL_SETTLEMENTS:
+        reasons.append("unsupported_iol_settlement")
+    if (settings.iol_order_type or "") not in SUPPORTED_ORDER_TYPES:
+        reasons.append("unsupported_iol_order_type")
+    if settings.execution_max_quote_age_seconds <= 0:
+        reasons.append("quote_policy_not_configured")
+    if settings.execution_max_price_deviation_pct <= 0:
+        reasons.append("price_deviation_limit_not_configured")
+    return reasons
+
+
+def get_execution_readiness() -> dict:
+    """Read-only, non-sensitive execution readiness report.
+
+    Never returns credentials, tokens, secrets or full URLs with auth info —
+    only booleans, stable blocking codes and the API host name.
+    """
+    from app.broker.environment import api_host_of, resolve_execution_environment
+
+    settings = get_settings()
+    env = resolve_execution_environment(settings)
+    venue_reasons = _venue_blocking_reasons(settings)
+
+    blocking: list[str] = []
+    if env["environment"] == "sandbox":
+        if not settings.sandbox_execution_enabled:
+            blocking.append("execution_locked")
+    elif env["environment"] != "mock":
+        if not settings.order_execution_enabled:
+            blocking.append("execution_locked")
+    if not settings.execution_admin_key:
+        blocking.append("execution_admin_key_not_configured")
+    if not settings.execution_preview_secret:
+        blocking.append("preview_signing_not_configured")
+    if not _limits_configured(settings):
+        blocking.append("execution_limits_not_configured")
+    blocking.extend(venue_reasons)
+
+    policy_configured = bool(settings.iol_order_market and settings.iol_order_settlement) and not any(
+        r in venue_reasons
+        for r in (
+            "iol_order_policy_not_configured",
+            "unsupported_iol_market",
+            "unsupported_iol_settlement",
+            "unsupported_iol_order_type",
+            "quote_policy_not_configured",
+            "price_deviation_limit_not_configured",
+        )
+    )
+
+    return {
+        "broker_mode": settings.broker_mode,
+        "environment": env["environment"],
+        "api_host": api_host_of(env),
+        "order_execution_enabled": settings.order_execution_enabled,
+        "sandbox_execution_enabled": settings.sandbox_execution_enabled,
+        "credentials_configured": bool(env["username"] and env["password"]),
+        "execution_admin_key_configured": bool(settings.execution_admin_key),
+        "preview_secret_configured": bool(settings.execution_preview_secret),
+        "limits_configured": _limits_configured(settings),
+        "order_policy_configured": policy_configured,
+        "market": settings.iol_order_market or None,
+        "settlement": settings.iol_order_settlement or None,
+        "order_type": settings.iol_order_type,
+        "blocking_reasons": blocking,
+        "ready_for_real_execution": env["environment"] == "real" and not blocking,
+        "ready_for_sandbox_execution": env["environment"] == "sandbox" and not blocking,
+    }
+
+
 def build_execution_preview(
     db: Session,
     recommendation_id: int,
@@ -489,13 +594,18 @@ def build_execution_preview(
 
     # --- Blocking reasons: stable codes the frontend can rely on ---
     blocking_reasons: list[str] = []
-    if settings.broker_mode != "mock" and not settings.order_execution_enabled:
-        blocking_reasons.append("execution_locked")
+    if settings.broker_mode == "sandbox":
+        if not settings.sandbox_execution_enabled:
+            blocking_reasons.append("execution_locked")
+    elif settings.broker_mode != "mock":
+        if not settings.order_execution_enabled:
+            blocking_reasons.append("execution_locked")
     if not admin_configured:
         blocking_reasons.append("execution_admin_key_not_configured")
     if not signing_configured:
         blocking_reasons.append("preview_signing_not_configured")
     blocking_reasons.extend(_evaluate_limit_reasons(orders_preview, snapshot, settings))
+    blocking_reasons.extend(_venue_blocking_reasons(settings))
     if rec.status not in _APPROVABLE_STATUSES:
         blocking_reasons.append("recommendation_not_pending")
     if rec.superseded_at is not None:
@@ -547,6 +657,7 @@ def build_execution_preview(
             "total_estimated_notional": total_notional,
             "configured": limits_configured,
         },
+        "execution_venue": _execution_venue(settings),
     }
 
 
@@ -673,6 +784,30 @@ def _validate_reinforced_authorization(
                 "status_code": 422,
             }, None
 
+    # Order policy / broker environment must be fully configured and valid
+    # for sandbox/real execution (mock is exempt — never builds IOL requests).
+    for code in (
+        "iol_order_policy_not_configured",
+        "unsupported_iol_market",
+        "unsupported_iol_settlement",
+        "unsupported_iol_order_type",
+        "quote_policy_not_configured",
+        "price_deviation_limit_not_configured",
+        "sandbox_environment_not_configured",
+        "sandbox_environment_invalid",
+        "sandbox_credentials_not_configured",
+        "real_environment_not_configured",
+        "real_environment_invalid",
+        "real_credentials_not_configured",
+        "unsupported_broker_mode",
+    ):
+        if code in blocking:
+            return {
+                "error": f"Ejecución bloqueada por política/ambiente de orden: {code}.",
+                "code": code,
+                "status_code": 423,
+            }, None
+
     return None, rebuilt
 
 
@@ -785,11 +920,23 @@ def approve_and_execute(
                 "status_code": 409,
             }
 
-    # 6. SAFETY LOCK — with a real broker, approve must not proceed unless
-    # ORDER_EXECUTION_ENABLED=true. Fail closed BEFORE any state change:
-    # no status change, no UserDecision, no OrderExecution rows, no broker,
-    # no quotes, no notifications.
-    if settings.broker_mode != "mock" and not settings.order_execution_enabled:
+    # 6. SAFETY LOCKS — fail closed BEFORE any state change: no status
+    # change, no UserDecision, no OrderExecution rows, no broker, no quotes,
+    # no notifications.
+    # Real (and any unknown mode): gated by ORDER_EXECUTION_ENABLED.
+    # Sandbox: gated by its own SANDBOX_EXECUTION_ENABLED lock.
+    if settings.broker_mode == "sandbox":
+        if not settings.sandbox_execution_enabled:
+            return {
+                "error": (
+                    "Safety lock sandbox activo: ejecución simulada deshabilitada "
+                    "(SANDBOX_EXECUTION_ENABLED=false). No se aprobó la recomendación "
+                    "ni se envió ninguna orden."
+                ),
+                "code": "execution_locked",
+                "status_code": 423,
+            }
+    elif settings.broker_mode != "mock" and not settings.order_execution_enabled:
         return {
             "error": (
                 "Safety lock activo: ejecución real deshabilitada "
@@ -893,6 +1040,194 @@ def approve_and_execute(
 _NO_RESUBMIT_STATUSES = {"submitting", "execution_sent", "manual_reconciliation_required"}
 
 
+def _fail_order_definitive(db: Session, order_exec: OrderExecution, message: str) -> None:
+    """Definitive pre-broker failure: nothing was sent, quantity_sent stays None."""
+    order_exec.status = "failed"
+    order_exec.error_message = message[:500]
+    order_exec.completed_at = datetime.now(timezone.utc)
+    db.commit()
+
+
+def _submit_iol_validated_order(
+    db: Session,
+    order_exec: OrderExecution,
+    broker,
+    settings,
+    preview_order: dict,
+) -> str:
+    """Submit ONE validated order through the canonical IOL contract.
+
+    Returns "sent" | "uncertain" | "failed" (definitive, nothing sent).
+
+    Sequence (fail closed at every step):
+    1. executable quote (bid for sell / ask for buy — never ultimoPrecio),
+       validated for age and deviation vs the signed snapshot_price_ref;
+    2. deterministic validity (ART timezone, same operating day);
+    3. canonical form-urlencoded request built by build_iol_order_request
+       (precioLimite only, exact integer quantity, stable Decimal price);
+    4. request_audit updated with execution_quote + the EXACT iol_request,
+       then 'submitting' + quantity_sent committed — the body can never be
+       rebuilt with different data after this commit;
+    5. single submit_order_request call with typed outcome classification.
+    """
+    from app.broker.environment import api_host_of, resolve_execution_environment
+    from app.broker.order_request import build_iol_order_request, compute_order_validity
+
+    symbol = order_exec.symbol
+    side = order_exec.side
+    market = settings.iol_order_market
+    settlement = settings.iol_order_settlement
+
+    # --- 1. Executable quote (definitive failures: nothing sent yet) ---
+    try:
+        quote = broker.get_execution_quote(symbol, side, market, settlement)
+    except Exception as exc:
+        _fail_order_definitive(
+            db, order_exec,
+            f"quote_unavailable: quote query failed for {symbol} ({str(exc)[:200]}). Order NOT sent.",
+        )
+        return "failed"
+
+    if not quote.get("available") or quote.get("source") not in ("bid", "ask") or not quote.get("price"):
+        _fail_order_definitive(
+            db, order_exec,
+            f"quote_unavailable: no executable {'bid' if side == 'sell' else 'ask'} for {symbol}. "
+            "Order NOT sent — a missing book side is never converted into a market order.",
+        )
+        return "failed"
+
+    # Quote age
+    try:
+        retrieved_at = datetime.fromisoformat(quote["retrieved_at"])
+        if retrieved_at.tzinfo is None:
+            retrieved_at = retrieved_at.replace(tzinfo=timezone.utc)
+        age_seconds = (_utcnow() - retrieved_at).total_seconds()
+    except (KeyError, ValueError, TypeError):
+        age_seconds = None
+    if age_seconds is None or age_seconds > settings.execution_max_quote_age_seconds:
+        _fail_order_definitive(
+            db, order_exec,
+            f"quote_stale: quote for {symbol} is older than "
+            f"{settings.execution_max_quote_age_seconds}s. Order NOT sent.",
+        )
+        return "failed"
+
+    # Price deviation vs the signed snapshot reference
+    fresh_price = Decimal(str(quote["price"]))
+    snapshot_ref = preview_order.get("snapshot_price_ref")
+    if not snapshot_ref or snapshot_ref <= 0:
+        _fail_order_definitive(
+            db, order_exec,
+            f"price_deviation_exceeded: no snapshot price reference for {symbol}. Order NOT sent.",
+        )
+        return "failed"
+    deviation = abs(fresh_price - Decimal(str(snapshot_ref))) / Decimal(str(snapshot_ref))
+    deviation_pct = float(deviation.quantize(Decimal("0.000001")))
+    if deviation_pct > settings.execution_max_price_deviation_pct:
+        _fail_order_definitive(
+            db, order_exec,
+            f"price_deviation_exceeded: fresh price {fresh_price} deviates {deviation_pct:.4%} "
+            f"from snapshot ref {snapshot_ref} (max {settings.execution_max_price_deviation_pct:.4%}). Order NOT sent.",
+        )
+        return "failed"
+
+    # --- 2. Deterministic validity (ART, same operating day) ---
+    validity, validity_err = compute_order_validity(settings.iol_order_validity_minutes)
+    if validity_err:
+        _fail_order_definitive(
+            db, order_exec,
+            f"{validity_err}: computed order validity is not usable. Order NOT sent.",
+        )
+        return "failed"
+
+    # --- 3. Canonical request (pure builder, fail closed) ---
+    order_request, build_err = build_iol_order_request(
+        side=side,
+        symbol=symbol,
+        quantity=order_exec.quantity_planned,
+        price=fresh_price,
+        market=market,
+        settlement=settlement,
+        order_type=settings.iol_order_type,
+        validity=validity,
+    )
+    if build_err:
+        _fail_order_definitive(
+            db, order_exec,
+            f"{build_err}: cannot build a valid IOL order request. Order NOT sent.",
+        )
+        return "failed"
+
+    # --- 4. Exact request audit + submitting, ONE commit before the POST ---
+    env = resolve_execution_environment(settings)
+    br = dict(order_exec.broker_response or {})
+    request_audit = dict(br.get("request_audit") or {})
+    request_audit["execution_quote"] = {
+        "price": float(fresh_price),
+        "source": quote["source"],
+        "retrieved_at": quote["retrieved_at"],
+        "market": market,
+        "settlement": settlement,
+        "deviation_pct": deviation_pct,
+    }
+    # Exactly what will be sent — never credentials/tokens.
+    request_audit["iol_request"] = {
+        "environment": env["environment"],
+        "api_host": api_host_of(env),
+        "endpoint": order_request["endpoint"],
+        "content_type": order_request["content_type"],
+        **order_request["form_data"],
+    }
+    br["request_audit"] = request_audit
+    order_exec.broker_response = br
+    order_exec.status = "submitting"
+    order_exec.quantity_sent = order_exec.quantity_planned
+    db.commit()
+
+    # --- 5. Single submission with typed classification ---
+    try:
+        result = broker.submit_order_request(order_request)
+    except Exception as exc:
+        result = {
+            "outcome": "submission_uncertain",
+            "order_id": "",
+            "endpoint_used": order_request["endpoint"],
+            "raw_response": {},
+            "error": f"Unexpected submission failure: {str(exc)[:200]}",
+        }
+
+    order_exec.endpoint_used = result.get("endpoint_used", order_request["endpoint"])
+    order_exec.broker_response = {
+        **(order_exec.broker_response or {}),
+        "broker_result": result.get("raw_response", {}),
+    }
+
+    outcome = result.get("outcome")
+    if outcome == "sent":
+        order_exec.broker_order_id = result.get("order_id", "")
+        order_exec.sent_at = datetime.now(timezone.utc)
+        order_exec.status = "execution_sent"
+        db.commit()
+        return "sent"
+    if outcome == "rejected":
+        order_exec.status = "rejected_by_broker"
+        order_exec.error_message = result.get("error", "Broker rejected order")[:500]
+        order_exec.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        return "rejected"
+
+    # submission_uncertain (or anything unclassified): IOL may have received
+    # the order. Manual reconciliation, NEVER auto-retry.
+    order_exec.status = "manual_reconciliation_required"
+    order_exec.error_message = (
+        f"Resultado incierto del broker: {result.get('error', 'unknown')[:300]}. "
+        "Requiere conciliación manual. NO se reintenta automáticamente."
+    )
+    order_exec.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    return "uncertain"
+
+
 def _execute_validated_orders(
     db: Session,
     rec: Recommendation,
@@ -966,6 +1301,10 @@ def _execute_validated_orders(
     sent_count = 0
     uncertain_count = 0
 
+    settings = get_settings()
+    is_iol = settings.broker_mode != "mock"  # sandbox or real → canonical IOL contract
+    orders_by_action = {o["recommendation_action_id"]: o for o in orders}
+
     try:
         broker = _get_execution_broker()
 
@@ -982,6 +1321,19 @@ def _execute_validated_orders(
                     uncertain_count += 1
                 continue
 
+            if is_iol:
+                outcome = _submit_iol_validated_order(
+                    db, order_exec, broker, settings,
+                    orders_by_action.get(order_exec.recommendation_action_id) or {},
+                )
+                if outcome == "sent":
+                    sent_count += 1
+                elif outcome == "uncertain":
+                    uncertain_count += 1
+                executions.append(_exec_summary(order_exec))
+                continue
+
+            # ---- Mock path (never IOL): historical market-order semantics ----
             # Fresh quote BEFORE 'submitting': any problem here is a
             # DEFINITIVE preparation failure — place_order was never called,
             # so this is 'failed', never 'manual_reconciliation_required'.
