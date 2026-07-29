@@ -660,23 +660,46 @@ def test_full_mock_flow_with_reinforced_contract(db):
 
 
 def test_simulated_real_flow_reaches_place_order_only_after_all_validations(db):
+    """Real-mode flow (broker fully mocked): submission happens only after
+    every validation passes, exactly once, via the canonical IOL contract
+    (submit_order_request) — never place_order for a real broker."""
+    from datetime import datetime, timezone as _tz
+
     _make_snapshot(db)
     rec = _make_recommendation(db)
     db.commit()
     fake_broker = mock.MagicMock()
-    fake_broker.place_order.return_value = {"status": "sent", "order_id": "SIM-1", "raw_response": {}, "endpoint_used": "sim"}
-    with exec_settings(**_full_auth_settings(broker_mode="real", order_execution_enabled=True)):
+    fake_broker.get_execution_quote.return_value = {
+        "available": True, "price": 1900.0, "source": "bid",
+        "retrieved_at": datetime.now(_tz.utc).isoformat(),
+        "market": "bCBA", "settlement": "t1",
+    }
+    fake_broker.submit_order_request.return_value = {
+        "outcome": "sent", "order_id": "SIM-1", "raw_response": {"numeroOperacion": "SIM-1"},
+        "endpoint_used": "/api/v2/operar/Vender", "error": "",
+    }
+    real_env = dict(
+        broker_mode="real", order_execution_enabled=True,
+        iol_real_username="test-user", iol_real_password="test-pass",
+        iol_order_market="bCBA", iol_order_settlement="t1",
+        iol_order_type="precioLimite", iol_order_validity_minutes=10,
+        execution_max_quote_age_seconds=15,
+        execution_max_price_deviation_pct=0.05,
+    )
+    with exec_settings(**_full_auth_settings(**real_env)):
         preview = build_execution_preview(db, rec.id)
         assert preview["can_submit_approval"] is True
         with mock.patch("app.services.execution._get_execution_broker", return_value=fake_broker):
             # First: failing validations never reach the broker
             bad = _reinforced_approve(db, rec, preview, key="nope")
             assert bad["status_code"] == 403
+            fake_broker.submit_order_request.assert_not_called()
             fake_broker.place_order.assert_not_called()
-            # Then: full valid contract reaches place_order exactly once
+            # Then: full valid contract submits exactly once
             result = _reinforced_approve(db, rec, preview)
     assert result.get("status") == "approved"
-    assert fake_broker.place_order.call_count == 1
+    assert fake_broker.submit_order_request.call_count == 1
+    fake_broker.place_order.assert_not_called()
 
 
 # ───────────────────────────────────────────────────────────────────
