@@ -183,6 +183,44 @@ aumenta la cantidad firmada. Sus fallos son definitivos previos al broker
   nunca negativos ni `NaN`/`Infinity`. Una configuración inválida hace fallar
   el arranque en vez de producir comparaciones ambiguas durante una orden.
 
+## Piloto administrativo (solo creación, nunca envío)
+
+`POST /api/execution-pilot/recommendations` crea **una** recomendación de
+venta de exactamente 1 BYMA. **No envía órdenes**: no instancia broker, no
+pide cotización, no llama `place_order` ni `submit_order_request`.
+
+Requiere `X-API-Key` + `X-Execution-Key` + la frase exacta
+`CREAR PILOTO BYMA 1`, y un **doble candado**:
+
+```
+EXECUTION_PILOT_CREATION_ENABLED=true
+ORDER_EXECUTION_ENABLED=false        # el piloto solo se PREPARA
+```
+
+Activar el lock del piloto **no habilita enviar órdenes**. Payload
+estrictamente literal (`symbol=BYMA`, `side=sell`, `quantity=1`); cualquier
+otro valor se rechaza, sin defaults implícitos. Antes de escribir valida
+snapshot, identidad (ACCIONES/ACCIONES/ARS), tenencia ≥ 1, allowlist,
+`max_quantity`, `quantity_step` y que no haya otro piloto pendiente.
+
+La cantidad exacta se expresa con `RecommendationAction.quantity_override`
+(entero positivo, columna nullable). Solo se honra si
+`metadata_json.execution_pilot=true`; en cualquier otra recomendación un
+override no nulo invalida la orden (fail-closed). Las recomendaciones
+automáticas dejan siempre `quantity_override=NULL` y siguen derivando la
+cantidad de `target_change_pct`. El override viaja en `orders_preview`,
+`estimated_notional`, el **payload canónico firmado** y `request_audit`:
+cambiarlo invalida el `preview_hash`.
+
+El piloto **supersede** las recomendaciones abiertas anteriores dejando
+trazabilidad (`superseded_by_execution_pilot`, `superseded_at`); no se borra
+historial ni se convierte una recomendación existente en BYMA.
+
+Después, el flujo es el de siempre y sin atajos:
+`GET /api/recommendations/{id}/execution-preview` y, solo si se decide
+ejecutar, `POST /api/recommendations/{id}/approve` — que sigue bloqueado por
+`ORDER_EXECUTION_ENABLED=false`.
+
 ## `execution_ready`: estado durable PRE-POST
 
 `execution_ready` significa exactamente: **el preflight quedó persistido y

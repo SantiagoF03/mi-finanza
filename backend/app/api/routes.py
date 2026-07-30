@@ -488,6 +488,47 @@ def approve_recommendation_endpoint(
     return result
 
 
+class ExecutionPilotIn(BaseModel):
+    symbol: str
+    side: str
+    quantity: float
+    confirmation_text: str
+    note: str = ""
+
+
+@router.post("/execution-pilot/recommendations")
+def create_execution_pilot(
+    payload: ExecutionPilotIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Create the controlled BYMA execution-pilot recommendation.
+
+    This endpoint CANNOT send an order: it only creates a Recommendation and
+    its RecommendationAction. No broker is instantiated, no quote is fetched,
+    no order is ever submitted. Requires X-API-Key + X-Execution-Key + the
+    exact confirmation phrase, and a double lock
+    (EXECUTION_PILOT_CREATION_ENABLED=true AND ORDER_EXECUTION_ENABLED=false).
+
+    The only execution path remains POST /recommendations/{id}/approve.
+    """
+    from app.services.execution_pilot import create_execution_pilot_recommendation
+
+    result = create_execution_pilot_recommendation(
+        db,
+        execution_key=x_execution_key,
+        symbol=payload.symbol,
+        side=payload.side,
+        quantity=payload.quantity,
+        confirmation_text=payload.confirmation_text,
+        note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
 @router.post("/recommendations/{recommendation_id}/reject")
 def reject_recommendation_endpoint(recommendation_id: int, payload: ApproveIn = None, db: Session = Depends(get_db), _auth=Depends(require_api_key)):
     """Reject a recommendation. No orders are placed."""

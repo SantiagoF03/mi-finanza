@@ -286,12 +286,30 @@ def confirmation_phrase(recommendation_id: int) -> str:
     return f"EJECUTAR RECOMENDACION {recommendation_id}"
 
 
-def _build_order_previews(actions: list, snapshot: PortfolioSnapshot) -> list[dict]:
+def is_execution_pilot(rec: Recommendation | None) -> bool:
+    """True only for a recommendation explicitly marked as execution pilot."""
+    if rec is None:
+        return False
+    meta = rec.metadata_json or {}
+    return isinstance(meta, dict) and meta.get("execution_pilot") is True
+
+
+def _build_order_previews(
+    actions: list,
+    snapshot: PortfolioSnapshot,
+    rec: Recommendation | None = None,
+) -> list[dict]:
     """Deterministic order plans with notional and portfolio percentage.
 
     This is THE single implementation of the execution plan calculation,
     used by both the preview endpoint and the approve validation.
+
+    quantity_override is honored ONLY when the recommendation is an
+    execution pilot and the override is a positive integer. Anywhere else a
+    non-null override is a fail-closed error: it must never let an automatic
+    recommendation bypass the percentage-derived quantity.
     """
+    pilot = is_execution_pilot(rec)
     orders = []
     for action in actions:
         plan = _plan_order(action, snapshot)
@@ -301,6 +319,40 @@ def _build_order_previews(actions: list, snapshot: PortfolioSnapshot) -> list[di
         qty = plan["quantity_planned"]
         estimated_notional = 0.0
         portfolio_pct = 0.0
+
+        override = getattr(action, "quantity_override", None)
+        if override is not None:
+            override_dec = positive_decimal(override)
+            if not pilot:
+                valid = False
+                blocked_reason = (
+                    "quantity_override is only allowed on an execution-pilot "
+                    "recommendation."
+                )
+            elif override_dec is None or override_dec != override_dec.to_integral_value():
+                valid = False
+                blocked_reason = (
+                    f"Invalid quantity_override {override!r}: must be a positive integer."
+                )
+            else:
+                # Explicit, auditable quantity — never rounded or resized.
+                qty = int(override_dec)
+                position = _find_position(snapshot, action.symbol) if snapshot else None
+                held = non_negative_decimal(getattr(position, "quantity", None)) if position else None
+                if plan["side"] != "sell":
+                    valid = False
+                    blocked_reason = "quantity_override is only supported for sell orders."
+                elif held is None or held < override_dec:
+                    valid = False
+                    blocked_reason = (
+                        f"quantity_override {qty} exceeds the snapshot position for "
+                        f"{action.symbol} ({held if held is not None else 'no position'})."
+                    )
+                elif not valid and "rounds to 0" in (plan["blocked_reason"] or ""):
+                    # The percentage rounded to zero, but the pilot states the
+                    # quantity explicitly: the plan is valid again.
+                    valid = True
+                    blocked_reason = ""
 
         if valid:
             if not price or price <= 0:
@@ -323,6 +375,7 @@ def _build_order_previews(actions: list, snapshot: PortfolioSnapshot) -> list[di
             "side": plan["side"],
             "target_change_pct": action.target_change_pct,
             "quantity_planned": qty,
+            "quantity_override": int(override) if override is not None else None,
             "snapshot_price_ref": price,
             "estimated_notional": estimated_notional,
             "portfolio_value_used": plan["portfolio_value_used"],
@@ -362,6 +415,8 @@ def _canonical_preview_payload(
                 "side": o["side"],
                 "target_change_pct": o["target_change_pct"],
                 "quantity_planned": o["quantity_planned"],
+                # Signed: changing the override invalidates the preview hash.
+                "quantity_override": o.get("quantity_override"),
                 "snapshot_price_ref": o["snapshot_price_ref"],
                 "estimated_notional": o["estimated_notional"],
                 "portfolio_value_used": o["portfolio_value_used"],
@@ -677,7 +732,7 @@ def build_execution_preview(
     if not snapshot:
         return {"error": "No portfolio snapshot available for preview", "status_code": 400}
 
-    orders_preview = _build_order_previews(actions, snapshot)
+    orders_preview = _build_order_previews(actions, snapshot, rec)
 
     gen_dt = generated_at or _utcnow()
     if gen_dt.tzinfo is None:
@@ -1775,6 +1830,7 @@ def _execute_validated_orders(
             "preview_generated_at": preview_generated_at,
             "estimated_notional": o.get("estimated_notional"),
             "portfolio_pct": o.get("portfolio_pct"),
+            "quantity_override": o.get("quantity_override"),
             "execution_request_id": f"rec{recommendation_id}-act{o['recommendation_action_id']}-{preview_hash[:16]}",
         }
         order_exec = OrderExecution(

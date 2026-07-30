@@ -76,6 +76,11 @@ class RecommendationAction(Base):
     symbol: Mapped[str] = mapped_column(String(20))
     target_change_pct: Mapped[float] = mapped_column(Float)
     reason: Mapped[str] = mapped_column(Text)
+    # Explicit unit quantity, honored ONLY for an execution-pilot
+    # recommendation (metadata_json.execution_pilot=true). Automatic
+    # recommendations always leave this NULL and keep deriving the quantity
+    # from target_change_pct.
+    quantity_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
     recommendation: Mapped[Recommendation] = relationship(back_populates="actions")
 
 
