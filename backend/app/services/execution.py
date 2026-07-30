@@ -1352,11 +1352,19 @@ def _preflight_one_order(
     if validity_err:
         return None, validity_err
 
-    # 7. Canonical form-urlencoded request (precioLimite only)
+    # 7. Canonical form-urlencoded request (precioLimite only).
+    # The per-symbol price_tick is enforced here: IOL rejects an order whose
+    # decimals are not compatible with the minimum tick, so we fail closed
+    # instead of sending it (the price is never rounded to fit).
+    policy = policies.get(_normalized(symbol))
+    if policy is None:
+        return None, "instrument_policy_missing"
+
     order_request, build_err = build_iol_order_request(
         side=side, symbol=symbol, quantity=quantity, price=fresh_price,
         market=market, settlement=settlement,
         order_type=settings.iol_order_type, validity=validity,
+        price_tick=policy["price_tick"],
     )
     if build_err:
         return None, build_err
@@ -1368,9 +1376,6 @@ def _preflight_one_order(
     fresh_portfolio_pct = (actual_notional / live_portfolio_value).quantize(Decimal("0.000001"))
 
     # 9. Re-validate limits against the FRESH notional
-    policy = policies.get(_normalized(symbol))
-    if policy is None:
-        return None, "instrument_policy_missing"
     if actual_notional > Decimal(str(policy["max_notional"])):
         return None, "fresh_symbol_notional_limit_exceeded"
     max_order_value = positive_decimal(settings.execution_max_order_value)

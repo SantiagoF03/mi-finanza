@@ -77,15 +77,33 @@ def _serialize_quantity(quantity) -> tuple[str | None, str | None]:
     return str(int(qty_dec)), None
 
 
-def _serialize_price(price) -> tuple[str | None, str | None]:
+def _serialize_price(price, price_tick=None) -> tuple[str | None, str | None]:
     """Stable Decimal serialization — no float repr instability, no
-    arbitrary rounding."""
+    arbitrary rounding.
+
+    When a price_tick (IOL's "alteración mínima") is given, the price MUST be
+    an exact multiple of it. Verified against the real API: IOL refuses an
+    order whose decimals are not compatible with the minimum tick, so we fail
+    closed here instead of letting the broker reject it. The price is never
+    rounded to fit — that would silently change the reviewed limit price.
+    """
     try:
         price_dec = Decimal(str(price))
     except (InvalidOperation, ValueError, TypeError):
         return None, "invalid_broker_price"
     if not price_dec.is_finite() or price_dec <= 0:
         return None, "invalid_broker_price"
+
+    if price_tick is not None:
+        try:
+            tick = Decimal(str(price_tick))
+        except (InvalidOperation, ValueError, TypeError):
+            return None, "invalid_price_tick"
+        if not tick.is_finite() or tick <= 0:
+            return None, "invalid_price_tick"
+        if price_dec % tick != 0:
+            return None, "price_tick_mismatch"
+
     normalized = price_dec.normalize()
     # normalize() may produce exponent notation for round numbers (2E+1) —
     # always serialize positionally.
@@ -102,6 +120,7 @@ def build_iol_order_request(
     settlement: str,
     order_type: str,
     validity: str,
+    price_tick=None,
 ) -> tuple[dict | None, str | None]:
     """Build the exact form-urlencoded request for an IOL personal order.
 
@@ -131,7 +150,7 @@ def build_iol_order_request(
     qty_str, err = _serialize_quantity(quantity)
     if err:
         return None, err
-    price_str, err = _serialize_price(price)
+    price_str, err = _serialize_price(price, price_tick=price_tick)
     if err:
         return None, err
 
