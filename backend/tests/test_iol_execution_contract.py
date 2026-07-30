@@ -131,7 +131,7 @@ def _sandbox_settings(**extra):
             "AAPL": {
                 "asset_type": "CEDEAR", "instrument_type": "CEDEAR", "currency": "USD",
                 "market": "bCBA", "settlement": "t1",
-                "quantity_step": 1, "max_quantity": 100, "max_notional": 1_000_000,
+                "quantity_step": 1, "price_tick": 0.01, "max_quantity": 100, "max_notional": 1_000_000,
             }
         },
     )
@@ -529,8 +529,11 @@ def test_end_to_end_sandbox_flow_with_mock_transport(db):
             }]})
         if request.url.path == "/api/v2/estadocuenta":
             return httpx.Response(200, json={"disponible": 12000})
-        if request.url.path.startswith("/api/v2/Cotizaciones/detalle/bCBA/AAPL"):
-            return httpx.Response(200, json={"puntas": {"precioCompra": 1900.0, "precioVenta": 1910.0}})
+        if request.url.path == "/api/v2/bCBA/Titulos/AAPL/Cotizacion":
+            # Real /Cotizacion shape: book prices at the top level.
+            return httpx.Response(200, json={
+                "ultimoPrecio": 1905.0, "precioCompra": 1900.0, "precioVenta": 1910.0,
+            })
         if request.url.path == "/api/v2/operar/Vender":
             captured["order_posts"].append({
                 "method": request.method,
@@ -623,8 +626,8 @@ def test_uncertain_e2e_never_retries_and_blocks_second_approve(db):
             }]})
         if request.url.path == "/api/v2/estadocuenta":
             return httpx.Response(200, json={"disponible": 12000})
-        if request.url.path.startswith("/api/v2/Cotizaciones/"):
-            return httpx.Response(200, json={"puntas": {"precioCompra": 1900.0}})
+        if request.url.path == "/api/v2/bCBA/Titulos/AAPL/Cotizacion":
+            return httpx.Response(200, json={"precioCompra": 1900.0})
         if request.url.path == "/api/v2/operar/Vender":
             post_attempts["n"] += 1
             raise httpx.ReadTimeout("timed out mid-send", request=request)

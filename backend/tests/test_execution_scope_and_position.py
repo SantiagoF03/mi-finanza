@@ -50,7 +50,7 @@ SANDBOX_BASE = "https://sandbox.iol-test.local"
 VALID_POLICY = {
     "asset_type": "CEDEAR", "instrument_type": "CEDEAR", "currency": "USD",
     "market": "bCBA", "settlement": "t1",
-    "quantity_step": 1, "max_quantity": 100, "max_notional": 1_000_000,
+    "quantity_step": 1, "price_tick": 0.01, "max_quantity": 100, "max_notional": 1_000_000,
 }
 
 
@@ -510,7 +510,7 @@ def test_identity_and_scope_are_in_the_preview_and_signed(db):
             "currency": "USD", "market": "bCBA", "settlement": "t1",
         }
         assert order["execution_scope"] == {
-            "sell_only": True, "quantity_step": 1.0,
+            "sell_only": True, "quantity_step": 1.0, "price_tick": 0.01,
             "max_quantity": 100.0, "max_notional": 1_000_000.0,
         }
         # Changing ONLY the policy invalidates the hash
