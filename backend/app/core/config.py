@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     # Re-verify the live position (read-only) right before submitting.
     execution_require_live_position_check: bool = True
 
+    # Administrative creation of the BYMA execution-pilot recommendation.
+    # Default false. It only allows PREPARING a pilot recommendation and can
+    # never send an order: the sole execution path remains
+    # POST /recommendations/{id}/approve, still gated by
+    # ORDER_EXECUTION_ENABLED.
+    execution_pilot_creation_enabled: bool = False
+
     @field_validator("execution_instrument_policies", mode="before")
     @classmethod
     def parse_instrument_policies(cls, v):

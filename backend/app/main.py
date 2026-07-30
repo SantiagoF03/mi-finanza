@@ -44,6 +44,17 @@ def _patch_schema(engine_ref):
                     "ADD COLUMN event_cluster_id INTEGER REFERENCES event_clusters(id)"
                 ))
 
+    # 3. recommendation_actions.quantity_override — nullable, added for the
+    #    execution pilot. Existing rows stay NULL, so automatic
+    #    recommendations keep their current behavior unchanged.
+    if "recommendation_actions" in existing_tables:
+        columns = {c["name"] for c in inspector.get_columns("recommendation_actions")}
+        if "quantity_override" not in columns:
+            with engine_ref.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE recommendation_actions ADD COLUMN quantity_override INTEGER"
+                ))
+
 
 @app.on_event("startup")
 def on_startup():
