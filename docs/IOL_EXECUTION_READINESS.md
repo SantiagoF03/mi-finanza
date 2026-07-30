@@ -21,11 +21,20 @@ Contrato HTTP de órdenes (Execution Contract V1):
   (Decimal estable), `plazo`, `validez` (hora de Buenos Aires, mismo día
   operativo), `tipoOrden=precioLimite` (las órdenes de mercado están
   prohibidas en esta versión)
-- Cotización ejecutable: mejor bid para venta / mejor ask para compra —
+- Cotización ejecutable: `GET /api/v2/{mercado}/Titulos/{simbolo}/Cotizacion`
+  (verificado contra la API real; el viejo `/api/v2/Cotizaciones/detalle/...`
+  responde HTTP 400). Mejor bid para venta / mejor ask para compra —
   `ultimoPrecio` nunca se usa para ejecutar; sin punta no hay orden
 - Semántica de envío: *at-most-once automatic submission + manual
   reconciliation on uncertain outcome* (timeouts, 5xx o 2xx sin
   `numeroOperacion` terminan en conciliación manual, jamás en reintento)
+- **Clasificación de respuestas 2xx** (verificado contra la API real): IOL
+  puede responder **HTTP 202 con un cuerpo de errores de validación**
+  (`[{"title": "PrecioLimite", "description": "Los decimales indicados no
+  son compatibles con la alteración mínima permitida..."}]`). Eso es un
+  **rechazo definitivo** — la orden nunca se creó — y se clasifica como
+  `rejected`, no como envío incierto. Solo un 2xx con `numeroOperacion` no
+  vacío cuenta como enviado; un 2xx desconocido sigue siendo incierto.
 
 ## Etapas permitidas (en orden, sin saltear)
 
@@ -99,9 +108,16 @@ obligatorios):
   "asset_type": "...", "instrument_type": "...", "currency": "...",
   "market": "<igual a IOL_ORDER_MARKET>",
   "settlement": "<igual a IOL_ORDER_SETTLEMENT>",
-  "quantity_step": <>0, "max_quantity": <>0, "max_notional": <>0
+  "quantity_step": <>0, "price_tick": <>0,
+  "max_quantity": <>0, "max_notional": <>0
 }}
 ```
+
+`price_tick` es la **alteración mínima** del instrumento. El precio límite
+debe ser múltiplo exacto de ese valor: si no lo es, la orden se bloquea con
+`price_tick_mismatch` **antes de enviarse** y el precio nunca se redondea
+para encajar (eso cambiaría silenciosamente el límite revisado). Es
+obligatorio: sin tick conocido no se puede garantizar un precio aceptable.
 
 `market`/`settlement` deben coincidir **exactamente** con la política global
 (`IOL_ORDER_MARKET` / `IOL_ORDER_SETTLEMENT`); si difieren se bloquea con

@@ -535,6 +535,8 @@ export default function App() {
     instrument_market_mismatch: 'el mercado del instrumento no coincide',
     instrument_settlement_mismatch: 'el plazo del instrumento no coincide',
     quantity_step_mismatch: 'la cantidad no respeta el step permitido',
+    price_tick_mismatch: 'el precio no respeta la alteración mínima del instrumento',
+    invalid_price_tick: 'alteración mínima del instrumento inválida',
     symbol_quantity_limit_exceeded: 'cantidad máxima por símbolo excedida',
     symbol_notional_limit_exceeded: 'monto máximo por símbolo excedido',
     live_position_verification_required: 'falta verificar la posición real',
@@ -743,7 +745,7 @@ export default function App() {
                       )}
                       {o.execution_scope?.quantity_step != null && (
                         <div style={{ fontSize: '0.85em', color: '#888' }}>
-                          Alcance: {o.execution_scope.sell_only ? 'solo venta' : 'compra y venta'} · step {o.execution_scope.quantity_step} · máx cantidad {Number(o.execution_scope.max_quantity || 0).toLocaleString()} · máx monto {Number(o.execution_scope.max_notional || 0).toLocaleString()}
+                          Alcance: {o.execution_scope.sell_only ? 'solo venta' : 'compra y venta'} · step {o.execution_scope.quantity_step} · alteración mínima {o.execution_scope.price_tick ?? '—'} · máx cantidad {Number(o.execution_scope.max_quantity || 0).toLocaleString()} · máx monto {Number(o.execution_scope.max_notional || 0).toLocaleString()}
                         </div>
                       )}
                       {o.blocked_reason && (

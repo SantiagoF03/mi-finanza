@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -35,6 +36,80 @@ class BrokerClient(ABC):
             "market": market,
             "settlement": settlement,
         }
+
+
+def _extract_iol_validation_errors(data: Any) -> str:
+    """Summarize an IOL validation-error body, or "" if it is not one.
+
+    IOL can answer 2xx (observed: 202) with a list — or a wrapped list — of
+    {title, description} entries when it refuses an order. Detecting this
+    shape is what separates a DEFINITIVE rejection from a genuinely
+    uncertain submission.
+    """
+    candidates = None
+    if isinstance(data, list):
+        candidates = data
+    elif isinstance(data, dict):
+        for key in ("errors", "Errors", "mensajes", "messages"):
+            value = data.get(key)
+            if isinstance(value, list):
+                candidates = value
+                break
+        if candidates is None and (data.get("title") or data.get("description")):
+            candidates = [data]
+
+    if not candidates:
+        return ""
+
+    parts = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("Title") or "").strip()
+        description = str(item.get("description") or item.get("Description") or "").strip()
+        if title or description:
+            parts.append(f"{title}: {description}".strip(": ").strip())
+    return " | ".join(parts)[:400]
+
+
+def _positive_price(value) -> float | None:
+    """Finite positive price, or None. Rejects NaN/Infinity/junk."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(price) or price <= 0:
+        return None
+    return price
+
+
+def _extract_book_price(data: Any, field: str) -> float | None:
+    """Read one side of the order book from an IOL quote payload.
+
+    The real /Cotizacion response carries precioCompra/precioVenta at the top
+    level; `puntas` may additionally be a dict or a list of book levels
+    (best level first). ultimoPrecio is NEVER used — a missing side of the
+    book must fail closed.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    top_level = _positive_price(data.get(field))
+    if top_level is not None:
+        return top_level
+
+    puntas = data.get("puntas")
+    if isinstance(puntas, dict):
+        return _positive_price(puntas.get(field))
+    if isinstance(puntas, list):
+        for level in puntas:
+            if isinstance(level, dict):
+                price = _positive_price(level.get(field))
+                if price is not None:
+                    return price
+    return None
 
 
 def map_iol_estadocuenta_cash(payload: dict[str, Any]) -> float:
@@ -475,25 +550,27 @@ class IolBrokerClient(BrokerClient):
             "market": market,
             "settlement": settlement,
         }
+        # Verified against the real API: /api/v2/Cotizaciones/detalle/{market}/
+        # {symbol} answers HTTP 400. The working contract is
+        # /api/v2/{market}/Titulos/{symbol}/Cotizacion.
         try:
-            resp = self._authorized_get(f"/api/v2/Cotizaciones/detalle/{market}/{symbol}")
+            resp = self._authorized_get(f"/api/v2/{market}/Titulos/{symbol}/Cotizacion")
             data = resp.json()
-            if not isinstance(data, dict):
-                return base
-            puntas = data.get("puntas") or {}
-            if not isinstance(puntas, dict):
-                return base
-            raw_price = puntas.get("precioCompra") if side == "sell" else puntas.get("precioVenta")
-            if raw_price and float(raw_price) > 0:
-                return {
-                    **base,
-                    "available": True,
-                    "price": float(raw_price),
-                    "source": "bid" if side == "sell" else "ask",
-                }
         except Exception:
-            pass
-        return base
+            return base
+
+        field = "precioCompra" if side == "sell" else "precioVenta"
+        raw_price = _extract_book_price(data, field)
+        if raw_price is None:
+            # No usable side of the book → never fall back to ultimoPrecio,
+            # never turn this into a market order.
+            return base
+        return {
+            **base,
+            "available": True,
+            "price": raw_price,
+            "source": "bid" if side == "sell" else "ask",
+        }
 
     def submit_order_request(self, order_request: dict) -> dict:
         """Submit a canonical form-urlencoded order request (built by
@@ -568,12 +645,29 @@ class IolBrokerClient(BrokerClient):
                     "raw_response": data,
                     "error": "",
                 }
+
+            # Verified against the real API: IOL answers HTTP 202 with a body
+            # of validation errors (e.g. [{"title": "PrecioLimite",
+            # "description": "Los decimales indicados no son compatibles con
+            # la alteración mínima permitida..."}]) when it refuses an order.
+            # That is a DEFINITIVE rejection — the order was never created —
+            # so it must not be treated as an uncertain submission.
+            rejection = _extract_iol_validation_errors(data)
+            if rejection:
+                return {
+                    "outcome": "rejected",
+                    "order_id": "",
+                    "endpoint_used": endpoint,
+                    "raw_response": data if isinstance(data, (dict, list)) else {"body": str(data)[:500]},
+                    "error": f"HTTP {resp.status_code}: order rejected by IOL validation — {rejection}",
+                }
+
             return {
                 "outcome": "submission_uncertain",
                 "order_id": "",
                 "endpoint_used": endpoint,
-                "raw_response": data if isinstance(data, dict) else {"body": str(data)[:500]},
-                "error": "2xx response without numeroOperacion — outcome unknown.",
+                "raw_response": data if isinstance(data, (dict, list)) else {"body": str(data)[:500]},
+                "error": f"HTTP {resp.status_code} without numeroOperacion — outcome unknown.",
             }
 
         raw = {}

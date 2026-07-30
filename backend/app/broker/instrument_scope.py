@@ -21,11 +21,15 @@ REQUIRED_POLICY_FIELDS = (
     "market",
     "settlement",
     "quantity_step",
+    # IOL's "alteración mínima": the limit price must be an exact multiple of
+    # it. Required — without a known tick we cannot guarantee a price IOL
+    # will accept, and it rejects incompatible decimals.
+    "price_tick",
     "max_quantity",
     "max_notional",
 )
 
-_NUMERIC_FIELDS = ("quantity_step", "max_quantity", "max_notional")
+_NUMERIC_FIELDS = ("quantity_step", "price_tick", "max_quantity", "max_notional")
 
 
 def normalize_symbol(symbol) -> str:
@@ -186,6 +190,7 @@ def evaluate_order_scope(
         "execution_scope": {
             "sell_only": bool(settings.execution_sell_only),
             "quantity_step": policy["quantity_step"],
+            "price_tick": policy["price_tick"],
             "max_quantity": policy["max_quantity"],
             "max_notional": policy["max_notional"],
         },

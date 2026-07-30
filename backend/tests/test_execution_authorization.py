@@ -695,7 +695,7 @@ def test_simulated_real_flow_reaches_place_order_only_after_all_validations(db):
             "AAPL": {
                 "asset_type": "CEDEAR", "instrument_type": "CEDEAR", "currency": "USD",
                 "market": "bCBA", "settlement": "t1",
-                "quantity_step": 1, "max_quantity": 100, "max_notional": 1_000_000,
+                "quantity_step": 1, "price_tick": 0.01, "max_quantity": 100, "max_notional": 1_000_000,
             }
         },
     )
