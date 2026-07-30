@@ -470,68 +470,40 @@ class IolBrokerClient(BrokerClient):
     }
 
     def place_order(self, symbol: str, side: str, quantity: float, price: float | None = None) -> dict:
-        """Place an order via IOL API using the correct side-specific endpoint.
+        """DISABLED legacy path — refuses to send, always.
 
-        - sell → POST /api/v2/operar/Vender
-        - buy  → POST /api/v2/operar/Comprar
+        This method used to POST a JSON body with a hardcoded `plazo` and an
+        implicit `precioMercado` when no price was given. None of that
+        matches the documented personal-order contract, and market orders are
+        banned in this version.
 
-        Returns dict with at least: order_id, status, endpoint_used, raw_response.
+        Real/sandbox execution MUST go through:
+            build_iol_order_request()  → application/x-www-form-urlencoded
+            → submit_order_request()
+
+        Raising here is defense in depth: approve_and_execute already routes
+        every non-mock environment to the canonical contract, so if this is
+        ever reached it is a bug — and it must fail closed instead of
+        sending a malformed real order.
         """
-        endpoint = self._IOL_SIDE_ENDPOINTS.get(side)
-        if not endpoint:
-            return {
-                "order_id": "",
-                "status": "error",
-                "error": f"Side '{side}' no soportado. Válidos: sell, buy",
-                "endpoint_used": "",
-                "raw_response": {},
-            }
+        raise RuntimeError(
+            "IolBrokerClient.place_order is disabled: real orders must use "
+            "build_iol_order_request() + submit_order_request() "
+            "(application/x-www-form-urlencoded, precioLimite only)."
+        )
 
-        body = {
-            "mercado": "bCBA",
-            "simbolo": symbol,
-            "cantidad": int(quantity),
-            "precio": price or 0,
-            "plazo": "t2",
-            "tipoOrden": "precioLimite" if price else "precioMercado",
-        }
-        try:
-            resp = self._authorized_post(endpoint, json_body=body)
-            data = resp.json()
-            return {
-                "order_id": str(data.get("numeroOperacion", "")),
-                "status": "sent",
-                "endpoint_used": endpoint,
-                "raw_response": data,
-            }
-        except httpx.HTTPStatusError as exc:
-            raw = {}
-            try:
-                raw = exc.response.json() if exc.response else {}
-            except Exception:
-                raw = {"status_code": exc.response.status_code if exc.response else None}
-            return {
-                "order_id": "",
-                "status": "rejected",
-                "error": str(exc),
-                "endpoint_used": endpoint,
-                "raw_response": raw,
-            }
-        except Exception as exc:
-            return {
-                "order_id": "",
-                "status": "error",
-                "error": str(exc),
-                "endpoint_used": endpoint,
-                "raw_response": {},
-            }
 
     def get_order_status(self, order_id: str) -> dict:
         """Check order status via IOL API."""
         try:
             resp = self._authorized_get(f"/api/v2/operaciones/{order_id}")
             data = resp.json()
-            return {"order_id": order_id, "raw_response": data, "status": data.get("estado", "unknown")}
+            # The real API returns "estadoActual" (e.g. "iniciada",
+            # "cancelada"); "estado" is kept as a fallback for older shapes.
+            status = "unknown"
+            if isinstance(data, dict):
+                status = data.get("estadoActual") or data.get("estado") or "unknown"
+            return {"order_id": order_id, "raw_response": data, "status": status}
         except Exception as exc:
             return {"order_id": order_id, "status": "error", "error": str(exc)}
 
