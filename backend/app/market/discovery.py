@@ -424,7 +424,7 @@ def fetch_fresh_quotes(
 ) -> tuple[dict, dict]:
     """Fetch fresh quotes from IOL for a small shortlist of symbols.
 
-    For each symbol, calls /api/v2/Cotizaciones/detalle/bCBA/{symbol}
+    For each symbol, calls /api/v2/bCBA/Titulos/{symbol}/Cotizacion
     to get ultimoPrecio. Computes variacion_pct by comparing fresh price
     against the catalog's last_price.
 
@@ -468,8 +468,10 @@ def fetch_fresh_quotes(
 
     for symbol in symbols:
         try:
+            # Verified against the real API: /api/v2/Cotizaciones/detalle/...
+            # answers HTTP 400. This is the working contract.
             resp = broker._authorized_get(
-                f"/api/v2/Cotizaciones/detalle/bCBA/{symbol}"
+                f"/api/v2/bCBA/Titulos/{symbol}/Cotizacion"
             )
             data = resp.json()
             if not isinstance(data, dict):

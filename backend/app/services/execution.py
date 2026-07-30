@@ -1450,6 +1450,79 @@ def _live_portfolio_total(live: dict, live_positions: list) -> Decimal | None:
     return total if total > 0 else None
 
 
+def _check_batch_sell_exposure(intents: list, live_positions: list) -> tuple[str | None, dict | None]:
+    """Aggregate every SELL of the same symbol against the real holding.
+
+    A per-order check compares each order against the FULL position, so two
+    sells of the same symbol can pass individually while together exceeding
+    what is actually held. This groups them (Decimal, normalized symbols)
+    using the single live portfolio read of the batch.
+
+    Returns (error_code, audit). Quantities are never reduced to fit: if the
+    aggregate exceeds the holding, the whole batch is cancelled.
+    """
+    from app.broker.instrument_scope import normalize_symbol
+
+    available_by_symbol: dict[str, Decimal | None] = {}
+    for p in live_positions:
+        symbol = normalize_symbol(p.get("symbol"))
+        if not symbol:
+            continue
+        available_by_symbol[symbol] = non_negative_decimal(p.get("quantity"))
+
+    grouped: dict[str, dict] = {}
+    for order_exec in intents:
+        if order_exec.side != "sell":
+            continue
+        symbol = normalize_symbol(order_exec.symbol)
+        required = positive_decimal(order_exec.quantity_planned)
+        if required is None:
+            return "invalid_execution_quantity", {
+                "symbol": symbol,
+                "order_execution_ids": [order_exec.id],
+                "recommendation_action_ids": [order_exec.recommendation_action_id],
+            }
+        entry = grouped.setdefault(symbol, {
+            "symbol": symbol,
+            "total_required": Decimal("0"),
+            "order_execution_ids": [],
+            "recommendation_action_ids": [],
+        })
+        entry["total_required"] += required
+        entry["order_execution_ids"].append(order_exec.id)
+        entry["recommendation_action_ids"].append(order_exec.recommendation_action_id)
+
+    for symbol, entry in grouped.items():
+        available = available_by_symbol.get(symbol)
+        audit = {
+            "symbol": symbol,
+            "quantity_available": float(available) if available is not None else None,
+            "total_quantity_required": float(entry["total_required"]),
+            "order_count": len(entry["order_execution_ids"]),
+            "order_execution_ids": entry["order_execution_ids"],
+            "recommendation_action_ids": entry["recommendation_action_ids"],
+            "passed": False,
+        }
+        if symbol not in available_by_symbol:
+            return "live_position_missing", audit
+        if available is None:
+            return "invalid_live_position_quantity", audit
+        if entry["total_required"] > available:
+            return "live_position_insufficient_batch", audit
+
+    return None, None
+
+
+def _describe_sell_exposure(audit: dict | None) -> str:
+    if not audit:
+        return "cumulative sell exposure check failed"
+    return (
+        f"symbol {audit.get('symbol')}: {audit.get('order_count')} sell order(s) require "
+        f"{audit.get('total_quantity_required')} but only {audit.get('quantity_available')} is held "
+        "(quantities are never reduced automatically)"
+    )
+
+
 def prepare_validated_execution_batch(
     db: Session,
     intents: list,
@@ -1486,6 +1559,20 @@ def prepare_validated_execution_batch(
         _cancel_batch(db, intents, None, "invalid_portfolio_value",
                       "live portfolio total value is not a positive finite number")
         return None, "invalid_portfolio_value"
+
+    # --- Cumulative sell exposure per symbol, BEFORE quoting or sending ---
+    # Each order is individually checked against the full position, so two
+    # sells of the same symbol could each pass while together exceeding the
+    # real holding. Aggregate them first and fail closed for the whole batch.
+    batch_error, batch_audit = _check_batch_sell_exposure(intents, live_positions)
+    if batch_error:
+        # Blame every order of the offending symbol; the rest of the batch
+        # keeps the preflight_cancelled semantics.
+        offending_ids = set((batch_audit or {}).get("order_execution_ids") or [])
+        culprits = [o for o in intents if o.id in offending_ids] or None
+        _cancel_batch(db, intents, culprits, batch_error,
+                      _describe_sell_exposure(batch_audit), extra_audit=batch_audit)
+        return None, batch_error
 
     prepared: list[dict] = []
     for order_exec in intents:
@@ -1529,7 +1616,8 @@ def prepare_validated_execution_batch(
     return prepared, None
 
 
-def _cancel_batch(db: Session, intents: list, failed_order, code: str, detail: str) -> None:
+def _cancel_batch(db: Session, intents: list, failed_order, code: str, detail: str,
+                  extra_audit: dict | None = None) -> None:
     """Abort the whole batch before ANY submission.
 
     The causing order gets `failed` with its specific code; every other
@@ -1538,13 +1626,23 @@ def _cancel_batch(db: Session, intents: list, failed_order, code: str, detail: s
     manual reconciliation case.
     """
     now = datetime.now(timezone.utc)
+    # failed_order may be a single order, a collection of orders (e.g. every
+    # sell of the symbol that blew the cumulative check) or None for a
+    # batch-wide failure where no single order is to blame.
+    if failed_order is None:
+        culprits = None
+    elif isinstance(failed_order, (list, tuple, set)):
+        culprits = {id(o) for o in failed_order}
+    else:
+        culprits = {id(failed_order)}
+
     for order_exec in intents:
         if order_exec.status in ("execution_sent", "manual_reconciliation_required", "submitting"):
             continue
-        # failed_order None → batch-level failure (portfolio read, portfolio
+        # culprits None → batch-level failure (portfolio read, portfolio
         # value, batch total): every order failed for the same definitive
         # reason, so all of them carry the specific code.
-        if failed_order is None or order_exec is failed_order:
+        if culprits is None or id(order_exec) in culprits:
             order_exec.status = "failed"
             order_exec.error_message = (
                 f"{code}: {detail}. Order NOT sent — no order in this batch was submitted."
@@ -1557,6 +1655,12 @@ def _cancel_batch(db: Session, intents: list, failed_order, code: str, detail: s
             )[:500]
         order_exec.quantity_sent = None
         order_exec.completed_at = now
+        if extra_audit:
+            br = dict(order_exec.broker_response or {})
+            request_audit = dict(br.get("request_audit") or {})
+            request_audit["batch_sell_exposure_check"] = {**extra_audit, "code": code}
+            br["request_audit"] = request_audit
+            order_exec.broker_response = br
     db.commit()
 
 
