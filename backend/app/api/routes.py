@@ -84,7 +84,9 @@ def run_manual_analysis(db: Session = Depends(get_db), _auth=Depends(require_api
             dispatch_recommendation_alerts,
             notify_new_recommendation_pending_review,
         )
-        dispatch_recommendation_alerts(db, cycle_result)
+        # Single main push: audit trail without push, then the human-review
+        # notification (see notifications/dispatcher.py).
+        dispatch_recommendation_alerts(db, cycle_result, suppress_push=True)
         notify_new_recommendation_pending_review(db, cycle_result)
     except Exception as exc:
         import logging

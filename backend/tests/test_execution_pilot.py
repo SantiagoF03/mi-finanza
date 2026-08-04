@@ -305,7 +305,9 @@ def test_second_pending_pilot_is_blocked(db):
         assert "error" not in first
         second = _create(db)
     assert second["status_code"] == 409
-    assert second["code"] == "pilot_already_pending"
+    # The central gate now blocks it (a pilot is an open recommendation like
+    # any other), which is strictly stronger than the old pilot-only check.
+    assert second["code"] == "open_recommendation_requires_decision"
     assert db.query(Recommendation).filter(
         Recommendation.status == "pending").count() == 1
 
@@ -349,7 +351,13 @@ def test_creation_never_touches_broker_or_sends(db):
     assert db.query(OrderExecution).count() == 0
 
 
-def test_pilot_supersedes_previous_recommendation_keeping_history(db):
+def test_pilot_is_blocked_by_an_open_recommendation(db):
+    """V2: the pilot NEVER supersedes an open recommendation.
+
+    The old behavior set superseded_at + metadata but left the previous
+    recommendation `pending`, so two open recommendations could coexist. Now
+    the central gate blocks pilot creation until the human resolves it.
+    """
     _make_snapshot(db)
     old = Recommendation(
         action="rebalancear", status="pending", suggested_pct=0.1, confidence=0.7,
@@ -363,21 +371,34 @@ def test_pilot_supersedes_previous_recommendation_keeping_history(db):
     db.commit()
     old_id = old.id
 
+    before = db.query(Recommendation).count()
     with exec_settings(**_pilot_settings()):
         result = _create(db)
 
-    assert old_id in result["superseded_recommendation_ids"]
+    assert result["status_code"] == 409
+    assert result["code"] == "open_recommendation_requires_decision"
+    assert db.query(Recommendation).count() == before   # no second recommendation
+
     db.expire_all()
     old_row = db.get(Recommendation, old_id)
     assert old_row is not None, "history must never be deleted"
-    assert old_row.superseded_at is not None
-    assert old_row.metadata_json["origin"] == "automatic"  # original data kept
-    assert old_row.metadata_json["superseded_by_execution_pilot"] == result["recommendation_id"]
+    assert old_row.status == "pending"              # NOT superseded
+    assert old_row.superseded_at is None
+    assert old_row.metadata_json["origin"] == "automatic"
+    assert "superseded_by_execution_pilot" not in old_row.metadata_json
     # The SPY action is untouched — it was not converted into BYMA
     spy_action = db.query(RecommendationAction).filter(
         RecommendationAction.recommendation_id == old_id).one()
     assert spy_action.symbol == "SPY"
     assert spy_action.quantity_override is None
+
+    # Once the human decides, the pilot can be created.
+    from tests.testutils import decide_open_recommendations
+    decide_open_recommendations(db)
+    with exec_settings(**_pilot_settings()):
+        ok = _create(db)
+    assert "error" not in ok
+    assert ok["recommendation_id"] != old_id
 
 
 # ───────────────────────────────────────────────────────────────────

@@ -3103,8 +3103,12 @@ def test_scheduler_state_updates_after_ingestion():
     before_runs = _scheduler_state["total_runs"]
     scheduled_ingestion()
     assert _scheduler_state["total_runs"] == before_runs + 1
-    assert _scheduler_state["last_status"] == "ok"
-    assert _scheduler_state["last_source"] == "ingestion"
+    # last_status is now a precise vocabulary instead of a blanket "ok", and
+    # last_source carries the REAL cycle source.
+    assert _scheduler_state["last_status"] in {
+        "created", "skipped", "no_cycle_needed", "error",
+    }
+    assert _scheduler_state["last_source"] == "scheduler_event"
     assert _scheduler_state["last_run_at"] is not None
 
 

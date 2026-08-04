@@ -26,9 +26,11 @@ from app.recommendations.unchanged import detect_unchanged
 from app.recommendations.universe import build_allowed_assets
 from app.rules.engine import enforce_rules
 from app.services.analysis_gate import (
+    SKIP_COOLDOWN,
     acquire_analysis_lease,
     check_recommendation_creation_allowed,
     release_analysis_lease,
+    verify_can_persist_recommendation,
 )
 from app.services.logs import app_log
 from app.services.planner import generate_reallocation_plan
@@ -890,21 +892,9 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     """
     settings = get_settings()
 
-    # --- Creation gate (cheap, before any broker/LLM work) ---
-    gate = check_recommendation_creation_allowed(db)
-    if not gate.allowed:
-        deferred = len(get_pending_recalc_events(db))
-        app_log(db, "Ciclo de análisis omitido: decisión humana pendiente", context={
-            "source": source,
-            "code": gate.code,
-            "blocking_recommendation_id": gate.blocking_recommendation_id,
-            "blocking_execution_id": gate.blocking_execution_id,
-            "deferred_events_count": deferred,
-        })
-        db.commit()
-        return gate.as_skip(source, deferred_events_count=deferred, snapshot_id=None)
-
-    # --- Persistent lease: only one process may create a recommendation ---
+    # --- Lease FIRST, then the gate INSIDE it ---
+    # Evaluating the gate before holding the lease would be a TOCTOU window:
+    # two processes could both read "allowed" and both proceed.
     lease_owner, lease_error = acquire_analysis_lease(db)
     if lease_owner is None:
         deferred = len(get_pending_recalc_events(db))
@@ -921,12 +911,25 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
         }
 
     try:
-        return _run_cycle_locked(db, source, settings)
+        gate = check_recommendation_creation_allowed(db)
+        if not gate.allowed:
+            deferred = len(get_pending_recalc_events(db))
+            app_log(db, "Ciclo de análisis omitido: decisión humana pendiente", context={
+                "source": source,
+                "code": gate.code,
+                "blocking_recommendation_id": gate.blocking_recommendation_id,
+                "blocking_execution_id": gate.blocking_execution_id,
+                "deferred_events_count": deferred,
+            })
+            db.commit()
+            return gate.as_skip(source, deferred_events_count=deferred, snapshot_id=None)
+
+        return _run_cycle_locked(db, source, settings, lease_owner)
     finally:
         release_analysis_lease(db, lease_owner)
 
 
-def _run_cycle_locked(db: Session, source: str, settings) -> dict:
+def _run_cycle_locked(db: Session, source: str, settings, lease_owner: str) -> dict:
     latest = db.query(Recommendation).order_by(desc(Recommendation.created_at)).first()
     if latest:
         cooldown_until = latest.created_at + timedelta(seconds=settings.trigger_cooldown_seconds)
@@ -942,10 +945,16 @@ def _run_cycle_locked(db: Session, source: str, settings) -> dict:
             return {
                 "status": "cooldown",
                 "skipped": True,
+                "code": SKIP_COOLDOWN,
+                "source": source,
                 "message": "Todavía no podés generar una nueva recomendación.",
                 "cooldown_remaining_seconds": remaining_seconds,
                 "cooldown_remaining_minutes": remaining_minutes,
                 "reason": "cooldown",
+                "blocking_recommendation_id": latest.id,
+                "blocking_execution_id": None,
+                "deferred_events_count": len(get_pending_recalc_events(db)),
+                "snapshot_id": None,
                 "recommendation_id": latest.id,
             }
 
@@ -1362,6 +1371,22 @@ def _run_cycle_locked(db: Session, source: str, settings) -> dict:
             "decision_summary": decision_summary,
         },
     )
+    # --- FINAL check, immediately before the INSERT (closes the TOCTOU
+    # window opened by a long analysis): renew the lease atomically (proving
+    # we still own it) and re-run the creation gate. Fail closed. ---
+    final_gate = verify_can_persist_recommendation(db, lease_owner)
+    if not final_gate.allowed:
+        db.rollback()
+        deferred = len(get_pending_recalc_events(db))
+        app_log(db, "Recomendación no persistida: verificación final falló", context={
+            "source": source,
+            "code": final_gate.code,
+            "blocking_recommendation_id": final_gate.blocking_recommendation_id,
+            "blocking_execution_id": final_gate.blocking_execution_id,
+        })
+        db.commit()
+        return final_gate.as_skip(source, deferred_events_count=deferred, snapshot_id=None)
+
     db.add(rec_model)
     db.flush()
     for item in rec["actions"]:

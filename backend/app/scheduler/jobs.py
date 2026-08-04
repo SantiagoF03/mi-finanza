@@ -32,6 +32,8 @@ _scheduler_state: dict = {
     "last_run_at": None,
     "last_status": None,
     "last_source": None,
+    "last_job": None,
+    "last_error": None,
     "last_skip_code": None,
     "blocking_recommendation_id": None,
     "blocking_execution_id": None,
@@ -52,21 +54,65 @@ def scheduler_now() -> datetime:
     return datetime.now(scheduler_timezone())
 
 
+def consume_recalc_events(db, events, cycle_result: dict | None) -> int:
+    """Mark recalc events as incorporated into a recommendation.
+
+    Shared by scheduled_ingestion AND scheduled_full_cycle so the two paths
+    cannot diverge. Events are consumed ONLY when the cycle actually
+    persisted a recommendation: a skip, a cooldown, a lease failure or an
+    error leaves them pending for a later cycle, and the flag plus the
+    association commit together in one transaction.
+    """
+    if not events or not isinstance(cycle_result, dict):
+        return 0
+    recommendation_id = cycle_result.get("recommendation_id")
+    if not recommendation_id or cycle_result.get("skipped"):
+        return 0
+    consumed = 0
+    for evt in events:
+        evt.triggered_recalc = True
+        evt.recalc_recommendation_id = recommendation_id
+        consumed += 1
+    db.commit()
+    return consumed
+
+
 def _record_cycle_outcome(result: dict | None, source: str) -> None:
-    """Record a run_cycle outcome, distinguishing a real skip from an error."""
+    """Record a run_cycle outcome with the REAL source and a precise status.
+
+    last_status distinguishes created / skipped / error / no_cycle_needed, and
+    the blocking fields are cleared as soon as they no longer apply so the
+    status never shows a stale block.
+    """
+    _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+    _scheduler_state["last_source"] = source
+
+    if result is None:
+        # The job ran but no cycle was needed (no pending events / not gated).
+        _scheduler_state["last_status"] = "no_cycle_needed"
+        _clear_blocking_state()
+        return
     if not isinstance(result, dict):
         return
+
     if result.get("skipped"):
+        _scheduler_state["last_status"] = "skipped"
         _scheduler_state["last_skip_code"] = result.get("code")
         _scheduler_state["blocking_recommendation_id"] = result.get("blocking_recommendation_id")
         _scheduler_state["blocking_execution_id"] = result.get("blocking_execution_id")
         _scheduler_state["deferred_events_count"] = result.get("deferred_events_count") or 0
         _scheduler_state["total_skips"] += 1
     else:
-        _scheduler_state["last_skip_code"] = None
-        _scheduler_state["blocking_recommendation_id"] = None
-        _scheduler_state["blocking_execution_id"] = None
-        _scheduler_state["deferred_events_count"] = 0
+        _scheduler_state["last_status"] = "created"
+        _clear_blocking_state()
+
+
+def _clear_blocking_state() -> None:
+    """Drop blocking info so a resolved block never lingers in the status."""
+    _scheduler_state["last_skip_code"] = None
+    _scheduler_state["blocking_recommendation_id"] = None
+    _scheduler_state["blocking_execution_id"] = None
+    _scheduler_state["deferred_events_count"] = 0
 
 
 def get_scheduler_state() -> dict:
@@ -149,36 +195,33 @@ def _market_phase(now_utc: datetime | None = None) -> str:
 
 def scheduled_ingestion():
     """Lightweight job: ingest news, create events, trigger recalc only if needed."""
-    db = SessionLocal()
+    db = None
     try:
+        db = SessionLocal()
         run_ingestion(db, source_label="scheduler")
 
         pending = get_pending_recalc_events(db)
         if pending:
             cycle_result = run_cycle(db, source="scheduler_event")
             _record_cycle_outcome(cycle_result, "scheduler_event")
-            # Deferred events: only mark them consumed when a recommendation
-            # was actually persisted. A skipped cycle leaves them pending so
-            # a future cycle picks them up — never lost, never duplicated.
-            if cycle_result.get("recommendation_id"):
-                for evt in pending:
-                    evt.triggered_recalc = True
-                    evt.recalc_recommendation_id = cycle_result["recommendation_id"]
-            db.commit()
+            consume_recalc_events(db, pending, cycle_result)
 
             _notify_events(db, pending)
             _notify_recommendation_change(db, cycle_result)
-        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
-        _scheduler_state["last_status"] = "ok"
-        _scheduler_state["last_source"] = "ingestion"
+        else:
+            _record_cycle_outcome(None, "scheduler_event")
+        # last_status / last_source are set by _record_cycle_outcome with the
+        # REAL cycle outcome and source; the job only counts the run here.
         _scheduler_state["total_runs"] += 1
     except Exception as exc:
         _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
-        _scheduler_state["last_status"] = f"error: {exc}"
-        _scheduler_state["last_source"] = "ingestion"
+        _scheduler_state["last_status"] = "error"
+        _scheduler_state["last_error"] = str(exc)[:300]
+        _scheduler_state["last_job"] = "ingestion"
         _scheduler_state["total_errors"] += 1
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 def scheduled_full_cycle():
@@ -191,8 +234,9 @@ def scheduled_full_cycle():
     if new actionable items were detected.
     """
     settings = get_settings()
-    db = SessionLocal()
+    db = None
     try:
+        db = SessionLocal()
         run_ingestion(db, source_label="scheduler_close")
 
         should_run = (
@@ -201,20 +245,28 @@ def scheduled_full_cycle():
             or bool(get_pending_recalc_events(db))
         )
         if should_run:
+            # Capture the events BEFORE the cycle so the ones it used are the
+            # ones consumed (previously full_cycle never consumed any, so they
+            # stayed pending and could produce a duplicate recommendation).
+            pending = get_pending_recalc_events(db)
             cycle_result = run_cycle(db, source="scheduler")
             _record_cycle_outcome(cycle_result, "scheduler")
+            consume_recalc_events(db, pending, cycle_result)
             _notify_recommendation_change(db, cycle_result)
-        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
-        _scheduler_state["last_status"] = "ok"
-        _scheduler_state["last_source"] = "full_cycle"
+        else:
+            _record_cycle_outcome(None, "scheduler")
+        # last_status / last_source are set by _record_cycle_outcome with the
+        # REAL cycle outcome and source; the job only counts the run here.
         _scheduler_state["total_runs"] += 1
     except Exception as exc:
         _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
-        _scheduler_state["last_status"] = f"error: {exc}"
-        _scheduler_state["last_source"] = "full_cycle"
+        _scheduler_state["last_status"] = "error"
+        _scheduler_state["last_error"] = str(exc)[:300]
+        _scheduler_state["last_job"] = "full_cycle"
         _scheduler_state["total_errors"] += 1
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 def _notify_events(db, events):
@@ -243,7 +295,11 @@ def _notify_recommendation_change(db, cycle_result: dict):
             dispatch_recommendation_alerts,
             notify_new_recommendation_pending_review,
         )
-        dispatch_recommendation_alerts(db, cycle_result)
+        # SINGLE MAIN PUSH policy: the human-review notice is THE push for a
+        # newly created recommendation. dispatch_recommendation_alerts still
+        # runs to persist its audit trail, but with push suppressed so the
+        # same recommendation never produces two notifications.
+        dispatch_recommendation_alerts(db, cycle_result, suppress_push=True)
         notify_new_recommendation_pending_review(db, cycle_result)
     except Exception:
         pass
