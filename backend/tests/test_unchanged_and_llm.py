@@ -10,6 +10,7 @@ from app.db.session import Base
 from app.models.models import Recommendation
 from app.recommendations.unchanged import detect_unchanged
 from app.services.orchestrator import run_cycle, get_current_recommendation
+from tests.testutils import decide_open_recommendations
 
 
 def make_db():
@@ -31,6 +32,8 @@ def test_two_identical_cycles_produce_unchanged_true():
     s.trigger_cooldown_seconds = 0
 
     first = run_cycle(db, source="test")
+    # V1: a second cycle needs the first recommendation decided by a human.
+    decide_open_recommendations(db)
     second = run_cycle(db, source="test")
 
     assert first["recommendation_id"] != second["recommendation_id"]
@@ -125,6 +128,8 @@ def test_unchanged_reason_populated():
     s.trigger_cooldown_seconds = 0
 
     first = run_cycle(db, source="test")
+    # V1: a second cycle needs the first recommendation decided by a human.
+    decide_open_recommendations(db)
     second = run_cycle(db, source="test")
     rec = db.query(Recommendation).filter(Recommendation.id == second["recommendation_id"]).first()
     assert isinstance((rec.metadata_json or {}).get("unchanged_reason"), str)

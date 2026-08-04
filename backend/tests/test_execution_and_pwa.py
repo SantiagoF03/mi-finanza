@@ -251,9 +251,13 @@ def test_scheduler_never_imports_execution():
     from app.scheduler import jobs
 
     source = inspect.getsource(jobs)
-    assert "execution" not in source.lower() or "execute" not in source
-    assert "place_order" not in source
-    assert "approve_and_execute" not in source
+    # Precise guard: forbid the symbols that could actually send/approve an
+    # order. (Observability field names such as blocking_execution_id are
+    # fine; the rigorous check lives in the AST test in
+    # test_semiautomatic_scheduler.py.)
+    for forbidden in ("approve_and_execute", "place_order", "submit_order_request",
+                      "OrderExecution", "reconcile_execution"):
+        assert forbidden not in source, f"scheduler must not reference {forbidden}"
 
 
 def test_scheduled_ingestion_no_execution():

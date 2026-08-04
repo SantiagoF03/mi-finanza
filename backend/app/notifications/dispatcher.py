@@ -1076,3 +1076,65 @@ def dispatch_alerts(db, events: list) -> dict:
         "web_push_failed": push_result.get("failed", 0),
         "web_push_removed": push_result.get("removed", 0),
     }
+
+
+def notify_new_recommendation_pending_review(db, cycle_result: dict) -> dict:
+    """Single 'a new recommendation needs your review' notification.
+
+    Semi-automatic mode V1: the cycle creates at most one open recommendation
+    and then waits for a human. This tells the user exactly that.
+
+    - sent exactly ONCE per recommendation (deduplicated via a persisted flag,
+      so a repeated dispatch never spams);
+    - never claims anything was executed;
+    - carries recommendation_id and a deep link only — no credentials, no
+      preview hash, no keys, no internal payloads.
+
+    Notifications NEVER execute orders.
+    """
+    from app.models.models import Recommendation
+
+    rec_id = cycle_result.get("recommendation_id")
+    if not rec_id or cycle_result.get("skipped"):
+        return {"sent": False, "reason": "no_new_recommendation"}
+
+    rec = db.query(Recommendation).filter(Recommendation.id == rec_id).first()
+    if not rec:
+        return {"sent": False, "reason": "recommendation_not_found"}
+
+    meta = dict(rec.metadata_json or {})
+    if meta.get("review_notification_sent") is True:
+        return {"sent": False, "reason": "already_notified", "recommendation_id": rec_id}
+
+    settings = get_settings()
+    title = "Mi Finanza — Nueva recomendación para revisar"
+    body = (
+        f"Recomendación #{rec_id} lista para tu revisión. "
+        "Requiere tu decisión manual: nada se ejecutó ni se ejecutará automáticamente."
+    )
+    deep_link = f"/recommendations/{rec_id}"
+
+    result = {"sent": False, "reason": "disabled"}
+    if settings.notification_enabled:
+        try:
+            result = send_web_push_to_all(
+                db, title=title, body=body, severity="medium", deep_link=deep_link,
+                extras={"category": "new_recommendation_pending_review",
+                        "recommendation_id": rec_id},
+            )
+        except Exception as exc:
+            logger.warning("New-recommendation notification failed: %s", exc)
+            result = {"sent": False, "reason": "dispatch_failed"}
+
+    # Mark as notified regardless of delivery outcome: retrying delivery is a
+    # transport concern, but re-notifying on every cycle would be spam.
+    meta["review_notification_sent"] = True
+    rec.metadata_json = meta
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return {**(result if isinstance(result, dict) else {}),
+            "recommendation_id": rec_id,
+            "category": "new_recommendation_pending_review"}

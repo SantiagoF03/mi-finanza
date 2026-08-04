@@ -2316,10 +2316,17 @@ def _exec_to_dict(e: OrderExecution) -> dict:
 # execution_ready is durable PRE-POST state: the preflight was persisted but
 # no submission was ever started (the flow always commits 'submitting' first).
 # It is therefore reconcilable, but ONLY as confirm_not_sent.
-_RECONCILABLE_STATUSES = {"submitting", "manual_reconciliation_required", "execution_ready"}
+# execution_requested and execution_ready are durable PRE-POST states: a
+# crash can leave an intent there before any broker call. Both are visible
+# and resolvable, but ONLY as confirm_not_sent — never resumed, never re-sent,
+# and never resolved by asking the broker.
+_RECONCILABLE_STATUSES = {
+    "submitting", "manual_reconciliation_required",
+    "execution_ready", "execution_requested",
+}
 
 # Statuses whose only valid manual resolution is "it was never sent".
-_PREPARED_NOT_SUBMITTED_STATUSES = {"execution_ready"}
+_PREPARED_NOT_SUBMITTED_STATUSES = {"execution_ready", "execution_requested"}
 
 _RECONCILIATION_ACTIONS = {
     "confirm_not_sent": {

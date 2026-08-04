@@ -12,6 +12,7 @@ from app.portfolio.analyzer import analyze_portfolio
 from app.portfolio.profiles import PROFILE_PRESETS, build_target_weights, get_bucket
 from app.recommendations.universe import VALID_ASSET_TYPES, build_allowed_assets, is_valid_asset_type
 from app.services.orchestrator import run_cycle
+from tests.testutils import decide_open_recommendations
 
 
 def make_db():
@@ -312,6 +313,8 @@ def test_unchanged_still_works_after_changes():
     s.watchlist_assets = ["TSLA"]
 
     first = run_cycle(db, source="test")
+    # V1: a second cycle needs the first recommendation decided by a human.
+    decide_open_recommendations(db)
     second = run_cycle(db, source="test")
     assert second.get("unchanged") is True
 

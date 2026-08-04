@@ -148,6 +148,15 @@ class Settings(BaseSettings):
     scheduler_ingestion_only_off_hours: bool = True
     scheduler_postmarket_force_cycle: bool = False  # if True, post-market runs full cycle even without events
 
+    # Explicit scheduler timezone (IANA). Default UTC preserves the previous
+    # behavior exactly: market open/close hours were already interpreted as
+    # UTC. Changing this changes WHEN jobs fire — do it deliberately.
+    scheduler_timezone: str = "UTC"
+
+    # Persistent analysis lease TTL (seconds, > 0). Cross-process mutual
+    # exclusion for the analysis cycle.
+    analysis_lease_ttl_seconds: int = 600
+
     # Notification (Part E)
     notification_enabled: bool = False
     notification_channel: str = "web_push"  # telegram | web_push
@@ -251,6 +260,38 @@ class Settings(BaseSettings):
         num = _finite_number(v)
         if num is None or num < 0 or num > 10:
             raise ValueError(f"{info.field_name} must be a finite number between 0 and 10 (got {v!r})")
+        return v
+
+    @field_validator("analysis_lease_ttl_seconds", mode="before")
+    @classmethod
+    def validate_lease_ttl(cls, v, info):
+        num = _finite_number(v)
+        if num is None or num <= 0:
+            raise ValueError(f"{info.field_name} must be a finite number > 0 (got {v!r})")
+        return v
+
+    @field_validator("scheduler_timezone", mode="before")
+    @classmethod
+    def validate_scheduler_timezone(cls, v, info):
+        """Must be a valid IANA zone — fail closed at startup, never silently
+        fall back to the host TZ."""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        name = (str(v or "")).strip()
+        if not name:
+            raise ValueError(f"{info.field_name} must be a non-empty IANA timezone")
+        try:
+            ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError, KeyError, ModuleNotFoundError) as exc:
+            raise ValueError(f"{info.field_name} is not a valid IANA timezone: {name!r}") from exc
+        return name
+
+    @field_validator("scheduler_market_open_hour", "scheduler_market_close_hour", mode="before")
+    @classmethod
+    def validate_market_hours(cls, v, info):
+        num = _finite_number(v)
+        if num is None or num < 0 or num > 23 or num != int(num):
+            raise ValueError(f"{info.field_name} must be an integer hour between 0 and 23 (got {v!r})")
         return v
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

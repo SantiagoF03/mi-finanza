@@ -64,14 +64,31 @@ def broker_execution_readiness(_auth=Depends(require_api_key)):
 
 @router.post("/analysis/run")
 def run_manual_analysis(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
+    """Manual analysis cycle. NEVER approves and NEVER executes.
+
+    Semi-automatic mode V1: while a recommendation awaits a human decision or
+    an execution is unresolved, this returns HTTP 200 with a stable
+    `skipped` payload (a blocked cycle is an expected outcome, not a 500).
+    It does not create, replace or modify the open recommendation, and sends
+    no "new recommendation" notification.
+    """
     cycle_result = run_cycle(db, source="manual")
+
+    if cycle_result.get("skipped"):
+        # Nothing was created → nothing to notify.
+        return cycle_result
+
     # Persist notification audit trail (best-effort, does not affect cycle result)
     try:
-        from app.notifications.dispatcher import dispatch_recommendation_alerts
+        from app.notifications.dispatcher import (
+            dispatch_recommendation_alerts,
+            notify_new_recommendation_pending_review,
+        )
         dispatch_recommendation_alerts(db, cycle_result)
+        notify_new_recommendation_pending_review(db, cycle_result)
     except Exception as exc:
         import logging
-        logging.getLogger(__name__).warning("dispatch_recommendation_alerts failed: %s", exc)
+        logging.getLogger(__name__).warning("recommendation notification failed: %s", exc)
     return cycle_result
 
 
