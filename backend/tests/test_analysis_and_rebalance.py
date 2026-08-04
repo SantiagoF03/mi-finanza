@@ -16,6 +16,7 @@ from app.portfolio.analyzer import _infer_economic_currency, analyze_portfolio
 from app.portfolio.profiles import PROFILE_PRESETS, build_target_weights
 from app.recommendations.engine import generate_recommendation
 from app.services.orchestrator import run_cycle
+from tests.testutils import decide_open_recommendations
 
 
 def make_db():
@@ -415,6 +416,8 @@ def test_unchanged_still_works_after_analysis_changes():
     s.trigger_cooldown_seconds = 0
 
     first = run_cycle(db, source="test")
+    # V1: a second cycle needs the first recommendation decided by a human.
+    decide_open_recommendations(db)
     second = run_cycle(db, source="test")
     assert second.get("unchanged") is True
 

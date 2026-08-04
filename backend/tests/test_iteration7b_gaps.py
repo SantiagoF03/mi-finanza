@@ -39,6 +39,7 @@ from app.news.ingestion import (
     run_ingestion,
 )
 from app.services.orchestrator import run_cycle
+from tests.testutils import decide_open_recommendations
 
 
 def make_db():
@@ -435,6 +436,9 @@ def test_cooldown_intact_after_7b():
     first = run_cycle(db, source="test")
     assert "recommendation_id" in first
 
+    # V1: decide the recommendation so the creation gate passes and the
+    # cooldown mechanism is what actually blocks the second cycle.
+    decide_open_recommendations(db)
     second = run_cycle(db, source="test")
     assert second.get("status") == "cooldown"
 
@@ -446,6 +450,8 @@ def test_unchanged_intact_after_7b():
     s.trigger_cooldown_seconds = 0
 
     first = run_cycle(db, source="test")
+    # V1: a second cycle needs the first recommendation decided by a human.
+    decide_open_recommendations(db)
     second = run_cycle(db, source="test")
     assert second.get("unchanged") is True
 
@@ -536,6 +542,8 @@ def test_detect_unchanged_uses_coherent_pipeline():
     s.trigger_cooldown_seconds = 0
 
     first = run_cycle(db, source="test")
+    # V1: a second cycle needs the first recommendation decided by a human.
+    decide_open_recommendations(db)
     second = run_cycle(db, source="test")
 
     rec1 = db.query(Recommendation).filter(Recommendation.id == first["recommendation_id"]).first()

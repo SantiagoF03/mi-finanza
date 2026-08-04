@@ -8,6 +8,7 @@ from app.recommendations.engine import generate_recommendation
 from app.rules.engine import enforce_rules
 from app.services.orchestrator import get_current_recommendation, run_cycle
 from app.core.config import get_settings
+from tests.testutils import decide_open_recommendations
 
 
 def make_db():
@@ -49,21 +50,34 @@ def test_recommendation_respects_max_move():
 
 
 def test_current_recommendation_selection_and_superseded():
+    """Semi-automatic V1: an open recommendation is NEVER auto-superseded.
+
+    (Before V1 a second cycle replaced the first one. That is exactly the
+    behavior that let an automatic cycle discard a pending human decision.)
+    """
     db = make_db()
     s = get_settings()
     s.trigger_cooldown_seconds = 0
 
     first = run_cycle(db)
     first_id = first["recommendation_id"]
+
     second = run_cycle(db)
-    second_id = second["recommendation_id"]
+    assert second["skipped"] is True
+    assert second["code"] == "open_recommendation_requires_decision"
+    assert second["blocking_recommendation_id"] == first_id
+    assert "recommendation_id" not in second
 
-    assert first_id != second_id
-    current = get_current_recommendation(db)
-    assert current.id == second_id
-
+    # The open recommendation is untouched and still current.
     old = db.query(Recommendation).filter(Recommendation.id == first_id).first()
-    assert old.status == "superseded"
+    assert old.status == "pending"
+    assert old.superseded_at is None
+    assert get_current_recommendation(db).id == first_id
+
+    # After a human decision, the next cycle may create a new one.
+    decide_open_recommendations(db)
+    third = run_cycle(db)
+    assert third["recommendation_id"] != first_id
 
 
 def test_idempotency_cooldown_skips_duplicate():
@@ -72,6 +86,8 @@ def test_idempotency_cooldown_skips_duplicate():
     s.trigger_cooldown_seconds = 999999
 
     first = run_cycle(db)
+    # V1: a second cycle needs the first recommendation decided by a human.
+    decide_open_recommendations(db)
     second = run_cycle(db)
 
     assert second["skipped"] is True

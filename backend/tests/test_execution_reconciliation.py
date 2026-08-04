@@ -488,7 +488,10 @@ def test_confirm_executed_sets_values_and_timestamps(db):
 
 def test_non_reconcilable_states_409(db):
     with exec_settings(execution_admin_key=TEST_ADMIN_KEY):
-        for status in ("execution_requested", "failed", "rejected_by_broker", "executed", "not_sent_confirmed"):
+        # execution_requested is NO LONGER here: it is a durable pre-POST
+        # state and is now reconcilable, but only as confirm_not_sent (see
+        # test_semiautomatic_scheduler.py).
+        for status in ("failed", "rejected_by_broker", "executed", "not_sent_confirmed"):
             engine = create_engine("sqlite:///:memory:")
             Base.metadata.create_all(bind=engine)
             session = sessionmaker(bind=engine)()
