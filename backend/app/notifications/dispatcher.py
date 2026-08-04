@@ -36,6 +36,11 @@ _notified_actionable_date: str | None = None  # ISO date string e.g. "2026-04-22
 # Anti-spam: postclose digest max 1/day
 _last_digest_date: str | None = None  # ISO date string
 
+# Review-notification transport policy (transport ONLY — analysis and
+# execution are never retried).
+REVIEW_NOTIFICATION_MAX_ATTEMPTS = 3
+REVIEW_NOTIFICATION_RETRY_COOLDOWN_SECONDS = 300
+
 
 def _reset_daily_state_if_needed(today_str: str) -> None:
     """Reset daily anti-spam counters when the calendar day changes."""
@@ -702,7 +707,7 @@ def classify_recommendation_alert(
     }
 
 
-def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
+def dispatch_recommendation_alerts(db, cycle_result: dict, suppress_push: bool = False) -> dict:
     """Dispatch push notification for a recommendation cycle, governed by alert policy.
 
     Flow:
@@ -713,6 +718,11 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     5. Apply phase-aware cooldown and suppression
     6. Send via Telegram + Web Push
     7. Persist audit trail into recommendation metadata_json
+
+    suppress_push=True keeps the full audit trail but sends no push. It is
+    used on the cycle that CREATED a recommendation, where
+    notify_new_recommendation_pending_review is the single main push — so the
+    same recommendation can never produce two notifications.
 
     Safety invariant: notifications NEVER execute orders. They are
     informational only. Every message includes "Solo informativo" disclaimer.
@@ -901,7 +911,7 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     channel = settings.notification_channel  # telegram | web_push
 
     telegram_sent = False
-    if channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
+    if (not suppress_push) and channel == "telegram" and settings.telegram_bot_token and settings.telegram_chat_id:
         phase_map = {"premarket": "Pre-apertura", "open": "Mercado abierto",
                      "postmarket": "Post-cierre", "off": "Mercado cerrado"}
         msg = (
@@ -915,7 +925,9 @@ def dispatch_recommendation_alerts(db, cycle_result: dict) -> dict:
     # web_push: primary channel when channel=web_push; also fires alongside telegram
     # when channel=telegram (belt-and-suspenders for high-value alerts).
     push_result = {"sent": 0, "failed": 0, "removed": 0}
-    if channel in ("web_push", "telegram"):
+    if suppress_push:
+        push_result = {"sent": 0, "failed": 0, "removed": 0, "reason": "suppressed_single_main_push"}
+    elif channel in ("web_push", "telegram"):
         try:
             push_extras = {}
             if classification["category"] == "new_actionable":
@@ -1079,18 +1091,21 @@ def dispatch_alerts(db, events: list) -> dict:
 
 
 def notify_new_recommendation_pending_review(db, cycle_result: dict) -> dict:
-    """Single 'a new recommendation needs your review' notification.
+    """THE single main push for a newly created recommendation.
 
-    Semi-automatic mode V1: the cycle creates at most one open recommendation
-    and then waits for a human. This tells the user exactly that.
+    Delivery is only recorded when there is EVIDENCE of delivery (sent > 0).
+    Disabled notifications, exceptions and sent=0 leave a retriable state, so
+    a transient transport failure is never mistaken for a delivered notice.
 
-    - sent exactly ONCE per recommendation (deduplicated via a persisted flag,
-      so a repeated dispatch never spams);
-    - never claims anything was executed;
-    - carries recommendation_id and a deep link only — no credentials, no
-      preview hash, no keys, no internal payloads.
+    Persisted on the recommendation metadata:
+      review_notification_status: pending | delivered | failed | disabled
+      review_notification_last_attempt_at
+      review_notification_delivered_at
+      review_notification_attempts
 
-    Notifications NEVER execute orders.
+    Retries apply ONLY to the notification transport (bounded + cooldown).
+    Analysis and execution are NEVER retried. Notifications never execute
+    orders.
     """
     from app.models.models import Recommendation
 
@@ -1103,8 +1118,24 @@ def notify_new_recommendation_pending_review(db, cycle_result: dict) -> dict:
         return {"sent": False, "reason": "recommendation_not_found"}
 
     meta = dict(rec.metadata_json or {})
-    if meta.get("review_notification_sent") is True:
-        return {"sent": False, "reason": "already_notified", "recommendation_id": rec_id}
+    if meta.get("review_notification_status") == "delivered":
+        return {"sent": False, "reason": "already_delivered", "recommendation_id": rec_id}
+
+    attempts = int(meta.get("review_notification_attempts") or 0)
+    if attempts >= REVIEW_NOTIFICATION_MAX_ATTEMPTS:
+        return {"sent": False, "reason": "max_attempts_reached", "recommendation_id": rec_id}
+
+    now = datetime.now(timezone.utc)
+    last_attempt = meta.get("review_notification_last_attempt_at")
+    if last_attempt:
+        try:
+            previous = datetime.fromisoformat(last_attempt)
+            if previous.tzinfo is None:
+                previous = previous.replace(tzinfo=timezone.utc)
+            if (now - previous).total_seconds() < REVIEW_NOTIFICATION_RETRY_COOLDOWN_SECONDS:
+                return {"sent": False, "reason": "retry_cooldown", "recommendation_id": rec_id}
+        except (ValueError, TypeError):
+            pass
 
     settings = get_settings()
     title = "Mi Finanza — Nueva recomendación para revisar"
@@ -1114,27 +1145,40 @@ def notify_new_recommendation_pending_review(db, cycle_result: dict) -> dict:
     )
     deep_link = f"/recommendations/{rec_id}"
 
-    result = {"sent": False, "reason": "disabled"}
-    if settings.notification_enabled:
+    status = "pending"
+    result: dict = {"sent": 0}
+    if not settings.notification_enabled:
+        status = "disabled"
+        result = {"sent": 0, "reason": "disabled"}
+    else:
         try:
             result = send_web_push_to_all(
                 db, title=title, body=body, severity="medium", deep_link=deep_link,
                 extras={"category": "new_recommendation_pending_review",
                         "recommendation_id": rec_id},
-            )
+            ) or {}
+            status = "delivered" if (result.get("sent") or 0) > 0 else "failed"
         except Exception as exc:
             logger.warning("New-recommendation notification failed: %s", exc)
-            result = {"sent": False, "reason": "dispatch_failed"}
+            result = {"sent": 0, "reason": "dispatch_failed"}
+            status = "failed"
 
-    # Mark as notified regardless of delivery outcome: retrying delivery is a
-    # transport concern, but re-notifying on every cycle would be spam.
-    meta["review_notification_sent"] = True
+    meta["review_notification_status"] = status
+    meta["review_notification_attempts"] = attempts + 1
+    meta["review_notification_last_attempt_at"] = now.isoformat()
+    if status == "delivered":
+        meta["review_notification_delivered_at"] = now.isoformat()
+        # Backwards-compatible flag: ONLY set on real delivery.
+        meta["review_notification_sent"] = True
     rec.metadata_json = meta
     try:
         db.commit()
     except Exception:
         db.rollback()
 
-    return {**(result if isinstance(result, dict) else {}),
-            "recommendation_id": rec_id,
-            "category": "new_recommendation_pending_review"}
+    return {
+        **(result if isinstance(result, dict) else {}),
+        "recommendation_id": rec_id,
+        "category": "new_recommendation_pending_review",
+        "review_notification_status": status,
+    }

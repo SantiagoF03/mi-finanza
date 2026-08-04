@@ -34,6 +34,7 @@ SKIP_EXECUTION_PENDING = "execution_requires_resolution"
 SKIP_LEASE_UNAVAILABLE = "analysis_lease_unavailable"
 SKIP_LEASE_ERROR = "analysis_lease_error"
 SKIP_CREATION_CONFLICT = "recommendation_creation_conflict"
+SKIP_COOLDOWN = "analysis_cooldown"
 
 SKIP_CODES = frozenset({
     SKIP_OPEN_RECOMMENDATION,
@@ -41,6 +42,7 @@ SKIP_CODES = frozenset({
     SKIP_LEASE_UNAVAILABLE,
     SKIP_LEASE_ERROR,
     SKIP_CREATION_CONFLICT,
+    SKIP_COOLDOWN,
 })
 
 # --- Recommendation states -------------------------------------------------
@@ -272,6 +274,87 @@ def acquire_analysis_lease(db: Session, ttl_seconds: int | None = None) -> tuple
         except Exception:
             pass
         return None, SKIP_LEASE_ERROR
+
+
+def renew_analysis_lease(db: Session, owner_id: str, ttl_seconds: int | None = None) -> bool:
+    """Atomically extend the lease — ONLY for the current, still-valid owner.
+
+    The conditional UPDATE requires name + owner_id + a lease that has not
+    expired yet. rowcount != 1 means we lost it (expired, or taken over by
+    another process), and the caller MUST NOT persist a Recommendation.
+
+    A long analysis must renew rather than assume it finished within the TTL.
+    """
+    if not owner_id:
+        return False
+    settings = get_settings()
+    ttl = ttl_seconds if ttl_seconds is not None else settings.analysis_lease_ttl_seconds
+    if ttl <= 0:
+        return False
+    try:
+        now = _utcnow_naive()
+        renewed = (
+            db.query(AnalysisLease)
+            .filter(
+                AnalysisLease.name == LEASE_NAME,
+                AnalysisLease.owner_id == owner_id,
+                AnalysisLease.expires_at.isnot(None),
+                AnalysisLease.expires_at > now,   # still ours, not expired
+            )
+            .update({"expires_at": now + timedelta(seconds=ttl)}, synchronize_session=False)
+        )
+        db.commit()
+        return renewed == 1
+    except Exception as exc:  # fail closed
+        logger.error("Analysis lease renewal failed: %s", exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def holds_analysis_lease(db: Session, owner_id: str) -> bool:
+    """True only if `owner_id` currently owns a non-expired lease."""
+    if not owner_id:
+        return False
+    try:
+        now = _utcnow_naive()
+        return (
+            db.query(func.count(AnalysisLease.id))
+            .filter(
+                AnalysisLease.name == LEASE_NAME,
+                AnalysisLease.owner_id == owner_id,
+                AnalysisLease.expires_at.isnot(None),
+                AnalysisLease.expires_at > now,
+            )
+            .scalar()
+            or 0
+        ) == 1
+    except Exception as exc:  # fail closed
+        logger.error("Analysis lease ownership check failed: %s", exc)
+        return False
+
+
+def verify_can_persist_recommendation(db: Session, owner_id: str) -> GateResult:
+    """FINAL check, immediately before the INSERT.
+
+    Closes the TOCTOU window between "gate said yes" and the actual write:
+    1. renew the lease atomically (proves we still own it AND buys time);
+    2. re-run the creation gate (a blocking recommendation/execution may have
+       appeared during a long analysis).
+    Anything failing here blocks the write — fail closed.
+    """
+    if not renew_analysis_lease(db, owner_id):
+        return GateResult(
+            allowed=False,
+            code=SKIP_LEASE_UNAVAILABLE,
+            detail=(
+                "El lease de análisis se perdió o venció durante el ciclo; "
+                "no se persiste la recomendación."
+            ),
+        )
+    return check_recommendation_creation_allowed(db)
 
 
 def release_analysis_lease(db: Session, owner_id: str) -> bool:

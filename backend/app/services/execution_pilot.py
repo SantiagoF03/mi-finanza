@@ -29,6 +29,11 @@ from sqlalchemy.orm import Session, joinedload
 from app.broker.instrument_scope import load_instrument_policies, normalize_symbol
 from app.broker.numeric import positive_decimal
 from app.core.config import get_settings
+from app.services.analysis_gate import (
+    acquire_analysis_lease,
+    check_recommendation_creation_allowed,
+    release_analysis_lease,
+)
 from app.models.models import (
     PortfolioSnapshot,
     Recommendation,
@@ -174,15 +179,32 @@ def create_execution_pilot_recommendation(
             "quantity_step_mismatch", 422,
         )
 
-    # --- Only one pending pilot at a time ---
-    existing = _find_pending_pilot(db)
-    if existing is not None:
+    # --- Central mutual exclusion: same lease and same gate as run_cycle ---
+    # The pilot is a Recommendation like any other, so it must not be able to
+    # create a second open one behind the analysis cycle's back.
+    lease_owner, lease_error = acquire_analysis_lease(db)
+    if lease_owner is None:
         return _err(
-            f"Ya existe una recomendación piloto pendiente (id={existing.id}).",
-            "pilot_already_pending", 409,
+            "Otro ciclo de análisis está en curso. Reintentá en unos segundos.",
+            lease_error or "analysis_lease_unavailable", 409,
         )
 
-    # --- Create (no broker, no quote, no order) ---
+    try:
+        gate = check_recommendation_creation_allowed(db)
+        if not gate.allowed:
+            return _err(
+                (gate.detail or "Hay una decisión pendiente.")
+                + " Resolvela explícitamente antes de crear el piloto.",
+                gate.code or "open_recommendation_requires_decision", 409,
+            )
+        return _create_pilot_locked(db, snapshot, position, note, lease_owner)
+    finally:
+        release_analysis_lease(db, lease_owner)
+
+
+def _create_pilot_locked(db: Session, snapshot, position, note: str, lease_owner: str) -> dict:
+    """Persist the pilot while holding the lease. No broker, no quote, no order."""
+    settings = get_settings()
     rec = Recommendation(
         action="rebalancear",
         status="pending",
@@ -219,15 +241,15 @@ def create_execution_pilot_recommendation(
     db.add(action)
     db.flush()
 
-    superseded = _supersede_other_open_recommendations(db, rec.id)
-
+    # No supersession: the gate above guarantees there was no other open
+    # recommendation. A pilot never silently discards a pending human
+    # decision — it is blocked instead.
     app_log(db, "Recomendación piloto de ejecución creada manualmente", context={
         "recommendation_id": rec.id,
         "symbol": PILOT_SYMBOL,
         "side": PILOT_SIDE,
         "quantity": PILOT_QUANTITY,
         "snapshot_id": snapshot.id,
-        "superseded_recommendation_ids": superseded,
     })
     db.commit()
 
@@ -241,7 +263,7 @@ def create_execution_pilot_recommendation(
         "quantity": PILOT_QUANTITY,
         "quantity_override": PILOT_QUANTITY,
         "snapshot_id": snapshot.id,
-        "superseded_recommendation_ids": superseded,
+        "superseded_recommendation_ids": [],
         "order_execution_enabled": settings.order_execution_enabled,
         "message": (
             "Recomendación piloto creada. NO se envió ninguna orden. "
@@ -252,42 +274,9 @@ def create_execution_pilot_recommendation(
     }
 
 
-def _find_pending_pilot(db: Session) -> Recommendation | None:
-    open_recs = (
-        db.query(Recommendation)
-        .filter(Recommendation.status.in_(["pending", "blocked"]))
-        .order_by(desc(Recommendation.created_at))
-        .all()
-    )
-    for rec in open_recs:
-        meta = rec.metadata_json or {}
-        if isinstance(meta, dict) and meta.get("execution_pilot") is True:
-            return rec
-    return None
 
 
-def _supersede_other_open_recommendations(db: Session, pilot_id: int) -> list[int]:
-    """Mark other open recommendations superseded, keeping full history.
-
-    Nothing is deleted: the previous recommendation keeps its row, status and
-    metadata, and records which pilot superseded it.
-    """
-    superseded = []
-    now = datetime.now(timezone.utc)
-    others = (
-        db.query(Recommendation)
-        .filter(
-            Recommendation.id != pilot_id,
-            Recommendation.status.in_(["pending", "blocked"]),
-            Recommendation.superseded_at.is_(None),
-        )
-        .all()
-    )
-    for rec in others:
-        rec.superseded_at = now
-        meta = dict(rec.metadata_json or {})
-        meta["superseded_by_execution_pilot"] = pilot_id
-        meta["superseded_at"] = now.isoformat()
-        rec.metadata_json = meta
-        superseded.append(rec.id)
-    return superseded
+# _supersede_other_open_recommendations was REMOVED: it flipped
+# superseded_at/metadata but left the previous recommendation `pending`,
+# which could leave two open recommendations at once. The central gate now
+# blocks pilot creation instead of superseding anything.
