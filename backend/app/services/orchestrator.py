@@ -15,6 +15,7 @@ from app.news.ingestion import (
     get_engine_eligible_news,
     get_llm_eligible_clusters,
     get_llm_eligible_news,
+    get_pending_recalc_events,
     run_ingestion,
 )
 from app.recommendations.scoring import build_shortlist, curate_llm_input, refine_with_fresh_quotes, score_and_classify_news
@@ -24,6 +25,11 @@ from app.recommendations.engine import generate_recommendation
 from app.recommendations.unchanged import detect_unchanged
 from app.recommendations.universe import build_allowed_assets
 from app.rules.engine import enforce_rules
+from app.services.analysis_gate import (
+    acquire_analysis_lease,
+    check_recommendation_creation_allowed,
+    release_analysis_lease,
+)
 from app.services.logs import app_log
 from app.services.planner import generate_reallocation_plan
 
@@ -283,12 +289,25 @@ def get_current_recommendation(db: Session) -> Recommendation | None:
 
 
 def _supersede_open_recommendations(db: Session, new_id: int) -> None:
-    open_recs = db.query(Recommendation).filter(Recommendation.status.in_(["pending", "blocked"])).all()
-    for rec in open_recs:
-        if rec.id != new_id:
-            rec.status = "superseded"
-            rec.replaced_by_id = new_id
-            rec.superseded_at = datetime.utcnow()
+    """REMOVED from every ordinary flow (semi-automatic mode V1).
+
+    Automatic supersession is what allowed a scheduler cycle to silently
+    replace an open recommendation — including a pending pilot — while a
+    human decision was still outstanding. In V1 at most ONE open
+    recommendation may exist, enforced by
+    app.services.analysis_gate.check_recommendation_creation_allowed, so
+    nothing needs to be superseded: creation is blocked instead.
+
+    The function is kept as an explicit no-op tripwire: if any ordinary flow
+    ever calls it again, it fails loudly instead of quietly rewriting an open
+    recommendation. The only legitimate supersession left is the audited,
+    explicit one in app.services.execution_pilot.
+    """
+    raise RuntimeError(
+        "Automatic supersession is disabled in semi-automatic mode V1. "
+        "An open recommendation must be decided by a human; new ones are "
+        "blocked by the analysis gate instead of replacing it."
+    )
 
 
 def _load_news_items(
@@ -857,8 +876,57 @@ def ensure_review_queue(decision_summary: dict) -> dict:
 
 
 def run_cycle(db: Session, source: str = "manual") -> dict:
+    """Analysis cycle. NEVER approves and NEVER executes.
+
+    Semi-automatic mode V1: a new Recommendation may only be persisted when
+    the analysis gate allows it AND this process holds the persistent lease.
+    While a human decision or an execution is outstanding the cycle returns a
+    stable skip payload and touches nothing — in particular it does not
+    refresh the snapshot, because doing so would invalidate the signed
+    preview of the open recommendation.
+
+    Events already ingested are NOT consumed by a skipped cycle: they stay
+    pending and are picked up once the block is released.
+    """
     settings = get_settings()
 
+    # --- Creation gate (cheap, before any broker/LLM work) ---
+    gate = check_recommendation_creation_allowed(db)
+    if not gate.allowed:
+        deferred = len(get_pending_recalc_events(db))
+        app_log(db, "Ciclo de análisis omitido: decisión humana pendiente", context={
+            "source": source,
+            "code": gate.code,
+            "blocking_recommendation_id": gate.blocking_recommendation_id,
+            "blocking_execution_id": gate.blocking_execution_id,
+            "deferred_events_count": deferred,
+        })
+        db.commit()
+        return gate.as_skip(source, deferred_events_count=deferred, snapshot_id=None)
+
+    # --- Persistent lease: only one process may create a recommendation ---
+    lease_owner, lease_error = acquire_analysis_lease(db)
+    if lease_owner is None:
+        deferred = len(get_pending_recalc_events(db))
+        return {
+            "skipped": True,
+            "status": "skipped",
+            "code": lease_error,
+            "source": source,
+            "blocking_recommendation_id": None,
+            "blocking_execution_id": None,
+            "deferred_events_count": deferred,
+            "snapshot_id": None,
+            "message": "Otro ciclo de análisis está en curso.",
+        }
+
+    try:
+        return _run_cycle_locked(db, source, settings)
+    finally:
+        release_analysis_lease(db, lease_owner)
+
+
+def _run_cycle_locked(db: Session, source: str, settings) -> dict:
     latest = db.query(Recommendation).order_by(desc(Recommendation.created_at)).first()
     if latest:
         cooldown_until = latest.created_at + timedelta(seconds=settings.trigger_cooldown_seconds)
@@ -1299,7 +1367,8 @@ def run_cycle(db: Session, source: str = "manual") -> dict:
     for item in rec["actions"]:
         db.add(RecommendationAction(recommendation_id=rec_model.id, **item))
 
-    _supersede_open_recommendations(db, rec_model.id)
+    # No supersession: the analysis gate guarantees there was no other open
+    # recommendation when this one was created.
     db.commit()
     app_log(
         db,

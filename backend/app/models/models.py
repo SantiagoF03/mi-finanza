@@ -306,3 +306,30 @@ class UserSettings(Base):
     key: Mapped[str] = mapped_column(String(100), unique=True, index=True)
     value: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Analysis lease — cross-process mutual exclusion for the analysis cycle
+# ---------------------------------------------------------------------------
+
+
+class AnalysisLease(Base):
+    """Single-row persistent lease guarding recommendation creation.
+
+    APScheduler's max_instances=1 only prevents overlap inside ONE process;
+    it does nothing against two replicas or overlapping deploys. This row
+    lives in the same database as every other write, so a conditional UPDATE
+    on it is atomic across processes.
+
+    owner_id is an anonymized, non-sensitive token (never a hostname or a
+    secret).
+    """
+
+    __tablename__ = "analysis_leases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    owner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    acquired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
