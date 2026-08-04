@@ -142,9 +142,12 @@ def get_scheduler_state() -> dict:
                 "next_run_time": next_run.isoformat() if next_run else None,
             })
 
+    from app.market.calendar import resolve_market_schedule
+
     tz_name = settings.scheduler_timezone
-    open_h = settings.scheduler_market_open_hour
-    close_h = settings.scheduler_market_close_hour
+    schedule = resolve_market_schedule(settings)
+    open_label = schedule["open_time"].strftime("%H:%M") if schedule["open_time"] else None
+    close_label = schedule["close_time"].strftime("%H:%M") if schedule["close_time"] else None
 
     lease = {"lease_held": None, "lease_owner": None, "lease_expires_at": None}
     try:
@@ -163,23 +166,49 @@ def get_scheduler_state() -> dict:
         "phase": _market_phase(),
         "timezone": tz_name,
         "scheduler_now": scheduler_now().isoformat(),
-        # Configured vs interpreted: the hours are plain integers; the
-        # timezone is what turns them into real instants.
-        "configured_open_time": f"{open_h:02d}:00",
-        "configured_close_time": f"{close_h:02d}:00",
-        "interpreted_open_time": f"{open_h:02d}:00 {tz_name}",
-        "interpreted_close_time": f"{close_h:02d}:00 {tz_name}",
+        # Configured vs interpreted: the times carry minutes; the timezone is
+        # what turns them into real instants.
+        "configured_open_time": open_label,
+        "configured_close_time": close_label,
+        "interpreted_open_time": f"{open_label} {tz_name}" if open_label else None,
+        "interpreted_close_time": f"{close_label} {tz_name}" if close_label else None,
+        "schedule_source": {
+            "open": schedule["open_source"],
+            "close": schedule["close_source"],
+        },
+        "deprecated_schedule_settings_in_use": schedule["deprecated_settings_in_use"],
+        "market_schedule_configured": schedule["configured"],
+        "market_holidays_configured": len(schedule["holidays"]),
         **lease,
         "jobs": next_jobs,
     }
 
 
+def _session_minutes(settings) -> tuple[int, int] | None:
+    """Configured open/close as minutes past midnight, or None if unusable.
+
+    Resolved through app.market.calendar so HH:MM settings (10:30) win over
+    the deprecated whole-hour ones, and an inconsistent schedule fails
+    closed instead of being guessed at.
+    """
+    from app.market.calendar import resolve_market_schedule
+
+    schedule = resolve_market_schedule(settings)
+    if schedule["errors"] or not schedule["open_time"] or not schedule["close_time"]:
+        return None
+    return (
+        schedule["open_time"].hour * 60 + schedule["open_time"].minute,
+        schedule["close_time"].hour * 60 + schedule["close_time"].minute,
+    )
+
+
 def _market_phase(now_utc: datetime | None = None) -> str:
     """Current market phase in the CONFIGURED timezone.
 
-    Hours are interpreted in SCHEDULER_TIMEZONE (default UTC, which preserves
-    the previous behavior exactly). An explicitly passed datetime is converted
-    into that zone, so the result never depends on the host TZ.
+    Times are interpreted in SCHEDULER_TIMEZONE and now carry MINUTES, so a
+    10:30 open is represented exactly instead of being rounded to 10:00 or
+    11:00. An explicitly passed datetime is converted into that zone, so the
+    result never depends on the host TZ.
     """
     settings = get_settings()
     tz = scheduler_timezone()
@@ -189,21 +218,24 @@ def _market_phase(now_utc: datetime | None = None) -> str:
         if now_utc.tzinfo is None:
             now_utc = now_utc.replace(tzinfo=timezone.utc)
         now = now_utc.astimezone(tz)
-    hour = now.hour
     weekday = now.weekday()
 
     if weekday >= 5:
         return "off"
 
-    open_h = settings.scheduler_market_open_hour
-    close_h = settings.scheduler_market_close_hour
-    premarket_start = open_h - 2
+    session = _session_minutes(settings)
+    if session is None:
+        # Unknown schedule: never claim the market is open.
+        return "off"
+    open_m, close_m = session
+    current = now.hour * 60 + now.minute
+    premarket_start = open_m - 120
 
-    if premarket_start <= hour < open_h:
+    if premarket_start <= current < open_m:
         return "premarket"
-    if open_h <= hour < close_h:
+    if open_m <= current < close_m:
         return "open"
-    if close_h <= hour < close_h + 2:
+    if close_m <= current < close_m + 120:
         return "postmarket"
     return "off"
 
@@ -341,14 +373,28 @@ def start_scheduler() -> None:
     # Explicit timezone: APScheduler would otherwise fall back to the host TZ.
     scheduler.configure(timezone=scheduler_timezone())
 
-    open_h = settings.scheduler_market_open_hour
-    close_h = settings.scheduler_market_close_hour
+    from app.market.calendar import premarket_times
 
-    # Pre-market ingestion runs
-    for mins_before in settings.scheduler_premarket_minutes:
-        total_mins = open_h * 60 - mins_before
-        pre_hour = total_mins // 60
-        pre_minute = total_mins % 60
+    session = _session_minutes(settings)
+    if session is None:
+        # An unresolvable schedule schedules NOTHING. Registering jobs against
+        # a guessed session would ingest at the wrong times and, worse, make
+        # /scheduler/status look healthy while it is misconfigured.
+        logger.error(
+            "Scheduler not started: market schedule is unresolvable. Set "
+            "SCHEDULER_MARKET_OPEN_TIME / SCHEDULER_MARKET_CLOSE_TIME (HH:MM)."
+        )
+        return
+    open_m, close_m = session
+    open_h, open_min = divmod(open_m, 60)
+    close_h, close_min = divmod(close_m, 60)
+
+    # Pre-market ingestion, relative to the real open (e.g. 60 min before
+    # 10:30 → 09:30, 15 min before → 10:15).
+    for (pre_hour, pre_minute), mins_before in zip(
+        premarket_times(settings, settings.scheduler_premarket_minutes),
+        settings.scheduler_premarket_minutes,
+    ):
         scheduler.add_job(
             scheduled_ingestion,
             "cron",
@@ -360,25 +406,44 @@ def start_scheduler() -> None:
             misfire_grace_time=120,
         )
 
-    # During market hours: ingestion every N minutes
+    # During the session: ingestion every N minutes, from the open minute.
+    # The offset makes the slots land ON the session grid (10:30, 11:00, …)
+    # instead of the wall-clock hour grid, and the last slot stays strictly
+    # before the close.
     interval = settings.scheduler_open_interval_minutes
+    offset = open_min % interval if interval > 0 else 0
+    minute_expr = f"{offset}-59/{interval}" if offset else f"*/{interval}"
     scheduler.add_job(
         scheduled_ingestion,
         "cron",
-        hour=f"{open_h}-{close_h - 1}",
-        minute=f"*/{interval}",
+        hour=f"{open_h}-{close_h}" if close_min else f"{open_h}-{max(close_h - 1, open_h)}",
+        minute=minute_expr,
         day_of_week="mon-fri",
         id="market_hours_ingestion",
         replace_existing=True,
         misfire_grace_time=120,
     )
 
-    # Post-market: full cycle at close
+    # Last in-session check, shortly BEFORE the close (never after it).
+    last_check = max(close_m - 5, open_m)
+    scheduler.add_job(
+        scheduled_ingestion,
+        "cron",
+        hour=last_check // 60,
+        minute=last_check % 60,
+        day_of_week="mon-fri",
+        id="pre_close_check",
+        replace_existing=True,
+        misfire_grace_time=120,
+    )
+
+    # Post-market: full cycle just after the close.
+    post_close = min(close_m + 5, 23 * 60 + 59)
     scheduler.add_job(
         scheduled_full_cycle,
         "cron",
-        hour=close_h,
-        minute=5,
+        hour=post_close // 60,
+        minute=post_close % 60,
         day_of_week="mon-fri",
         id="postmarket_close",
         replace_existing=True,
@@ -386,12 +451,12 @@ def start_scheduler() -> None:
     )
 
     # Post-market: light ingestion 1h after close
-    post_h = close_h + 1 if close_h < 23 else 23
+    post_light = min(close_m + 60, 23 * 60 + 59)
     scheduler.add_job(
         scheduled_ingestion,
         "cron",
-        hour=post_h,
-        minute=0,
+        hour=post_light // 60,
+        minute=post_light % 60,
         day_of_week="mon-fri",
         id="postmarket_light",
         replace_existing=True,

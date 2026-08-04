@@ -258,19 +258,54 @@ def test_live_check_false_returns_423_before_any_db_write(db):
     dict(broker_mode="real", iol_use_sandbox=False, order_execution_enabled=True,
          iol_real_username="u", iol_real_password="p"),
 ])
-def test_sell_only_false_blocks_sandbox_and_real(db, env_extra):
+def test_sell_only_false_without_new_flag_blocks_sandbox_and_real(db, env_extra):
+    """EXECUTION_SELL_ONLY=false no longer *enables* anything.
+
+    It used to be a hard invariant (`sell_only_mode_required`). It is now a
+    deprecated compatibility switch: while true it keeps authorising the
+    legacy sell path, and turning it off simply removes that bridge. With the
+    bridge gone and SECURITIES_SELL_ENABLED still false, no capability is
+    enabled at all — which is the fail-closed outcome.
+    """
     _make_snapshot(db)
     rec = _make_recommendation(db)
     db.commit()
-    with exec_settings(**_sandbox_settings(execution_sell_only=False, **env_extra)):
+    with exec_settings(**_sandbox_settings(
+        execution_sell_only=False, securities_sell_enabled=False, **env_extra
+    )):
         preview = build_execution_preview(db, rec.id)
         readiness = get_execution_readiness()
         result = _approve(db, rec, preview, _broker())
-    assert "sell_only_mode_required" in preview["blocking_reasons"]
+    assert "no_execution_capability_enabled" in preview["blocking_reasons"]
     assert preview["can_submit_approval"] is False
-    assert "sell_only_mode_required" in readiness["blocking_reasons"]
+    assert "no_execution_capability_enabled" in readiness["blocking_reasons"]
+    assert readiness["securities_sell_enabled"] is False
+    assert readiness["securities_buy_enabled"] is False
     assert result["status_code"] == 423
     assert db.query(OrderExecution).count() == 0
+
+
+@pytest.mark.parametrize("env_extra", [
+    dict(broker_mode="sandbox"),
+    dict(broker_mode="real", iol_use_sandbox=False, order_execution_enabled=True,
+         iol_real_username="u", iol_real_password="p"),
+])
+def test_sell_only_false_with_new_flag_is_the_supported_migration(db, env_extra):
+    """The documented migration path: drop EXECUTION_SELL_ONLY, set
+    SECURITIES_SELL_ENABLED. Sells stay authorised, buys stay blocked."""
+    _make_snapshot(db)
+    rec = _make_recommendation(db)
+    db.commit()
+    with exec_settings(**_sandbox_settings(
+        execution_sell_only=False, securities_sell_enabled=True, **env_extra
+    )):
+        preview = build_execution_preview(db, rec.id)
+        readiness = get_execution_readiness()
+    assert "no_execution_capability_enabled" not in preview["blocking_reasons"]
+    assert "sell_execution_disabled" not in preview["blocking_reasons"]
+    assert readiness["securities_sell_enabled"] is True
+    assert readiness["securities_buy_enabled"] is False
+    assert readiness["legacy_sell_only_bridge_active"] is False
 
 
 def test_buy_remains_blocked_even_with_sell_only_true(db):
@@ -301,7 +336,10 @@ def test_readiness_exposes_v1_invariants():
     with exec_settings(**_sandbox_settings()):
         readiness = get_execution_readiness()
     assert readiness["live_position_check_required"] is True
+    # Deprecated invariant: still reported for compatibility, but it is the
+    # per-capability flags that decide now.
     assert readiness["sell_only_mode_required"] is True
+    assert readiness["legacy_sell_only_bridge_active"] is True
     assert readiness["batch_preflight_enabled"] is True
     assert readiness["fresh_limit_revalidation_enabled"] is True
 

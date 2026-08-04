@@ -512,6 +512,11 @@ def test_identity_and_scope_are_in_the_preview_and_signed(db):
         assert order["execution_scope"] == {
             "sell_only": True, "quantity_step": 1.0, "price_tick": 0.01,
             "max_quantity": 100.0, "max_notional": 1_000_000.0,
+            # Which rule set authorised the order — a reviewer must be able to
+            # tell the legacy per-symbol policy from the class policy.
+            "policy_source": "legacy_instrument_policy",
+            "execution_family": "securities",
+            "legacy_sell_bridge": True,
         }
         # Changing ONLY the policy invalidates the hash
         with exec_settings(execution_instrument_policies={"AAPL": {**VALID_POLICY, "max_quantity": 99}}):

@@ -242,9 +242,19 @@ def test_no_place_order_or_submit_from_reconciliation(db):
 
     # And no retry/resubmit action exists at all
     from app.services.execution import _RECONCILIATION_ACTIONS
+    # Every action is a record of a HUMAN decision about what already
+    # happened. confirm_cancelled records that the operator cancelled the
+    # order in IOL's own panel — the app has no verified cancellation
+    # contract, so it can only record, never cancel.
     assert set(_RECONCILIATION_ACTIONS) == {
         "confirm_not_sent", "confirm_sent", "confirm_rejected", "confirm_executed",
+        "confirm_cancelled",
     }
+    # The real invariant: no action may resume, retry or resend anything.
+    for action, spec in _RECONCILIATION_ACTIONS.items():
+        assert action.startswith("confirm_"), f"{action} is not a confirmation"
+        assert not any(token in action for token in ("retry", "resubmit", "resume", "send"))
+        assert spec["target_status"] not in {"execution_requested", "execution_ready", "pending"}
     assert "retry" not in _RECONCILIATION_ACTIONS
     assert "resubmit" not in _RECONCILIATION_ACTIONS
 

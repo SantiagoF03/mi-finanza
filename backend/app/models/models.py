@@ -295,6 +295,88 @@ class InstrumentCatalog(Base):
 
 
 # ---------------------------------------------------------------------------
+# Execution Instrument Catalog — execution-grade instrument identity.
+#
+# Deliberately SEPARATE from InstrumentCatalog: that one is a market-data /
+# discovery universe (what may be analysed), this one is the authority on
+# what may be *traded* and with which exact identity. An analysis universe
+# must never be able to authorise an order by itself.
+# ---------------------------------------------------------------------------
+
+
+class ExecutionInstrument(Base):
+    """One tradeable instrument, verified and auditable.
+
+    An entry is only usable while it is complete, active and fresh
+    (verified_at within the class catalog_max_age). Anything else fails
+    closed with a stable blocking code — there is no wildcard.
+    """
+
+    __tablename__ = "execution_instruments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Identity as the BROKER knows it — this is what travels in the order.
+    broker_symbol: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    # Identity as the USER sees it (may differ, e.g. display suffixes).
+    display_symbol: Mapped[str] = mapped_column(String(30), default="")
+    description: Mapped[str] = mapped_column(String(200), default="")
+    country: Mapped[str] = mapped_column(String(30), default="argentina")
+    market: Mapped[str] = mapped_column(String(30), default="")
+    settlement: Mapped[str] = mapped_column(String(10), default="")
+    asset_type: Mapped[str] = mapped_column(String(30), default="")
+    instrument_type: Mapped[str] = mapped_column(String(30), default="")
+    # "securities" | "fund" — decides WHICH execution contract applies.
+    execution_family: Mapped[str] = mapped_column(String(20), default="")
+    # Logical class used to resolve the policy: ACCIONES | CEDEARS | FCI.
+    execution_class: Mapped[str] = mapped_column(String(20), default="", index=True)
+    currency: Mapped[str] = mapped_column(String(10), default="")
+    quantity_step: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price_tick: Mapped[float | None] = mapped_column(Float, nullable=True)
+    minimum_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    buy_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    sell_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    quote_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    cancellation_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Fund-only metadata (NULL for securities). Present so an FCI entry is
+    # never squeezed into the securities contract.
+    fund_minimum_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fund_cutoff_local_time: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    settlement_delay_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Provenance & freshness.
+    source: Mapped[str] = mapped_column(String(50), default="")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    stale_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Hash of the raw identity fields the entry was built from. A change in
+    # the broker's identity for this symbol changes the hash, which makes the
+    # entry unverified again instead of silently drifting.
+    raw_identity_hash: Mapped[str] = mapped_column(String(64), default="")
+    raw_identity: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ExecutionDailyNotional(Base):
+    """Per-day, per-class submitted notional — backs max_daily_notional.
+
+    Incremented ONLY at the moment an order is committed as 'submitting'
+    (the point of no return), so a blocked or cancelled preflight never
+    consumes daily budget.
+    """
+
+    __tablename__ = "execution_daily_notional"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Local (America/Argentina/Buenos_Aires) operating day, YYYY-MM-DD.
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    execution_class: Mapped[str] = mapped_column(String(20), index=True)
+    currency: Mapped[str] = mapped_column(String(10), default="")
+    submitted_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    order_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
 # User Settings — persisted settings (P4)
 # ---------------------------------------------------------------------------
 

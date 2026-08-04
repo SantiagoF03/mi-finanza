@@ -79,6 +79,42 @@ class Settings(BaseSettings):
     # Re-verify the live position (read-only) right before submitting.
     execution_require_live_position_check: bool = True
 
+    # --- Capability flags (Securities / FCI) — ALL fail closed ------------
+    # Independent of each other and of the global ORDER_EXECUTION_ENABLED
+    # lock, which still has to be true for anything to reach IOL. Neither the
+    # scheduler nor any public endpoint can flip these: they are process
+    # configuration, read-only at runtime.
+    securities_buy_enabled: bool = False
+    securities_sell_enabled: bool = False
+    # FCI capability flags exist so readiness can report them explicitly.
+    # They can never be sufficient on their own: subscription/redemption also
+    # require a VERIFIED official IOL contract, which this repository does not
+    # have (see app/services/fci.py and docs/IOL_FCI_CAPABILITY.md).
+    fci_subscription_enabled: bool = False
+    fci_redemption_enabled: bool = False
+
+    # Per-class execution policies (ACCIONES | CEDEARS | FCI), loaded from
+    # JSON. Empty = no class may trade. This replaces the need for a full
+    # hand-written policy per symbol.
+    execution_class_policies: dict = Field(default_factory=dict)
+    # Per-symbol overrides. May only TIGHTEN a class policy (lower a limit,
+    # disable a side) unless the explicit administrative escape hatch below
+    # is set.
+    execution_instrument_overrides: dict = Field(default_factory=dict)
+    # Per-symbol numeric identity that cannot be derived from read-only data
+    # (IOL's "alteración mínima" and lot size). Never identity, only numbers.
+    execution_instrument_ticks: dict = Field(default_factory=dict)
+    # Symbols that are never tradeable, whatever the catalog or policy says.
+    execution_denylist: List[str] = Field(default_factory=list)
+    # Explicit administrative opt-in for an override that WIDENS a limit.
+    # Default false: an override can never loosen a global limit by itself.
+    execution_allow_override_limit_increase: bool = False
+
+    # --- Buy-side guards (live cash) --------------------------------------
+    # Consult the live balance immediately before submitting a buy. Like the
+    # position guard for sells, this is not configurable away for sandbox/real.
+    execution_require_live_cash_check: bool = True
+
     # Administrative creation of the BYMA execution-pilot recommendation.
     # Default false. It only allows PREPARING a pilot recommendation and can
     # never send an order: the sole execution path remains
@@ -86,9 +122,15 @@ class Settings(BaseSettings):
     # ORDER_EXECUTION_ENABLED.
     execution_pilot_creation_enabled: bool = False
 
-    @field_validator("execution_instrument_policies", mode="before")
+    @field_validator(
+        "execution_instrument_policies",
+        "execution_class_policies",
+        "execution_instrument_overrides",
+        "execution_instrument_ticks",
+        mode="before",
+    )
     @classmethod
-    def parse_instrument_policies(cls, v):
+    def parse_instrument_policies(cls, v, info):
         if isinstance(v, str):
             raw = v.strip()
             if not raw:
@@ -97,9 +139,9 @@ class Settings(BaseSettings):
             try:
                 parsed = _json.loads(raw)
             except ValueError as exc:
-                raise ValueError(f"EXECUTION_INSTRUMENT_POLICIES must be valid JSON: {exc}") from exc
+                raise ValueError(f"{info.field_name.upper()} must be valid JSON: {exc}") from exc
             if not isinstance(parsed, dict):
-                raise ValueError("EXECUTION_INSTRUMENT_POLICIES must be a JSON object")
+                raise ValueError(f"{info.field_name.upper()} must be a JSON object")
             return parsed
         return v
 
@@ -139,8 +181,21 @@ class Settings(BaseSettings):
     recommendation_unchanged_risk_threshold: float = 0.03
 
     # Scheduler — market-hours aware (Part D)
+    #
+    # PREFERRED: HH:MM times, interpreted in SCHEDULER_TIMEZONE. These are the
+    # only settings that can express the real BYMA open (10:30). When set,
+    # they take precedence over the deprecated whole-hour settings below.
+    scheduler_market_open_time: str = ""   # e.g. "10:30"
+    scheduler_market_close_time: str = ""  # e.g. "17:00"
+    # DEPRECATED (whole hours only — cannot represent 10:30). Kept so an
+    # existing deployment keeps working while it migrates to the HH:MM
+    # settings; they are ignored as soon as the HH:MM ones are present.
     scheduler_market_open_hour: int = 11  # Argentina market open (UTC): 11:00 = 8:00 ART
     scheduler_market_close_hour: int = 20  # Argentina market close (UTC): 20:00 = 17:00 ART
+    # Non-trading days, "YYYY-MM-DD" CSV. An unparseable entry invalidates the
+    # whole calendar (market_schedule_unknown) rather than silently declaring
+    # a closed day open.
+    market_holidays: List[str] = Field(default_factory=list)
     scheduler_premarket_minutes: List[int] = Field(default_factory=lambda: [60, 15])
     scheduler_open_interval_minutes: int = 30
     scheduler_postmarket_runs: int = 2
@@ -215,12 +270,36 @@ class Settings(BaseSettings):
         default_factory=list
     )
 
-    @field_validator("whitelist_assets", "news_rss_urls", "watchlist_assets", "market_universe_assets", "scheduler_premarket_minutes", mode="before")
+    @field_validator(
+        "whitelist_assets",
+        "news_rss_urls",
+        "watchlist_assets",
+        "market_universe_assets",
+        "scheduler_premarket_minutes",
+        "execution_denylist",
+        "market_holidays",
+        mode="before",
+    )
     @classmethod
     def parse_csv_fields(cls, v):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator("scheduler_market_open_time", "scheduler_market_close_time", mode="before")
+    @classmethod
+    def validate_market_times(cls, v, info):
+        """Empty means "not configured" (fall back to the deprecated hour
+        settings). A non-empty value must be a real HH:MM — a typo must fail
+        at startup, never silently shift when orders may be sent."""
+        text = str(v or "").strip()
+        if not text:
+            return ""
+        from app.market.calendar import parse_hhmm
+
+        if parse_hhmm(text) is None:
+            raise ValueError(f"{info.field_name} must be HH:MM between 00:00 and 23:59 (got {v!r})")
+        return text
 
     @field_validator(
         "execution_preview_ttl_seconds",

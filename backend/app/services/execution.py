@@ -36,6 +36,14 @@ from sqlalchemy.orm import Session, joinedload
 from app.broker.clients import IolBrokerClient, MockBrokerClient
 from app.broker.numeric import decimal_str, non_negative_decimal, positive_decimal, to_finite_decimal
 from app.core.config import get_settings
+from app.market.calendar import market_session_state
+from app.services.execution_limits import (
+    check_daily_budget,
+    consume_daily_budget,
+    evaluate_buy_cash,
+    pending_buy_notional,
+    trade_date_for,
+)
 from app.models.models import (
     OrderExecution,
     PortfolioPosition,
@@ -103,9 +111,39 @@ def _find_position(snapshot: PortfolioSnapshot, symbol: str) -> PortfolioPositio
     return None
 
 
+def _catalog_reference_price(db: Session | None, symbol: str) -> float | None:
+    """Deterministic price REFERENCE for an instrument we do not hold.
+
+    A buy must never require a prior position just to obtain a price, and it
+    must never invent one from a non-existent avg_price. The discovery
+    catalog's last observed price is a legitimate reference for sizing the
+    plan and for the later deviation check.
+
+    It is a REFERENCE only: the price actually sent is always the fresh best
+    ask resolved at preflight time. A catalog price is never sent to IOL.
+    """
+    if db is None or not symbol:
+        return None
+    from app.models.models import InstrumentCatalog
+
+    row = (
+        db.query(InstrumentCatalog.last_price)
+        .filter(
+            InstrumentCatalog.symbol == str(symbol).strip().upper(),
+            InstrumentCatalog.is_active == True,  # noqa: E712
+        )
+        .first()
+    )
+    if not row:
+        return None
+    price = positive_decimal(row[0])
+    return float(price) if price is not None else None
+
+
 def _plan_order(
     action: RecommendationAction,
     snapshot: PortfolioSnapshot,
+    db: Session | None = None,
 ) -> dict:
     """Plan a safe order from a recommendation action using real portfolio data.
 
@@ -222,12 +260,26 @@ def _plan_order(
             "snapshot_price_ref": None,
         }
 
-    # Need a price — from position or fail
+    # Price REFERENCE for sizing. A buy must work for an instrument we do not
+    # hold yet, so the absence of a position can never be the blocker:
+    #   1. the live position's own derived price, when we do hold it;
+    #   2. the discovery catalog's last observed price;
+    #   3. avg_price, only when it actually exists.
+    # None of these is ever sent to IOL — the submitted limit price is always
+    # the fresh best ask resolved at preflight.
     price_per_unit = None
+    price_ref_source = None
     if position and position.quantity and position.quantity > 0 and position.market_value:
         price_per_unit = position.market_value / position.quantity
-    elif position and position.avg_price and position.avg_price > 0:
+        price_ref_source = "live_position"
+    if not price_per_unit or price_per_unit <= 0:
+        catalog_price = _catalog_reference_price(db, symbol)
+        if catalog_price:
+            price_per_unit = catalog_price
+            price_ref_source = "instrument_catalog"
+    if (not price_per_unit or price_per_unit <= 0) and position and position.avg_price and position.avg_price > 0:
         price_per_unit = position.avg_price
+        price_ref_source = "avg_price"
 
     if not price_per_unit or price_per_unit <= 0:
         return {
@@ -236,12 +288,18 @@ def _plan_order(
             "quantity_planned": 0,
             "portfolio_value_used": portfolio_value,
             "position_value_used": position.market_value if position else 0,
-            "blocked_reason": f"No price reference for {symbol}. Cannot calculate buy quantity.",
+            "blocked_reason": (
+                f"No price reference for {symbol} (no live position and no active "
+                "catalog price). Cannot size the buy."
+            ),
             "snapshot_price_ref": None,
+            "price_ref_source": None,
         }
 
-    # Don't buy more than available cash
-    buy_value = min(target_value, cash)
+    # Snapshot cash is used ONLY as a conservative upper bound on the size —
+    # it can shrink the order, never authorise it. The authoritative check is
+    # the live balance read immediately before submitting.
+    buy_value = min(target_value, cash) if cash and cash > 0 else target_value
     quantity_planned = math.floor(buy_value / price_per_unit)
 
     if quantity_planned <= 0:
@@ -253,6 +311,7 @@ def _plan_order(
             "position_value_used": position.market_value if position else 0,
             "blocked_reason": f"Buy quantity for {symbol} rounds to 0 (buy_value={buy_value:.2f}, price={price_per_unit:.2f}, cash={cash:.2f}).",
             "snapshot_price_ref": price_per_unit,
+            "price_ref_source": price_ref_source,
         }
 
     return {
@@ -263,6 +322,7 @@ def _plan_order(
         "position_value_used": position.market_value if position else 0,
         "blocked_reason": "",
         "snapshot_price_ref": price_per_unit,
+        "price_ref_source": price_ref_source,
     }
 
 
@@ -298,6 +358,7 @@ def _build_order_previews(
     actions: list,
     snapshot: PortfolioSnapshot,
     rec: Recommendation | None = None,
+    db: Session | None = None,
 ) -> list[dict]:
     """Deterministic order plans with notional and portfolio percentage.
 
@@ -312,7 +373,7 @@ def _build_order_previews(
     pilot = is_execution_pilot(rec)
     orders = []
     for action in actions:
-        plan = _plan_order(action, snapshot)
+        plan = _plan_order(action, snapshot, db)
         valid = plan["valid"]
         blocked_reason = plan["blocked_reason"]
         price = plan["snapshot_price_ref"]
@@ -377,6 +438,7 @@ def _build_order_previews(
             "quantity_planned": qty,
             "quantity_override": int(override) if override is not None else None,
             "snapshot_price_ref": price,
+            "price_ref_source": plan.get("price_ref_source"),
             "estimated_notional": estimated_notional,
             "portfolio_value_used": plan["portfolio_value_used"],
             "position_value_used": plan["position_value_used"],
@@ -523,24 +585,34 @@ def _execution_locked(settings) -> bool:
     return not settings.order_execution_enabled
 
 
-def _apply_execution_scope(orders: list[dict], snapshot, settings) -> list[str]:
+def _apply_execution_scope(orders: list[dict], snapshot, settings, db: Session | None = None) -> list[str]:
     """Attach instrument identity + scope to each order and collect blocking
-    codes. Mock effective environment is exempt (never reaches IOL)."""
-    from app.broker.instrument_scope import evaluate_order_scope, load_instrument_policies
+    codes. Mock effective environment is exempt (never reaches IOL).
+
+    Authorization is resolved by app.broker.execution_scope, which layers the
+    denylist, the capability flags, the execution catalog and the per-class
+    policy over the legacy per-symbol allowlist.
+    """
+    from app.broker.execution_scope import (
+        evaluate_order_authorization,
+        load_authorization_context,
+    )
 
     if _effective_environment(settings) == "mock":
         return []
 
-    policies, policy_errors = load_instrument_policies(settings)
-    codes: list[str] = list(policy_errors)
+    context = load_authorization_context(settings)
+    codes: list[str] = list(context["errors"])
 
     for order in orders:
         position = _find_position(snapshot, order["symbol"]) if snapshot else None
-        scope_info, order_codes = evaluate_order_scope(
-            order=order, position=position, policies=policies, settings=settings
+        scope_info, order_codes = evaluate_order_authorization(
+            db, order=order, position=position, settings=settings, context=context
         )
         order["instrument_identity"] = scope_info["instrument_identity"]
         order["execution_scope"] = scope_info["execution_scope"]
+        if scope_info.get("catalog"):
+            order["catalog"] = scope_info["catalog"]
         if order_codes:
             # A scoped-out order can never be part of an approvable plan.
             order["valid"] = False
@@ -569,21 +641,42 @@ def _execution_venue(settings) -> dict:
     }
 
 
-def _preflight_policy_reasons(settings) -> list[str]:
-    """V1 non-negotiable execution policy for sandbox/real.
+def _preflight_policy_reasons(settings, orders: list[dict] | None = None) -> list[str]:
+    """Non-negotiable execution policy for sandbox/real.
 
-    - the live position guard can NOT be disabled;
-    - the phase is strictly sell-only (there is no cash/balance guard for
-      buys yet, so buys stay out of scope entirely).
+    - the live POSITION guard can NOT be disabled (sells);
+    - the live CASH guard can NOT be disabled (buys);
+    - at least one capability must be enabled, otherwise nothing is
+      executable and saying so early is clearer than a per-order verdict.
+
+    EXECUTION_SELL_ONLY is no longer a hard requirement: it is now a
+    deprecated compatibility switch that, while true, keeps forcing buys off
+    (see app.broker.execution_scope.securities_buy_enabled). Turning it off
+    does not by itself enable anything — SECURITIES_BUY_ENABLED still has to
+    be set deliberately.
+
     Mock effective environment is exempt (never reaches IOL).
     """
     if _effective_environment(settings) == "mock":
         return []
+    from app.broker.execution_scope import securities_buy_enabled, sell_capability_enabled
+
     reasons = []
     if not settings.execution_require_live_position_check:
         reasons.append("live_position_verification_required")
-    if not settings.execution_sell_only:
-        reasons.append("sell_only_mode_required")
+    if not getattr(settings, "execution_require_live_cash_check", True):
+        reasons.append("live_cash_verification_required")
+
+    buy_ok = securities_buy_enabled(settings)
+    sell_ok = sell_capability_enabled(settings)
+    if not buy_ok and not sell_ok:
+        reasons.append("no_execution_capability_enabled")
+    elif orders:
+        sides = {o.get("side") for o in orders}
+        if "buy" in sides and not buy_ok:
+            reasons.append("buy_execution_disabled")
+        if "sell" in sides and not sell_ok:
+            reasons.append("sell_execution_disabled")
     return reasons
 
 
@@ -623,13 +716,29 @@ def _venue_blocking_reasons(settings) -> list[str]:
     return reasons
 
 
-def get_execution_readiness() -> dict:
+def get_execution_readiness(db: Session | None = None) -> dict:
     """Read-only, non-sensitive execution readiness report.
 
     Never returns credentials, tokens, secrets or full URLs with auth info —
     only booleans, stable blocking codes and the API host name.
+
+    `db` is optional so the report still works without a session; catalog
+    coverage is then reported as unavailable rather than silently empty.
     """
     from app.broker.environment import api_host_of, resolve_execution_environment
+    from app.broker.execution_class import (
+        KNOWN_EXECUTION_CLASSES,
+        load_class_policies,
+        load_denylist,
+        load_instrument_overrides,
+    )
+    from app.broker.execution_scope import (
+        legacy_sell_bridge_active,
+        securities_buy_enabled,
+        securities_sell_enabled,
+        sell_capability_enabled,
+    )
+    from app.services.fci import get_fci_capability
 
     settings = get_settings()
     env = resolve_execution_environment(settings)
@@ -649,12 +758,29 @@ def get_execution_readiness() -> dict:
     blocking.extend(venue_reasons)
 
     policies, policy_errors = load_instrument_policies(settings)
+    class_policies, class_errors = load_class_policies(settings)
+    overrides, override_errors = load_instrument_overrides(settings)
+    denylist = load_denylist(settings)
+
     if env["environment"] != "mock":
-        if not policies:
+        if not policies and not class_policies:
             blocking.append("execution_scope_not_configured")
-        for code in policy_errors:
+        for code in list(policy_errors) + list(class_errors) + list(override_errors):
             if code not in blocking:
                 blocking.append(code)
+
+    session_state = market_session_state(settings)
+    if env["environment"] != "mock" and session_state["code"]:
+        blocking.append(session_state["code"])
+
+    catalog_report = _catalog_readiness(db, settings, class_policies)
+    for code in catalog_report["blocking_reasons"]:
+        if code not in blocking:
+            blocking.append(code)
+
+    buy_enabled = securities_buy_enabled(settings)
+    sell_enabled = sell_capability_enabled(settings)
+    fci = get_fci_capability()
 
     policy_configured = bool(settings.iol_order_market and settings.iol_order_settlement) and not any(
         r in venue_reasons
@@ -690,12 +816,172 @@ def get_execution_readiness() -> dict:
         "sell_only_mode_required": True,
         "batch_preflight_enabled": True,
         "fresh_limit_revalidation_enabled": True,
-        "execution_scope_configured": bool(policies) and not policy_errors,
+        "execution_scope_configured": (bool(policies) or bool(class_policies))
+        and not (policy_errors or class_errors or override_errors),
         "allowed_symbols": sorted(policies.keys()),
         "instrument_policy_count": len(policies),
+
+        # --- Capabilities, each reported separately ---
+        "securities_buy_enabled": buy_enabled,
+        "securities_sell_enabled": sell_enabled,
+        "securities_sell_flag_enabled": securities_sell_enabled(settings),
+        "legacy_sell_only_bridge_active": legacy_sell_bridge_active(settings),
+        "fci_subscription_enabled": bool(getattr(settings, "fci_subscription_enabled", False)),
+        "fci_redemption_enabled": bool(getattr(settings, "fci_redemption_enabled", False)),
+        "fci_execution_supported": fci["fci_execution_supported"],
+        "fci_capability": fci,
+
+        # --- Environments ---
+        "sandbox_configured": bool(
+            (settings.iol_sandbox_api_base or "").strip()
+            and settings.iol_sandbox_username
+            and settings.iol_sandbox_password
+        ),
+        "real_configured": env["environment"] == "real" and not env["errors"],
+
+        # --- Calendar & live checks ---
+        "market_calendar_configured": not bool(session_state["code"] == "market_schedule_unknown"),
+        "market_session": session_state,
+        "live_cash_check_available": bool(
+            getattr(settings, "execution_require_live_cash_check", True)
+        ),
+        "live_position_check_available": bool(settings.execution_require_live_position_check),
+
+        # --- Catalog & class coverage ---
+        "class_policies_configured": sorted(class_policies.keys()),
+        "class_policy_limits": {
+            name: {
+                "buy_enabled": policy["buy_enabled"],
+                "sell_enabled": policy["sell_enabled"],
+                "currencies": policy["currencies"],
+                "markets": policy["markets"],
+                "settlements": policy["settlements"],
+                "max_order_notional": policy["max_order_notional"],
+                "max_daily_notional": policy["max_daily_notional"],
+                "max_quantity": policy["max_quantity"],
+                "max_portfolio_pct": policy["max_portfolio_pct"],
+                "min_cash_reserve": policy["min_cash_reserve"],
+                "fee_buffer_pct": policy["fee_buffer_pct"],
+                "max_quote_age_seconds": policy["max_quote_age_seconds"],
+                "max_price_deviation_pct": policy["max_price_deviation_pct"],
+                "catalog_max_age_seconds": policy["catalog_max_age_seconds"],
+            }
+            for name, policy in sorted(class_policies.items())
+        },
+        "known_execution_classes": list(KNOWN_EXECUTION_CLASSES),
+        "instrument_overrides": sorted(overrides.keys()),
+        "denylisted_symbols": sorted(denylist),
+        "override_limit_increase_allowed": bool(
+            getattr(settings, "execution_allow_override_limit_increase", False)
+        ),
+        **catalog_report["summary"],
+
+        # --- Global limits ---
+        "global_limits": {
+            "max_order_value": settings.execution_max_order_value,
+            "max_total_value": settings.execution_max_total_value,
+            "max_portfolio_pct": settings.execution_max_portfolio_pct,
+        },
+
         "blocking_reasons": blocking,
         "ready_for_real_execution": env["environment"] == "real" and not blocking,
         "ready_for_sandbox_execution": env["environment"] == "sandbox" and not blocking,
+        # Per-capability readiness. Each requires the shared prerequisites
+        # AND its own flag — no capability can ride on another's readiness.
+        "ready_for_real_securities_buy": (
+            env["environment"] == "real" and not blocking and buy_enabled
+        ),
+        "ready_for_real_securities_sell": (
+            env["environment"] == "real" and not blocking and sell_enabled
+        ),
+        # Always false while the FCI contract is unverified: a flag alone can
+        # never make an unknown contract executable.
+        "ready_for_real_fci_subscription": False,
+        "ready_for_real_fci_redemption": False,
+    }
+
+
+def _catalog_readiness(db: Session | None, settings, class_policies: dict) -> dict:
+    """Catalog coverage for the readiness report. Read-only, no secrets."""
+    from app.broker.execution_scope import load_authorization_context
+    from app.broker.instrument_catalog import catalog_entry_status, list_catalog
+
+    if db is None:
+        return {
+            "blocking_reasons": [],
+            "summary": {
+                "catalog_available": False,
+                "catalog_total": None,
+                "supported_acciones": None,
+                "supported_cedears": None,
+                "supported_fci": None,
+                "portfolio_instruments_covered": None,
+                "blocked_instruments": [],
+            },
+        }
+
+    context = load_authorization_context(settings)
+    entries = list_catalog(db)
+    by_class: dict[str, int] = {}
+    blocked: list[dict] = []
+
+    for entry in entries:
+        policy = class_policies.get(entry.execution_class or "")
+        code, details = catalog_entry_status(
+            entry, max_age_seconds=(policy or {}).get("catalog_max_age_seconds")
+        )
+        reasons = [code] if code else []
+        if entry.broker_symbol in context["denylist"]:
+            reasons.append("instrument_denylisted")
+        if not reasons:
+            by_class[entry.execution_class] = by_class.get(entry.execution_class, 0) + 1
+        else:
+            blocked.append({
+                "symbol": entry.broker_symbol,
+                "execution_class": entry.execution_class or None,
+                "reasons": reasons,
+                "missing_fields": details.get("missing_fields", []),
+            })
+
+    # Portfolio coverage: which held instruments could actually be traded.
+    snapshot = _get_latest_snapshot(db)
+    covered = 0
+    uncovered: list[dict] = []
+    if snapshot:
+        for position in snapshot.positions:
+            order = {"symbol": position.symbol, "side": "sell",
+                     "quantity_planned": 0, "estimated_notional": 0}
+            from app.broker.execution_scope import evaluate_order_authorization
+
+            _, codes = evaluate_order_authorization(
+                db, order=order, position=position, settings=settings, context=context
+            )
+            # Sizing codes are irrelevant for a coverage probe (quantity 0).
+            identity_codes = [
+                c for c in codes
+                if c not in {"quantity_step_mismatch", "minimum_quantity_not_met",
+                             "symbol_quantity_limit_exceeded", "symbol_notional_limit_exceeded",
+                             "sell_execution_disabled", "buy_execution_disabled",
+                             "class_sell_disabled", "class_buy_disabled"}
+            ]
+            if identity_codes:
+                uncovered.append({"symbol": position.symbol, "reasons": identity_codes})
+            else:
+                covered += 1
+
+    return {
+        "blocking_reasons": [],
+        "summary": {
+            "catalog_available": True,
+            "catalog_total": len(entries),
+            "supported_acciones": by_class.get("ACCIONES", 0),
+            "supported_cedears": by_class.get("CEDEARS", 0),
+            "supported_fci": by_class.get("FCI", 0),
+            "portfolio_instruments_total": len(snapshot.positions) if snapshot else 0,
+            "portfolio_instruments_covered": covered,
+            "portfolio_instruments_blocked": uncovered,
+            "blocked_instruments": blocked,
+        },
     }
 
 
@@ -732,7 +1018,7 @@ def build_execution_preview(
     if not snapshot:
         return {"error": "No portfolio snapshot available for preview", "status_code": 400}
 
-    orders_preview = _build_order_previews(actions, snapshot, rec)
+    orders_preview = _build_order_previews(actions, snapshot, rec, db)
 
     gen_dt = generated_at or _utcnow()
     if gen_dt.tzinfo is None:
@@ -747,7 +1033,7 @@ def build_execution_preview(
 
     # Execution scope: attaches instrument identity + per-symbol scope to
     # every order and invalidates any order outside the allowlist.
-    scope_reasons = _apply_execution_scope(orders_preview, snapshot, settings)
+    scope_reasons = _apply_execution_scope(orders_preview, snapshot, settings, db)
 
     # --- Blocking reasons: stable codes the frontend can rely on ---
     blocking_reasons: list[str] = []
@@ -759,7 +1045,13 @@ def build_execution_preview(
         blocking_reasons.append("preview_signing_not_configured")
     blocking_reasons.extend(_evaluate_limit_reasons(orders_preview, snapshot, settings))
     blocking_reasons.extend(_venue_blocking_reasons(settings))
-    blocking_reasons.extend(_preflight_policy_reasons(settings))
+    blocking_reasons.extend(_preflight_policy_reasons(settings, orders_preview))
+    # The securities session must be open. Reported in the preview so the
+    # reviewer sees it before approving, not only at submission time.
+    if _effective_environment(settings) != "mock":
+        session_state = market_session_state(settings)
+        if session_state["code"]:
+            blocking_reasons.append(session_state["code"])
     for code in scope_reasons:
         if code not in blocking_reasons:
             blocking_reasons.append(code)
@@ -811,6 +1103,12 @@ def build_execution_preview(
         "preview_hash": preview_hash,
         "message": "Execution preview only. No order was sent and no state was changed.",
         "actions_count": len(actions),
+        # Snapshot cash, clearly labelled as a REFERENCE. The authoritative
+        # balance is read live at preflight; this is only what the reviewer
+        # saw. Never presented as the amount that will be available.
+        "snapshot_cash_reference": snapshot.cash,
+        "snapshot_currency": snapshot.currency,
+        "market_session": market_session_state(settings),
         "orders_preview": orders_preview,
         "limits": {
             "max_order_value": settings.execution_max_order_value,
@@ -929,8 +1227,16 @@ def _validate_reinforced_authorization(
     # as an invalid order.
     for code in (
         "live_position_verification_required",
+        "live_cash_verification_required",
+        "no_execution_capability_enabled",
         "sell_only_mode_required",
         "execution_scope_not_configured",
+        "class_policy_not_configured",
+        "class_policy_invalid",
+        "class_policy_incomplete",
+        "instrument_override_invalid",
+        "override_increases_limit",
+        "market_schedule_unknown",
         "instrument_policy_invalid",
         "broker_environment_requires_https",
         "broker_environment_url_invalid",
@@ -954,7 +1260,21 @@ def _validate_reinforced_authorization(
     for code in (
         "instrument_policy_missing",
         "symbol_not_allowed",
+        "instrument_denylisted",
+        "instrument_catalog_missing",
+        "instrument_catalog_stale",
+        "instrument_catalog_incomplete",
+        "instrument_inactive",
+        "instrument_class_unsupported",
+        "fci_not_supported_by_iol_api",
+        "market_closed",
         "buy_execution_disabled",
+        "sell_execution_disabled",
+        "class_buy_disabled",
+        "class_sell_disabled",
+        "instrument_buy_unsupported",
+        "instrument_sell_unsupported",
+        "minimum_quantity_not_met",
         "instrument_identity_mismatch",
         "instrument_currency_mismatch",
         "instrument_market_mismatch",
@@ -1341,6 +1661,16 @@ def _quote_age_seconds(retrieved_at_raw, settings) -> tuple[float, str | None]:
     return max(age_seconds, 0.0), None
 
 
+def _policy_number(policy: dict, key: str, fallback):
+    """Per-class parameter with a settings-level fallback.
+
+    Legacy policies predate the per-class parameters, so they fall back to the
+    global settings that already governed them — never to a permissive value.
+    """
+    value = policy.get(key)
+    return fallback if value is None else value
+
+
 def _preflight_one_order(
     order_exec: OrderExecution,
     preview_order: dict,
@@ -1349,6 +1679,13 @@ def _preflight_one_order(
     live_positions: list,
     live_portfolio_value: Decimal,
     policies: dict,
+    *,
+    db: Session | None = None,
+    live_cash_by_currency: dict | None = None,
+    pending_buys: Decimal | None = None,
+    trade_date: str | None = None,
+    daily_reserved: dict | None = None,
+    cash_reserved: dict | None = None,
 ) -> tuple[dict | None, str | None]:
     """Prepare ONE order completely, without sending anything.
 
@@ -1364,14 +1701,34 @@ def _preflight_one_order(
     market = settings.iol_order_market
     settlement = settings.iol_order_settlement
 
-    # 1-2. Live identity + quantity
-    live_check, err = _check_live_position(order_exec, preview_order, live_positions)
-    if err:
-        return None, err
+    policy = policies.get(_normalized(symbol))
+    if policy is None:
+        return None, "instrument_policy_missing"
+
+    execution_class = policy.get("execution_class") or "LEGACY"
+    identity = preview_order.get("instrument_identity") or {}
+    currency = str(identity.get("currency") or "").strip().upper()
+
+    # 1-2. Live identity + quantity. A SELL must be covered by a real
+    # holding; a BUY has no position to verify — requiring one is exactly the
+    # bug that made buying an instrument we do not hold impossible.
+    live_check = None
+    if side == "sell":
+        live_check, err = _check_live_position(order_exec, preview_order, live_positions)
+        if err:
+            return None, err
 
     quantity = positive_decimal(order_exec.quantity_planned)
     if quantity is None:
         return None, "invalid_execution_quantity"
+
+    # Quantity step / minimum, from the verified catalog (or legacy policy).
+    step = positive_decimal(policy.get("quantity_step"))
+    if step is None:
+        return None, "quantity_step_mismatch"
+    ratio = quantity / step
+    if ratio != ratio.to_integral_value():
+        return None, "quantity_step_mismatch"
 
     # 3. Executable quote (bid for sell / ask for buy — never last price)
     try:
@@ -1380,30 +1737,44 @@ def _preflight_one_order(
         return None, "quote_unavailable"
     if not quote or not quote.get("available") or quote.get("source") not in ("bid", "ask"):
         return None, "quote_unavailable"
+    expected_source = "bid" if side == "sell" else "ask"
+    if quote.get("source") != expected_source:
+        # Selling against the ask (or buying against the bid) would cross the
+        # book in the wrong direction.
+        return None, "quote_unavailable"
 
     fresh_price = positive_decimal(quote.get("price"))
     if fresh_price is None:
         # Covers NaN / Infinity / zero / negative / non-numeric prices
         return None, "invalid_execution_price"
 
-    # 4. Quote timestamp + freshness
+    # 4. Quote timestamp + freshness (per-class window)
     age_seconds, ts_error = _quote_age_seconds(quote.get("retrieved_at"), settings)
     if ts_error:
         return None, ts_error
-    if age_seconds > settings.execution_max_quote_age_seconds:
+    max_quote_age = _policy_number(
+        policy, "max_quote_age_seconds", settings.execution_max_quote_age_seconds
+    )
+    if age_seconds > max_quote_age:
         return None, "quote_stale"
 
-    # 5. Deviation vs the SIGNED snapshot reference
+    # 5. Deviation vs the SIGNED reference price (per-class tolerance)
     snapshot_ref = positive_decimal(preview_order.get("snapshot_price_ref"))
     if snapshot_ref is None:
         return None, "invalid_execution_price"
     deviation = abs(fresh_price - snapshot_ref) / snapshot_ref
     deviation_pct = float(deviation.quantize(Decimal("0.000001")))
-    if deviation_pct > settings.execution_max_price_deviation_pct:
+    max_deviation = _policy_number(
+        policy, "max_price_deviation_pct", settings.execution_max_price_deviation_pct
+    )
+    if max_deviation is None or max_deviation <= 0 or deviation_pct > max_deviation:
         return None, "price_deviation_exceeded"
 
     # 6. Deterministic validity (ART, same operating day)
-    validity, validity_err = compute_order_validity(settings.iol_order_validity_minutes)
+    validity_minutes = _policy_number(
+        policy, "validity_minutes", settings.iol_order_validity_minutes
+    )
+    validity, validity_err = compute_order_validity(validity_minutes)
     if validity_err:
         return None, validity_err
 
@@ -1411,14 +1782,11 @@ def _preflight_one_order(
     # The per-symbol price_tick is enforced here: IOL rejects an order whose
     # decimals are not compatible with the minimum tick, so we fail closed
     # instead of sending it (the price is never rounded to fit).
-    policy = policies.get(_normalized(symbol))
-    if policy is None:
-        return None, "instrument_policy_missing"
-
     order_request, build_err = build_iol_order_request(
         side=side, symbol=symbol, quantity=quantity, price=fresh_price,
         market=market, settlement=settlement,
-        order_type=settings.iol_order_type, validity=validity,
+        order_type=_policy_number(policy, "order_type", settings.iol_order_type),
+        validity=validity,
         price_tick=policy["price_tick"],
     )
     if build_err:
@@ -1431,42 +1799,105 @@ def _preflight_one_order(
     fresh_portfolio_pct = (actual_notional / live_portfolio_value).quantize(Decimal("0.000001"))
 
     # 9. Re-validate limits against the FRESH notional
-    if actual_notional > Decimal(str(policy["max_notional"])):
+    symbol_cap = positive_decimal(
+        policy.get("max_order_notional", policy.get("max_notional"))
+    )
+    if symbol_cap is None or actual_notional > symbol_cap:
         return None, "fresh_symbol_notional_limit_exceeded"
     max_order_value = positive_decimal(settings.execution_max_order_value)
     if max_order_value is None or actual_notional > max_order_value:
         return None, "fresh_order_limit_exceeded"
-    max_pct = positive_decimal(settings.execution_max_portfolio_pct)
+    max_pct = positive_decimal(
+        _policy_number(policy, "max_portfolio_pct", settings.execution_max_portfolio_pct)
+    )
     if max_pct is None or fresh_portfolio_pct > max_pct:
         return None, "fresh_portfolio_pct_limit_exceeded"
 
+    # 9b. Daily budget for this execution class, including everything this
+    # batch has already reserved. Only class policies define a daily cap;
+    # legacy policies keep their previous (per-order/per-batch) semantics.
+    daily_audit = None
+    if policy.get("max_daily_notional") is not None and db is not None:
+        reserved = (daily_reserved or {}).get(execution_class, Decimal("0"))
+        daily_error, daily_audit = check_daily_budget(
+            db,
+            trade_date=trade_date or trade_date_for(settings),
+            execution_class=execution_class,
+            additional_notional=actual_notional + reserved,
+            max_daily_notional=policy["max_daily_notional"],
+        )
+        if daily_error:
+            return None, daily_error
+        if daily_reserved is not None:
+            daily_reserved[execution_class] = reserved + actual_notional
+
+    # 9c. BUY ONLY — live balance, in the right currency, with a fee buffer
+    # and a preserved reserve. snapshot.cash is never sufficient here.
+    cash_audit = None
+    if side == "buy":
+        if not currency:
+            return None, "currency_cash_mismatch"
+        live_cash = (live_cash_by_currency or {}).get(currency)
+        # Cumulative within the batch: checking each buy against the FULL
+        # balance would let two orders each pass while together overdrawing
+        # the account. Everything already reserved by earlier orders of this
+        # same batch counts as pending, exactly like an external pending buy.
+        already_reserved = (cash_reserved or {}).get(currency, Decimal("0"))
+        cash_error, cash_audit = evaluate_buy_cash(
+            live_cash=live_cash,
+            required_notional=actual_notional,
+            currency=currency,
+            fee_buffer_pct=_policy_number(policy, "fee_buffer_pct", 0.0),
+            min_cash_reserve=_policy_number(policy, "min_cash_reserve", 0.0),
+            pending_notional=(pending_buys or Decimal("0")) + already_reserved,
+        )
+        if cash_error:
+            return None, cash_error
+        if cash_reserved is not None:
+            # Reserve the fee-inclusive amount, not the bare notional.
+            cash_reserved[currency] = already_reserved + Decimal(
+                str(cash_audit["notional_with_fees"])
+            )
+
     # 10. Request audit (exactly what will be sent; never credentials)
     env = resolve_execution_environment(settings)
+    audit = {
+        "live_position_check": live_check,
+        "execution_quote": {
+            "price": float(fresh_price),
+            "source": quote["source"],
+            "retrieved_at": quote["retrieved_at"],
+            "market": market,
+            "settlement": settlement,
+            "deviation_pct": deviation_pct,
+            "max_quote_age_seconds": max_quote_age,
+            "age_seconds": age_seconds,
+        },
+        "actual_notional": decimal_str(actual_notional),
+        "fresh_portfolio_pct": decimal_str(fresh_portfolio_pct, "0.000001"),
+        "live_portfolio_value_used": decimal_str(live_portfolio_value),
+        "execution_class": execution_class,
+        "policy_source": policy.get("policy_source", "legacy_instrument_policy"),
+        "iol_request": {
+            "environment": env["environment"],
+            "api_host": api_host_of(env),
+            "endpoint": order_request["endpoint"],
+            "content_type": order_request["content_type"],
+            **order_request["form_data"],
+        },
+    }
+    if cash_audit is not None:
+        audit["live_cash_check"] = cash_audit
+    if daily_audit is not None:
+        audit["daily_budget_check"] = daily_audit
+
     return {
         "order_exec": order_exec,
         "order_request": order_request,
         "actual_notional": actual_notional,
-        "audit": {
-            "live_position_check": live_check,
-            "execution_quote": {
-                "price": float(fresh_price),
-                "source": quote["source"],
-                "retrieved_at": quote["retrieved_at"],
-                "market": market,
-                "settlement": settlement,
-                "deviation_pct": deviation_pct,
-            },
-            "actual_notional": decimal_str(actual_notional),
-            "fresh_portfolio_pct": decimal_str(fresh_portfolio_pct, "0.000001"),
-            "live_portfolio_value_used": decimal_str(live_portfolio_value),
-            "iol_request": {
-                "environment": env["environment"],
-                "api_host": api_host_of(env),
-                "endpoint": order_request["endpoint"],
-                "content_type": order_request["content_type"],
-                **order_request["form_data"],
-            },
-        },
+        "execution_class": execution_class,
+        "currency": currency,
+        "audit": audit,
     }, None
 
 
@@ -1595,9 +2026,25 @@ def prepare_validated_execution_batch(
     submitted: the causing order is marked failed with its specific code and
     every other order becomes preflight_cancelled.
     """
-    from app.broker.instrument_scope import load_instrument_policies
+    from app.broker.execution_scope import effective_policy_for, load_authorization_context
 
-    policies, _ = load_instrument_policies(settings)
+    context = load_authorization_context(settings)
+    policies: dict[str, dict] = {}
+    for order_exec in intents:
+        key = _normalized(order_exec.symbol)
+        resolved = effective_policy_for(db, key, settings, context)
+        if resolved is not None:
+            policies[key] = resolved
+
+    # --- The securities session must be open, for the WHOLE batch ---
+    # Checked before any quote or POST: a closed market, an unknown schedule
+    # or a holiday cancels the batch instead of producing orders that would
+    # sit unexecuted or be rejected.
+    session_state = market_session_state(settings)
+    if session_state["code"]:
+        _cancel_batch(db, intents, None, session_state["code"],
+                      f"securities session not open ({session_state.get('reason', session_state['code'])})")
+        return None, session_state["code"]
 
     # --- Single live portfolio read for the whole batch ---
     try:
@@ -1607,6 +2054,29 @@ def prepare_validated_execution_batch(
         _cancel_batch(db, intents, None, "live_position_verification_failed",
                       f"could not read the live portfolio ({str(exc)[:150]})")
         return None, "live_position_verification_failed"
+
+    # --- Live balance, per currency, for every BUY in the batch ---
+    # Read ONCE and immediately before the preflight, never from the snapshot.
+    live_cash_by_currency: dict[str, dict] = {}
+    buy_currencies = {
+        str(((orders_by_action.get(o.recommendation_action_id) or {})
+             .get("instrument_identity") or {}).get("currency") or "").strip().upper()
+        for o in intents if o.side == "buy"
+    }
+    buy_currencies.discard("")
+    for currency in sorted(buy_currencies):
+        try:
+            live_cash_by_currency[currency] = broker.get_live_cash(currency)
+        except Exception as exc:
+            _cancel_batch(db, intents, None, "live_cash_unavailable",
+                          f"could not read the live balance in {currency} ({str(exc)[:120]})")
+            return None, "live_cash_unavailable"
+
+    pending_buys = pending_buy_notional(db, exclude_ids={o.id for o in intents})
+    trade_date = trade_date_for(settings)
+    daily_reserved: dict[str, Decimal] = {}
+    # Cash reserved by earlier buys of THIS batch, per currency.
+    cash_reserved: dict[str, Decimal] = {}
 
     live_portfolio_value = _live_portfolio_total(live, live_positions)
     if live_portfolio_value is None:
@@ -1635,6 +2105,12 @@ def prepare_validated_execution_batch(
         result, err = _preflight_one_order(
             order_exec, preview_order, broker, settings,
             live_positions, live_portfolio_value, policies,
+            db=db,
+            live_cash_by_currency=live_cash_by_currency,
+            pending_buys=pending_buys,
+            trade_date=trade_date,
+            daily_reserved=daily_reserved,
+            cash_reserved=cash_reserved,
         )
         if err:
             _cancel_batch(db, intents, order_exec, err, "preflight validation failed")
@@ -1737,9 +2213,20 @@ def _submit_prepared_order(db: Session, prepared: dict, broker) -> str:
             return "uncertain"
         return "skipped"
 
-    # Point of no return: quantity_sent is set together with 'submitting'.
+    # Point of no return: quantity_sent is set together with 'submitting',
+    # and the daily budget is consumed in the SAME commit. A preflight that
+    # never reached this line never eats into the day's allowance.
     order_exec.status = "submitting"
     order_exec.quantity_sent = order_exec.quantity_planned
+    execution_class = prepared.get("execution_class")
+    if execution_class:
+        consume_daily_budget(
+            db,
+            trade_date=trade_date_for(get_settings()),
+            execution_class=execution_class,
+            currency=prepared.get("currency") or "",
+            notional=prepared["actual_notional"],
+        )
     db.commit()
 
     try:
@@ -2345,13 +2832,24 @@ _RECONCILIATION_ACTIONS = {
         "target_status": "executed",
         "phrase": "CONCILIAR EJECUCION {execution_id} COMO EJECUTADA",
     },
+    # Explicit MANUAL cancellation. The app cannot cancel at IOL — no
+    # cancellation contract has been verified (see docs/IOL_CAPABILITY_MATRIX
+    # §5) — so this records that a human cancelled it in IOL's own panel.
+    # It never sends anything and never cancels automatically.
+    "confirm_cancelled": {
+        "target_status": "cancelled_by_user",
+        "phrase": "CONCILIAR EJECUCION {execution_id} COMO CANCELADA",
+    },
 }
 
 _UNCERTAIN_ORDER_STATUSES = {
     "submitting", "manual_reconciliation_required", "execution_requested", "execution_ready",
 }
 _SENT_ORDER_STATUSES = {"execution_sent", "executed"}
-_DEFINITIVE_FAIL_STATUSES = {"failed", "rejected_by_broker", "not_sent_confirmed", "validation_failed"}
+_DEFINITIVE_FAIL_STATUSES = {
+    "failed", "rejected_by_broker", "not_sent_confirmed", "validation_failed",
+    "cancelled_by_user",
+}
 
 
 def reconciliation_phrase(execution_id: int, action: str) -> str:
@@ -2501,7 +2999,9 @@ def reconcile_execution(
     previous_status = order_exec.status
     # Eligibility: only uncertain states — with ONE tested exception:
     # execution_sent may be corrected to executed with explicit evidence.
-    if action == "confirm_executed":
+    if action in ("confirm_executed", "confirm_cancelled"):
+        # An order already at the broker may still be executed (correcting a
+        # sent order) or cancelled by the human directly in IOL.
         allowed_from = _RECONCILABLE_STATUSES | {"execution_sent"}
     else:
         allowed_from = _RECONCILABLE_STATUSES
@@ -2540,6 +3040,17 @@ def reconcile_execution(
     if action == "confirm_rejected" and not clean_note:
         return {
             "error": "confirm_rejected requiere una nota no vacía con el motivo.",
+            "code": "note_required",
+            "status_code": 422,
+        }
+    if action == "confirm_cancelled" and not clean_note:
+        # A cancellation must say WHERE it was cancelled and by whom, because
+        # the app itself cannot cancel at IOL.
+        return {
+            "error": (
+                "confirm_cancelled requiere una nota no vacía indicando la "
+                "evidencia de la cancelación en IOL."
+            ),
             "code": "note_required",
             "status_code": 422,
         }
@@ -2615,6 +3126,12 @@ def reconcile_execution(
             order_exec.sent_at = now
     elif action == "confirm_rejected":
         order_exec.error_message = clean_note
+        order_exec.completed_at = now
+    elif action == "confirm_cancelled":
+        # quantity_sent is deliberately NOT cleared: the order may well have
+        # reached IOL before the human cancelled it there. Saying "nothing was
+        # sent" would be a different claim, and that is confirm_not_sent.
+        order_exec.error_message = f"Cancelada manualmente en IOL: {clean_note}"[:500]
         order_exec.completed_at = now
     elif action == "confirm_executed":
         if clean_broker_id:
