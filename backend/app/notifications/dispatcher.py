@@ -1118,7 +1118,7 @@ def notify_new_recommendation_pending_review(db, cycle_result: dict) -> dict:
         return {"sent": False, "reason": "recommendation_not_found"}
 
     meta = dict(rec.metadata_json or {})
-    if meta.get("review_notification_status") == "delivered":
+    if _review_notification_is_delivered(meta):
         return {"sent": False, "reason": "already_delivered", "recommendation_id": rec_id}
 
     attempts = int(meta.get("review_notification_attempts") or 0)
@@ -1148,9 +1148,23 @@ def notify_new_recommendation_pending_review(db, cycle_result: dict) -> dict:
     status = "pending"
     result: dict = {"sent": 0}
     if not settings.notification_enabled:
-        status = "disabled"
-        result = {"sent": 0, "reason": "disabled"}
-    else:
+        # NOT a transport attempt: disabled notifications must not consume the
+        # bounded retry budget. State is recorded only if this recommendation
+        # already has notification state, so a never-notified recommendation
+        # is left byte-identical.
+        if meta.get("review_notification_status") is not None or \
+           meta.get("review_notification_attempts"):
+            meta["review_notification_status"] = "disabled"
+            meta["review_notification_last_attempt_at"] = now.isoformat()
+            rec.metadata_json = meta
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+        return {"sent": 0, "reason": "disabled", "recommendation_id": rec_id,
+                "category": "new_recommendation_pending_review",
+                "review_notification_status": "disabled"}
+    if True:
         try:
             result = send_web_push_to_all(
                 db, title=title, body=body, severity="medium", deep_link=deep_link,
@@ -1182,3 +1196,83 @@ def notify_new_recommendation_pending_review(db, cycle_result: dict) -> dict:
         "category": "new_recommendation_pending_review",
         "review_notification_status": status,
     }
+
+
+def _review_notification_is_delivered(meta: dict) -> bool:
+    """True when the review notification was already delivered.
+
+    LEGACY COMPATIBILITY: recommendations created before the status field
+    existed only carry `review_notification_sent=True`. They are treated as
+    DELIVERED — the conservative reading, since re-notifying an already
+    warned user is worse than staying silent, and there is no evidence to the
+    contrary. An explicit non-delivered status always wins over the old flag.
+    """
+    if not isinstance(meta, dict):
+        return False
+    status = meta.get("review_notification_status")
+    if status == "delivered":
+        return True
+    if status in ("pending", "failed", "disabled"):
+        return False
+    return meta.get("review_notification_sent") is True
+
+
+def retry_pending_review_notifications(db) -> dict:
+    """Transport-only retry for review notifications that never reached the user.
+
+    Reads the DB (never an in-memory cycle_result), because the cycle that
+    created the recommendation is long gone: later cycles are skipped by that
+    very recommendation and would never call the notifier again.
+
+    Retries an open recommendation whose notification is `pending`, `failed`,
+    never attempted, or `disabled` once notifications have been re-enabled.
+    Delivered ones (and legacy `review_notification_sent=True`) are never
+    re-sent. Cooldown and the bounded attempt budget are enforced by
+    notify_new_recommendation_pending_review itself.
+
+    TRANSPORT ONLY. Analysis and execution are never retried.
+    """
+    from app.models.models import Recommendation
+    from app.services.analysis_gate import TERMINAL_RECOMMENDATION_STATUSES
+
+    settings = get_settings()
+    result = {"checked": 0, "retried": 0, "delivered": 0, "skipped": 0}
+
+    if not settings.notification_enabled:
+        # Nothing to retry and no attempt to record: disabled notifications
+        # must never consume the attempt budget nor touch a recommendation.
+        return {**result, "reason": "notifications_disabled"}
+
+    try:
+        open_recs = (
+            db.query(Recommendation)
+            .filter(Recommendation.status.notin_(sorted(TERMINAL_RECOMMENDATION_STATUSES)))
+            .order_by(Recommendation.id)
+            .all()
+        )
+    except Exception as exc:
+        logger.warning("retry_pending_review_notifications query failed: %s", exc)
+        return {**result, "error": "query_failed"}
+
+    for rec in open_recs:
+        meta = rec.metadata_json or {}
+        result["checked"] += 1
+
+        if _review_notification_is_delivered(meta):
+            result["skipped"] += 1
+            continue
+        if meta.get("review_notification_status") == "disabled" and not settings.notification_enabled:
+            # Still disabled: nothing to do and no attempt is consumed.
+            result["skipped"] += 1
+            continue
+
+        outcome = notify_new_recommendation_pending_review(db, {"recommendation_id": rec.id})
+        if outcome.get("review_notification_status") == "delivered":
+            result["delivered"] += 1
+            result["retried"] += 1
+        elif outcome.get("reason") in ("retry_cooldown", "max_attempts_reached", "already_delivered"):
+            result["skipped"] += 1
+        else:
+            result["retried"] += 1
+
+    return result

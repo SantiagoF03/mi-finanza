@@ -440,29 +440,47 @@ def test_consumed_events_do_not_create_a_duplicate_recommendation(db):
             scheduled_full_cycle()
             first_count = db.query(Recommendation).count()
             decide_open_recommendations(db)
-            # Same (already consumed) events must not regenerate a duplicate.
+            # Same (already consumed) events must not regenerate anything.
             assert _pending_events(db) == []
+
+    # Second cycle NOT forced and with NO new input: ingestion is stubbed so
+    # no fresh events appear, isolating the question under test — can an
+    # ALREADY CONSUMED event regenerate a recommendation? (A forced cycle, or
+    # one fed by new news, would legitimately create one; that is a different
+    # scenario and must not mask a duplicate.)
+    with exec_settings(trigger_cooldown_seconds=0, scheduler_postmarket_force_cycle=False):
+        with mock.patch("app.scheduler.jobs.SessionLocal", return_value=db), \
+             mock.patch.object(db, "close"), \
+             mock.patch("app.scheduler.jobs.run_ingestion", return_value={"status": "ok"}), \
+             mock.patch("app.scheduler.jobs.has_llm_eligible_news", return_value=False):
             scheduled_full_cycle()
 
-    # A second recommendation may only come from NEW analysis, not from the
-    # already-consumed events.
+    assert _pending_events(db) == [], "consumed events must not reappear as pending"
+
+    # STRICT: the already-consumed events must not produce another
+    # recommendation. Exact equality, not >=.
     for evt in db.query(MarketEvent).all():
         if evt.triggered_recalc:
             assert evt.recalc_recommendation_id is not None
-    assert db.query(Recommendation).count() >= first_count
+    assert db.query(Recommendation).count() == first_count, (
+        "an already-consumed event produced a duplicate recommendation"
+    )
 
 
-def test_consume_helper_ignores_skips_and_errors(db):
-    from app.scheduler.jobs import consume_recalc_events
-    from app.news.ingestion import run_ingestion
+def test_no_separate_event_consumption_helper_exists():
+    """The post-commit consumption window must be gone for good.
 
-    run_ingestion(db, source_label="test")
-    events = _pending_events(db)
-    for payload in ({"skipped": True, "code": "x"}, {}, None,
-                    {"recommendation_id": None}, {"recommendation_id": 5, "skipped": True}):
-        assert consume_recalc_events(db, events, payload) == 0
-    for evt in events:
-        assert evt.triggered_recalc is False
+    consume_recalc_events committed events in a SECOND transaction after the
+    recommendation was already committed. Association now happens inside
+    run_cycle's single atomic commit, so the helper must not come back.
+    """
+    from app.scheduler import jobs
+
+    assert not hasattr(jobs, "consume_recalc_events")
+    src = (BACKEND_DIR / "app" / "scheduler" / "jobs.py").read_text()
+    tree = ast.parse(src)
+    fn_names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+    assert "consume_recalc_events" not in fn_names
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -486,14 +504,30 @@ def test_disabled_notifications_are_not_recorded_as_delivered(db):
     from app.notifications.dispatcher import notify_new_recommendation_pending_review
 
     result = _fresh_recommendation(db)
+    before = json.dumps(_meta(db, result["recommendation_id"]), sort_keys=True)
+
     with exec_settings(notification_enabled=False):
         out = notify_new_recommendation_pending_review(db, result)
 
     assert out["review_notification_status"] == "disabled"
     meta = _meta(db, result["recommendation_id"])
-    assert meta["review_notification_status"] == "disabled"
     assert meta.get("review_notification_sent") is not True
     assert "review_notification_delivered_at" not in meta
+    # A never-notified recommendation is left byte-identical: disabled
+    # notifications must not fabricate state nor consume an attempt.
+    assert json.dumps(meta, sort_keys=True) == before
+    assert meta.get("review_notification_attempts") in (None, 0)
+
+    # But a recommendation that ALREADY has notification state records the
+    # disabled outcome, so a later retry can pick it up.
+    rec = db.get(Recommendation, result["recommendation_id"])
+    rec.metadata_json = {**(rec.metadata_json or {}),
+                         "review_notification_status": "failed",
+                         "review_notification_attempts": 1}
+    db.commit()
+    with exec_settings(notification_enabled=False):
+        notify_new_recommendation_pending_review(db, result)
+    assert _meta(db, result["recommendation_id"])["review_notification_status"] == "disabled"
 
 
 def test_failed_dispatch_is_not_recorded_as_delivered(db):

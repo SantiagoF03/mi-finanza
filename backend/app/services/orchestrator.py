@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta
 
 from sqlalchemy import desc
@@ -27,6 +28,7 @@ from app.recommendations.universe import build_allowed_assets
 from app.rules.engine import enforce_rules
 from app.services.analysis_gate import (
     SKIP_COOLDOWN,
+    SKIP_CREATION_CONFLICT,
     acquire_analysis_lease,
     check_recommendation_creation_allowed,
     release_analysis_lease,
@@ -34,6 +36,8 @@ from app.services.analysis_gate import (
 )
 from app.services.logs import app_log
 from app.services.planner import generate_reallocation_plan
+
+logger = logging.getLogger(__name__)
 
 _broker_singletons: dict[str, object] = {}
 
@@ -1387,14 +1391,49 @@ def _run_cycle_locked(db: Session, source: str, settings, lease_owner: str) -> d
         db.commit()
         return final_gate.as_skip(source, deferred_events_count=deferred, snapshot_id=None)
 
+    # --- SINGLE ATOMIC COMMIT ---
+    # Recommendation + RecommendationAction + the MarketEvents incorporated
+    # into this analysis are confirmed together. Previously the orchestrator
+    # committed the recommendation and the jobs committed the events in a
+    # SECOND transaction: a crash in between left a recommendation with its
+    # events still pending, so once it was resolved the very same events could
+    # produce a duplicate recommendation.
+    #
+    # The pending events are read HERE — after run_cycle's internal
+    # run_ingestion — so events created by that ingestion are associated too
+    # (the jobs used to capture them before the cycle and missed those).
+    incorporated_events = get_pending_recalc_events(db)
+
     db.add(rec_model)
-    db.flush()
+    db.flush()   # obtain recommendation_id without committing
+
     for item in rec["actions"]:
         db.add(RecommendationAction(recommendation_id=rec_model.id, **item))
 
+    for evt in incorporated_events:
+        evt.triggered_recalc = True
+        evt.recalc_recommendation_id = rec_model.id
+
     # No supersession: the analysis gate guarantees there was no other open
     # recommendation when this one was created.
-    db.commit()
+    try:
+        db.commit()   # <-- THE single commit for all three entities
+    except Exception as exc:
+        # Fail closed: nothing partial survives — no recommendation, no
+        # actions, no consumed events.
+        db.rollback()
+        logger.error("Atomic recommendation commit failed (%s): %s", source, exc)
+        return {
+            "skipped": True,
+            "status": "skipped",
+            "code": SKIP_CREATION_CONFLICT,
+            "source": source,
+            "blocking_recommendation_id": None,
+            "blocking_execution_id": None,
+            "deferred_events_count": len(get_pending_recalc_events(db)),
+            "snapshot_id": None,
+            "message": f"No se pudo persistir la recomendación: {str(exc)[:200]}",
+        }
     app_log(
         db,
         "Ciclo de análisis ejecutado",

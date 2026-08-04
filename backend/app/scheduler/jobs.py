@@ -11,6 +11,7 @@ The scheduler NEVER calls the LLM unless ingestion found trigger_recalc events.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -25,6 +26,8 @@ from app.services.orchestrator import run_cycle
 # IMPORTANT: this module must never import or call anything from the
 # execution/approval layer. Static tests (substring + AST) enforce that no
 # sending, approving or order-creating symbol appears here.
+
+logger = logging.getLogger(__name__)
 
 scheduler = BackgroundScheduler(job_defaults={"coalesce": True, "max_instances": 1})
 
@@ -54,42 +57,38 @@ def scheduler_now() -> datetime:
     return datetime.now(scheduler_timezone())
 
 
-def consume_recalc_events(db, events, cycle_result: dict | None) -> int:
-    """Mark recalc events as incorporated into a recommendation.
-
-    Shared by scheduled_ingestion AND scheduled_full_cycle so the two paths
-    cannot diverge. Events are consumed ONLY when the cycle actually
-    persisted a recommendation: a skip, a cooldown, a lease failure or an
-    error leaves them pending for a later cycle, and the flag plus the
-    association commit together in one transaction.
-    """
-    if not events or not isinstance(cycle_result, dict):
-        return 0
-    recommendation_id = cycle_result.get("recommendation_id")
-    if not recommendation_id or cycle_result.get("skipped"):
-        return 0
-    consumed = 0
-    for evt in events:
-        evt.triggered_recalc = True
-        evt.recalc_recommendation_id = recommendation_id
-        consumed += 1
-    db.commit()
-    return consumed
+# consume_recalc_events was REMOVED.
+#
+# It marked events in a SECOND commit after run_cycle had already committed
+# the recommendation, leaving a durable window where a crash produced a
+# recommendation whose events were still pending — and those events could
+# later generate a duplicate. The association now happens inside
+# run_cycle's SINGLE atomic commit (Recommendation + RecommendationAction +
+# MarketEvent together), so the jobs must NOT commit events at all.
 
 
-def _record_cycle_outcome(result: dict | None, source: str) -> None:
-    """Record a run_cycle outcome with the REAL source and a precise status.
+def record_cycle_outcome(result: dict | None, source: str, job: str | None = None) -> None:
+    """THE single place where a cycle outcome is recorded.
 
-    last_status distinguishes created / skipped / error / no_cycle_needed, and
-    the blocking fields are cleared as soon as they no longer apply so the
-    status never shows a stale block.
+    Used by scheduled_ingestion, scheduled_full_cycle AND manual analysis, so
+    automatic and manual runs report consistently.
+
+    source: the REAL cycle source (scheduler_event | scheduler | manual).
+    job:    the job that ran it (ingestion | full_cycle | manual), when known.
+
+    On success it also clears last_error and any stale blocking fields, so the
+    status never mixes data from different runs. This module records state —
+    it can never execute anything.
     """
     _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
     _scheduler_state["last_source"] = source
+    if job is not None:
+        _scheduler_state["last_job"] = job
 
     if result is None:
         # The job ran but no cycle was needed (no pending events / not gated).
         _scheduler_state["last_status"] = "no_cycle_needed"
+        _scheduler_state["last_error"] = None
         _clear_blocking_state()
         return
     if not isinstance(result, dict):
@@ -97,6 +96,7 @@ def _record_cycle_outcome(result: dict | None, source: str) -> None:
 
     if result.get("skipped"):
         _scheduler_state["last_status"] = "skipped"
+        _scheduler_state["last_error"] = None
         _scheduler_state["last_skip_code"] = result.get("code")
         _scheduler_state["blocking_recommendation_id"] = result.get("blocking_recommendation_id")
         _scheduler_state["blocking_execution_id"] = result.get("blocking_execution_id")
@@ -104,7 +104,22 @@ def _record_cycle_outcome(result: dict | None, source: str) -> None:
         _scheduler_state["total_skips"] += 1
     else:
         _scheduler_state["last_status"] = "created"
+        _scheduler_state["last_error"] = None
         _clear_blocking_state()
+
+
+def record_cycle_error(exc: Exception, source: str, job: str) -> None:
+    """Record a job/analysis failure with its real source and job."""
+    _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+    _scheduler_state["last_status"] = "error"
+    _scheduler_state["last_source"] = source
+    _scheduler_state["last_job"] = job
+    _scheduler_state["last_error"] = str(exc)[:300]
+    _scheduler_state["total_errors"] += 1
+
+
+# Backwards-compatible alias used across the codebase and tests.
+_record_cycle_outcome = record_cycle_outcome
 
 
 def _clear_blocking_state() -> None:
@@ -198,27 +213,29 @@ def scheduled_ingestion():
     db = None
     try:
         db = SessionLocal()
+        # Transport-only retry: a review notification that never reached the
+        # user is retried here, because later cycles are skipped by that very
+        # recommendation and would never call the notifier again. Bounded by
+        # cooldown + max attempts. Analysis and orders are NEVER retried.
+        _retry_review_notifications(db)
+
         run_ingestion(db, source_label="scheduler")
 
         pending = get_pending_recalc_events(db)
         if pending:
             cycle_result = run_cycle(db, source="scheduler_event")
-            _record_cycle_outcome(cycle_result, "scheduler_event")
-            consume_recalc_events(db, pending, cycle_result)
-
+            _record_cycle_outcome(cycle_result, "scheduler_event", job="ingestion")
+            # Events are associated atomically inside run_cycle — no second
+            # commit here.
             _notify_events(db, pending)
             _notify_recommendation_change(db, cycle_result)
         else:
-            _record_cycle_outcome(None, "scheduler_event")
+            _record_cycle_outcome(None, "scheduler_event", job="ingestion")
         # last_status / last_source are set by _record_cycle_outcome with the
         # REAL cycle outcome and source; the job only counts the run here.
         _scheduler_state["total_runs"] += 1
     except Exception as exc:
-        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
-        _scheduler_state["last_status"] = "error"
-        _scheduler_state["last_error"] = str(exc)[:300]
-        _scheduler_state["last_job"] = "ingestion"
-        _scheduler_state["total_errors"] += 1
+        record_cycle_error(exc, "scheduler_event", "ingestion")
     finally:
         if db is not None:
             db.close()
@@ -237,6 +254,12 @@ def scheduled_full_cycle():
     db = None
     try:
         db = SessionLocal()
+        # Transport-only retry: a review notification that never reached the
+        # user is retried here, because later cycles are skipped by that very
+        # recommendation and would never call the notifier again. Bounded by
+        # cooldown + max attempts. Analysis and orders are NEVER retried.
+        _retry_review_notifications(db)
+
         run_ingestion(db, source_label="scheduler_close")
 
         should_run = (
@@ -245,28 +268,30 @@ def scheduled_full_cycle():
             or bool(get_pending_recalc_events(db))
         )
         if should_run:
-            # Capture the events BEFORE the cycle so the ones it used are the
-            # ones consumed (previously full_cycle never consumed any, so they
-            # stayed pending and could produce a duplicate recommendation).
-            pending = get_pending_recalc_events(db)
             cycle_result = run_cycle(db, source="scheduler")
-            _record_cycle_outcome(cycle_result, "scheduler")
-            consume_recalc_events(db, pending, cycle_result)
+            _record_cycle_outcome(cycle_result, "scheduler", job="full_cycle")
+            # Event association happens inside run_cycle's atomic commit.
             _notify_recommendation_change(db, cycle_result)
         else:
-            _record_cycle_outcome(None, "scheduler")
+            _record_cycle_outcome(None, "scheduler", job="full_cycle")
         # last_status / last_source are set by _record_cycle_outcome with the
         # REAL cycle outcome and source; the job only counts the run here.
         _scheduler_state["total_runs"] += 1
     except Exception as exc:
-        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
-        _scheduler_state["last_status"] = "error"
-        _scheduler_state["last_error"] = str(exc)[:300]
-        _scheduler_state["last_job"] = "full_cycle"
-        _scheduler_state["total_errors"] += 1
+        record_cycle_error(exc, "scheduler", "full_cycle")
     finally:
         if db is not None:
             db.close()
+
+
+def _retry_review_notifications(db):
+    """Best-effort transport retry. Never analysis, never execution."""
+    try:
+        from app.notifications.dispatcher import retry_pending_review_notifications
+        return retry_pending_review_notifications(db)
+    except Exception as exc:
+        logger.warning("review notification retry failed: %s", exc)
+        return {}
 
 
 def _notify_events(db, events):

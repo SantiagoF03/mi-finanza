@@ -72,7 +72,18 @@ def run_manual_analysis(db: Session = Depends(get_db), _auth=Depends(require_api
     It does not create, replace or modify the open recommendation, and sends
     no "new recommendation" notification.
     """
-    cycle_result = run_cycle(db, source="manual")
+    from app.scheduler.jobs import record_cycle_error, record_cycle_outcome
+
+    try:
+        cycle_result = run_cycle(db, source="manual")
+    except Exception as exc:
+        # Manual runs report through the SAME observability recorder as the
+        # automatic jobs, so the status never mixes sources.
+        record_cycle_error(exc, "manual", "manual")
+        raise
+
+    # Records created | skipped with source=manual (job=manual).
+    record_cycle_outcome(cycle_result, "manual", job="manual")
 
     if cycle_result.get("skipped"):
         # Nothing was created → nothing to notify.
