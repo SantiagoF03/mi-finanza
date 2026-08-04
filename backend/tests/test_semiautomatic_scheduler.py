@@ -599,7 +599,7 @@ def test_new_recommendation_sends_one_human_review_notification(db):
             second = notify_new_recommendation_pending_review(db, result)
 
     assert push.call_count == 1                      # exactly one notification
-    assert second["reason"] == "already_notified"    # deduplicated
+    assert second["reason"] == "already_delivered"   # deduplicated
     body = push.call_args.kwargs["body"]
     assert str(result["recommendation_id"]) in body
     assert "revisión" in body.lower()

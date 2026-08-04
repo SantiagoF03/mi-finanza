@@ -66,6 +66,23 @@ Un skip devuelve **HTTP 200** con `skipped=true` (no es un error), e incluye
 Un ciclo bloqueado **no refresca el snapshot**: hacerlo invalidaría el
 `preview_hash` firmado de la recomendación abierta.
 
+## Orden correcto: lease → gate → análisis → verificación final
+
+El lease se adquiere **primero**; el gate se evalúa **dentro** del lease
+(evaluarlo antes abriría un TOCTOU donde dos procesos leen «permitido»).
+Inmediatamente **antes del INSERT** se ejecuta `verify_can_persist_recommendation`,
+que:
+
+1. **renueva el lease atómicamente** (`renew_analysis_lease`) — el UPDATE
+   condicional exige `name` + `owner_id` + lease vigente, así que un
+   `rowcount != 1` significa que se perdió (venció o lo tomó otro proceso);
+2. **vuelve a correr el gate** — durante un análisis largo pudo aparecer una
+   recomendación o ejecución bloqueante.
+
+Si cualquiera de las dos falla, **no se persiste** y se devuelve un skip
+estable. Un análisis que supera el TTL no puede escribir sin renovar: no se
+asume que «normalmente tarda menos».
+
 ## Lease persistente (`analysis_leases`)
 
 Fila única con adquisición **atómica** mediante un solo UPDATE condicional:
@@ -122,12 +139,65 @@ cualquier llamada al broker. Ahora:
 
 Igual que `execution_ready`. No hay endpoints de resume/retry/resubmit.
 
+## Piloto bajo la misma exclusión
+
+`create_execution_pilot_recommendation` adquiere **el mismo lease** y corre
+**el mismo gate**. Si existe cualquier recomendación abierta devuelve **409**
+y exige resolverla explícitamente. **No supersede nada**: la versión anterior
+estampaba `superseded_at` + metadata pero dejaba la recomendación previa en
+`pending`, lo que podía dejar dos recomendaciones abiertas a la vez. Ese
+helper fue eliminado.
+
+## Consumo transaccional de eventos
+
+`consume_recalc_events(db, events, cycle_result)` es el **único** punto de
+consumo, usado por `scheduled_ingestion` **y** `scheduled_full_cycle` (antes
+el full cycle no consumía nada, así que sus eventos quedaban pendientes y
+podían generar una recomendación duplicada). Marca `triggered_recalc=True` y
+`recalc_recommendation_id` **solo** cuando el ciclo devolvió
+`recommendation_id`; en skip, cooldown, lease no disponible o error no
+consume nada, y ambos campos se commitean juntos.
+
 ## Notificaciones
 
-Una recomendación nueva genera **una sola** notificación de revisión humana
-(deduplicada con un flag persistido), con `recommendation_id` y deep link, sin
-credenciales, sin `preview_hash` y sin decir que se ejecutó algo. Un ciclo con
-skip **no notifica**, así que un bloqueo persistente no genera spam.
+**Un solo push principal por recomendación**: la notificación de revisión
+humana es el aviso principal; en el ciclo que crea la recomendación,
+`dispatch_recommendation_alerts` corre con `suppress_push=True` (conserva su
+auditoría, no manda push). Así la misma recomendación nunca produce dos
+avisos.
+
+La entrega se registra **solo con evidencia** (`sent > 0`). Estados
+persistidos:
+
+| Campo | Valores |
+|---|---|
+| `review_notification_status` | `pending` / `delivered` / `failed` / `disabled` |
+| `review_notification_attempts` | contador (máx. 3) |
+| `review_notification_last_attempt_at` | ISO |
+| `review_notification_delivered_at` | ISO, solo en `delivered` |
+
+`review_notification_sent=True` se escribe **únicamente** en entrega real.
+Notificaciones deshabilitadas, excepciones y `sent=0` dejan un estado
+reintentable con cooldown de 300 s y máximo 3 intentos — el reintento aplica
+**solo al transporte**; el análisis y la ejecución nunca se reintentan. Un
+ciclo con skip no notifica.
+
+## Observabilidad
+
+`last_status` distingue `created` / `skipped` / `error` / `no_cycle_needed`
+(antes decía `ok` incluso en skips) y `last_source` conserva el source real
+(`scheduler_event` / `scheduler` / `manual`) en vez de un literal del job.
+Los campos `last_skip_code`, `blocking_recommendation_id`,
+`blocking_execution_id` y `deferred_events_count` se limpian en cuanto dejan
+de aplicar, así que el status nunca muestra un bloqueo obsoleto. El cooldown
+tiene código estable `analysis_cooldown` y el payload completo.
+
+## Timezone portable
+
+`python:3.11-slim` **no** trae la base IANA del sistema, así que `zoneinfo`
+no podría resolver `America/Argentina/Buenos_Aires`. Se agregó **`tzdata`**
+a `requirements.txt`. El default sigue siendo `UTC` y los horarios
+productivos no cambian.
 
 ## Variables nuevas
 
