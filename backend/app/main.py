@@ -55,6 +55,22 @@ def _patch_schema(engine_ref):
                     "ALTER TABLE recommendation_actions ADD COLUMN quantity_override INTEGER"
                 ))
 
+    # 4. execution_instruments / execution_daily_notional — new tables only.
+    #    create_all() already made them; nothing here rewrites or drops data.
+    #
+    #    MIGRATION SAFETY: every step in this function is additive and
+    #    idempotent — CREATE TABLE for tables that do not exist, ADD COLUMN
+    #    for columns that do not exist. There is no DROP, no UPDATE and no
+    #    DELETE anywhere in the startup path, so existing rows (including
+    #    Recommendation 13 and OrderExecution 1) are never touched.
+    #
+    #    ROLLBACK: reverting the application code is sufficient. The new
+    #    tables are simply left unused and unread by the previous version;
+    #    no old column changed type, meaning or nullability. If the tables
+    #    must also be removed, that is a manual, offline
+    #    `DROP TABLE execution_instruments; DROP TABLE execution_daily_notional;`
+    #    which cannot affect any pre-existing table.
+
 
 @app.on_event("startup")
 def on_startup():

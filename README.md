@@ -107,6 +107,170 @@ Motor rule-based → Recomendación (pending/blocked)
 - `BROKER_MODE=mock`: MockBrokerClient simula órdenes exitosas
 - `BROKER_MODE=real`: IolBrokerClient envía órdenes reales via `POST /api/v2/operar`
 
+## Cobertura de instrumentos: catálogo + políticas por clase
+
+La app dejó de estar limitada a un piloto de un solo símbolo. La cobertura de
+**acciones argentinas y CEDEARs** se resuelve con dos piezas, sin escribir una
+política a mano por cada símbolo:
+
+### 1. Catálogo de ejecución (`execution_instruments`)
+
+Es la **única autoridad sobre identidad operable**. Deliberadamente separado
+de `instrument_catalog` (que es el universo de *análisis*): un universo de
+análisis nunca debe poder autorizar una orden por sí solo.
+
+Se alimenta con datos **read-only** del broker (la cartera real informa
+`asset_type`, `instrument_type` y `moneda` de cada símbolo) vía
+`POST /api/broker/instrument-catalog/refresh`. **Nunca** se alimenta con texto
+generado por un LLM: una cadena generada no puede declarar moneda, mercado ni
+tick.
+
+Una entrada sólo sirve si está **completa, activa y fresca**. Si no:
+
+| Código | Significado |
+|---|---|
+| `instrument_catalog_missing` | No hay entrada para el símbolo |
+| `instrument_catalog_incomplete` | Falta identidad, tick o step |
+| `instrument_catalog_stale` | La verificación venció |
+| `instrument_inactive` | Dada de baja |
+| `instrument_class_unsupported` | No mapea a ninguna clase operable |
+
+No hay wildcard: un símbolo sin catálogo verificado **no se opera**.
+
+### 2. Políticas por clase (`EXECUTION_CLASS_POLICIES`)
+
+Una política cubre **todos** los instrumentos de su clase — agregar un CEDEAR
+no requiere escribir nada nuevo.
+
+| Clase | Familia | Estado |
+|---|---|---|
+| `ACCIONES` | `securities` | operable |
+| `CEDEARS` | `securities` | operable |
+| `FCI` | `fund` | **no operable** (ver abajo) |
+
+Cada política define: `buy_enabled`, `sell_enabled`, `currencies`, `markets`,
+`settlements`, `max_order_notional`, `max_daily_notional`, `max_quantity`,
+`max_portfolio_pct`, `min_cash_reserve`, `fee_buffer_pct`,
+`max_quote_age_seconds`, `max_price_deviation_pct`, `order_type`,
+`validity_minutes`, `catalog_max_age_seconds`, `default_quantity_step`,
+`default_price_tick`. **Todos obligatorios**: un límite ausente nunca se lee
+como "sin límite".
+
+Encima de la clase:
+
+- **Overrides por símbolo** (`EXECUTION_INSTRUMENT_OVERRIDES`): sólo pueden
+  **endurecer** (bajar un límite, apagar un lado, subir la reserva). Aflojar
+  requiere el escape administrativo explícito
+  `EXECUTION_ALLOW_OVERRIDE_LIMIT_INCREASE=true`; sin él se responde
+  `override_increases_limit` y se conserva el valor de la clase.
+- **Denylist** (`EXECUTION_DENYLIST`): gana siempre, sobre cualquier override.
+- **Allowlist legacy** (`EXECUTION_INSTRUMENT_POLICIES`): sigue funcionando y
+  manda para los símbolos que cubre.
+
+Detalle completo y ejemplo de JSON: `backend/.env.execution.example`.
+
+## Capacidades separadas (todas apagadas por defecto)
+
+```
+ORDER_EXECUTION_ENABLED=false     # candado global, por encima de todo
+SECURITIES_BUY_ENABLED=false
+SECURITIES_SELL_ENABLED=false
+FCI_SUBSCRIPTION_ENABLED=false
+FCI_REDEMPTION_ENABLED=false
+```
+
+`EXECUTION_SELL_ONLY` está **deprecado pero no eliminado**: mientras esté en
+`true` sigue bloqueando toda compra y sigue autorizando el camino legacy de
+venta, así que la configuración productiva actual no cambia de comportamiento.
+Migración: poner `SECURITIES_SELL_ENABLED=true` y recién después
+`EXECUTION_SELL_ONLY=false`.
+
+Ni el scheduler ni ningún endpoint público pueden cambiar estos flags.
+
+## Compra de títulos: preflight de saldo vivo
+
+Antes de enviar una compra se valida, **inmediatamente antes del envío**:
+
+1. **Recomendación** — pending/blocked, no vencida, sin ejecución ni
+   aprobación previa, preview firmado y vigente.
+2. **Instrumento** — catálogo válido y fresco, `buy_supported`, clase
+   habilitada, mercado/plazo/moneda correctos, tick y step conocidos.
+3. **Mercado** — día hábil y horario válido (`market_closed`,
+   `market_schedule_unknown`). Fail closed ante horario desconocido.
+4. **Cotización** — **best ask** (nunca `ultimoPrecio`, nunca el bid),
+   timestamp con zona horaria, antigüedad dentro del máximo de la clase,
+   precio múltiplo exacto del `price_tick` (nunca se redondea para encajar),
+   desviación máxima respecto de la referencia firmada.
+5. **Saldo** — `get_live_cash(moneda)` contra `/api/v2/estadocuenta`,
+   **por moneda** (sumar pesos y dólares daría un número sin sentido).
+   Se descuentan buffer de costos, reserva mínima y compras pendientes.
+   `snapshot.cash` sólo puede **achicar** una orden, jamás autorizarla.
+6. **Cantidad** — múltiplo del `quantity_step`, mínimo, máximos por símbolo,
+   por clase, por orden, **por día** y como porcentaje de cartera.
+7. **Confirmación** — preview firmado + frase exacta + `X-Execution-Key`.
+
+Códigos de bloqueo: `buy_execution_disabled`, `live_cash_unavailable`,
+`insufficient_live_cash`, `currency_cash_mismatch`, `fee_buffer_exceeded`,
+`quote_stale`, `quote_unavailable`, `price_tick_mismatch`,
+`quantity_step_mismatch`, `order_limit_exceeded`, `daily_limit_exceeded`,
+`portfolio_pct_limit_exceeded`.
+
+El límite diario se consume **sólo en el punto de no retorno** (cuando la
+orden se commitea como `submitting`), así que un preflight bloqueado nunca
+gasta presupuesto del día.
+
+## FCI: análisis sí, ejecución no
+
+```
+fci_execution_supported = false
+bloqueo                 = fci_not_supported_by_iol_api
+```
+
+La API oficial de IOL **no expone un contrato verificado** de suscripción ni
+rescate de FCI, y los endpoints no se inventan. Por lo tanto la app:
+
+- ✅ analiza, muestra y recomienda FCI;
+- ✅ genera un **preview informativo** (sin precio límite, sin punta, sin
+  step — un fondo no tiene nada de eso) con el **cutoff propio del fondo** y
+  el plazo estimado;
+- ✅ indica operar manualmente en IOL;
+- ❌ **nunca** simula que puede enviar la operación;
+- ❌ un FCI no puede generar un `OrderExecution` ni viajar por el contrato de
+  títulos.
+
+Encender `FCI_SUBSCRIPTION_ENABLED` / `FCI_REDEMPTION_ENABLED` **no habilita
+nada**: `ready_for_real_fci_*` es `false` incondicionalmente mientras el
+contrato no esté verificado. Ver `docs/IOL_FCI_CAPABILITY.md`.
+
+## Calendario y horarios (minutos, no sólo horas)
+
+```
+SCHEDULER_MARKET_OPEN_TIME=10:30
+SCHEDULER_MARKET_CLOSE_TIME=17:00
+SCHEDULER_TIMEZONE=America/Argentina/Buenos_Aires
+MARKET_HOLIDAYS=
+```
+
+`SCHEDULER_MARKET_OPEN_HOUR` / `SCHEDULER_MARKET_CLOSE_HOUR` quedan
+**deprecadas** (sólo horas enteras, no pueden representar 10:30). Se siguen
+honrando mientras las variables HH:MM estén ausentes.
+
+El cron generado: premarket relativo a 10:30, ingesta durante la rueda sobre
+la grilla de la sesión, un último chequeo **antes** de las 17:00 y el ciclo
+completo después del cierre. Un horario irresoluble **no registra ningún job**
+en vez de adivinar una sesión.
+
+El calendario de títulos (BYMA) y el cutoff de cada FCI son cosas separadas:
+el cutoff vive en la entrada de catálogo del fondo, no en el calendario.
+
+### El scheduler sigue sin poder ejecutar
+
+Puede analizar y recomendar. **No puede** aprobar, llamar a execution, enviar
+una orden, suscribir, rescatar, cancelar ni habilitar flags. Garantizado por
+tests AST sobre `app/scheduler/jobs.py`, `app/services/orchestrator.py`,
+`app/services/analysis_gate.py`, `app/notifications/dispatcher.py`,
+`app/llm/explainer.py`, `app/news/ingestion.py` y `app/market/calendar.py`.
+
 ## PWA / Mobile
 
 La app es instalable como PWA (Progressive Web App):
@@ -122,7 +286,14 @@ La app es instalable como PWA (Progressive Web App):
 |---|---|---|
 | POST | `/api/recommendations/{id}/approve` | Aprobar y ejecutar órdenes |
 | POST | `/api/recommendations/{id}/reject` | Rechazar sin ejecutar |
+| GET | `/api/broker/execution-readiness` | Readiness por capacidad, límites y cobertura |
+| GET | `/api/broker/instrument-capabilities` | Matriz read-only: buy/sell ready y motivos de bloqueo |
+| POST | `/api/broker/instrument-catalog/refresh` | Refresca identidad desde datos read-only del broker |
+| GET | `/api/broker/fci-capability` | Estado de la capacidad FCI (bloqueada y por qué) |
 | GET | `/api/executions/recent` | Ejecuciones recientes |
+| GET | `/api/executions/reconciliation-queue` | Órdenes que requieren conciliación manual |
+| POST | `/api/executions/{id}/reconcile` | Resolución manual (incluye `confirm_cancelled`) |
+| POST | `/api/executions/{id}/refresh-broker-status` | Consulta read-only de estado al broker |
 | GET | `/api/executions/{id}` | Detalle de una ejecución |
 | GET | `/api/notifications/settings` | Config de notificaciones |
 | PUT | `/api/notifications/settings` | Actualizar config |

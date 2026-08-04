@@ -157,6 +157,33 @@ export default function App() {
   const [summary, setSummary] = useState(null)
   const [analysis, setAnalysis] = useState(null)
   const [news, setNews] = useState([])
+  // --- Operation kinds -----------------------------------------------------
+  // Securities and funds are DIFFERENT operations with different vocabularies.
+  // A fund is subscribed/redeemed by amount at an end-of-day value; it has no
+  // limit price, no book and no quantity step. Rendering them with the same
+  // fields would invite the user to approve something the app cannot send.
+  const isFundOperation = (o) =>
+    (o?.instrument_identity?.execution_family || o?.execution_scope?.execution_family) === 'fund'
+
+  const operationKind = (o) => {
+    if (isFundOperation(o)) return o?.side === 'buy' ? 'subscribe' : 'redeem'
+    return o?.side === 'buy' ? 'buy' : 'sell'
+  }
+
+  const OPERATION_LABELS = {
+    buy: 'COMPRA',
+    sell: 'VENTA',
+    subscribe: 'SUSCRIPCIÓN FCI',
+    redeem: 'RESCATE FCI',
+  }
+  const operationLabel = (o) => OPERATION_LABELS[operationKind(o)] || 'OPERACIÓN'
+
+  const projectedPosition = (o) => {
+    const currentValue = Number(o?.position_value_used || 0)
+    const delta = Number(o?.estimated_notional || 0)
+    return o?.side === 'buy' ? currentValue + delta : currentValue - delta
+  }
+
   const [current, setCurrent] = useState(null)
   const [history, setHistory] = useState([])
   const [events, setEvents] = useState([])
@@ -455,6 +482,22 @@ export default function App() {
       setError('No hay órdenes válidas para ejecutar.')
       return
     }
+    // A fund operation can never be approved here: the app has no verified
+    // IOL contract to send it, so approving would imply an action that will
+    // never happen.
+    if (orders.some(isFundOperation)) {
+      setError(
+        'Hay operaciones de FCI en el plan. La suscripción y el rescate de FCI ' +
+        'deben realizarse manualmente en IOL: la app no puede enviarlas.',
+      )
+      return
+    }
+    // The preview must be the one currently on screen, for THIS
+    // recommendation — never a silently reused earlier one.
+    if (executionPreview.recommendation_id !== current.id) {
+      setError('El preview no corresponde a la recomendación actual. Refrescá.')
+      return
+    }
     const requiredPhrase = `EJECUTAR RECOMENDACION ${current.id}`
     if (confirmText.trim() !== requiredPhrase) {
       setError(`Frase de confirmación incorrecta. Escribí exactamente: ${requiredPhrase}`)
@@ -728,25 +771,81 @@ export default function App() {
 
                   {(executionPreview.orders_preview || []).map((o, idx) => (
                     <div key={`${o.symbol}-${idx}`} className="opportunity-item">
-                      <strong>{o.symbol}</strong> — {o.side}
-                      <div style={{ fontSize: '0.85em' }}>
-                        Cantidad planificada: {o.quantity_planned} · Cambio objetivo: {(Number(o.target_change_pct || 0) * 100).toFixed(2)}%
-                      </div>
-                      <div style={{ fontSize: '0.85em' }}>
-                        Portfolio usado: {Number(o.portfolio_value_used || 0).toLocaleString()} · Posición usada: {Number(o.position_value_used || 0).toLocaleString()}
-                      </div>
-                      <div style={{ fontSize: '0.85em' }}>
-                        Precio ref snapshot: {Number(o.snapshot_price_ref || 0).toLocaleString()} · Monto estimado: {Number(o.estimated_notional || 0).toLocaleString()} · % portfolio: {(Number(o.portfolio_pct || 0) * 100).toFixed(2)}% · Válida: {o.valid ? 'sí' : 'no'}
-                      </div>
-                      {o.instrument_identity?.symbol && (
-                        <div style={{ fontSize: '0.85em', color: '#888' }}>
-                          Instrumento: {o.instrument_identity.symbol} · activo {o.instrument_identity.asset_type} · instrumento {o.instrument_identity.instrument_type} · moneda {o.instrument_identity.currency} · mercado {o.instrument_identity.market} · plazo {o.instrument_identity.settlement}
-                        </div>
-                      )}
-                      {o.execution_scope?.quantity_step != null && (
-                        <div style={{ fontSize: '0.85em', color: '#888' }}>
-                          Alcance: {o.execution_scope.sell_only ? 'solo venta' : 'compra y venta'} · step {o.execution_scope.quantity_step} · alteración mínima {o.execution_scope.price_tick ?? '—'} · máx cantidad {Number(o.execution_scope.max_quantity || 0).toLocaleString()} · máx monto {Number(o.execution_scope.max_notional || 0).toLocaleString()}
-                        </div>
+                      <strong>{o.symbol}</strong>{' '}
+                      <span className={`op-badge op-${operationKind(o)}`}>{operationLabel(o)}</span>
+                      {isFundOperation(o) ? (
+                        <>
+                          {/* Un FCI no tiene precio límite, punta ni step: se
+                              suscribe o rescata por monto a un valor de cuotaparte
+                              que todavía no existe. Mostrar un precio sería mentir. */}
+                          <div style={{ fontSize: '0.85em' }}>
+                            Fondo: {o.instrument_identity?.display_symbol || o.symbol}
+                            {' · '}moneda {o.instrument_identity?.currency || '—'}
+                          </div>
+                          <div style={{ fontSize: '0.85em' }}>
+                            Monto estimado: {Number(o.estimated_notional || 0).toLocaleString()}
+                            {' · '}cuotapartes actuales: {o.position_value_used != null ? Number(o.position_value_used).toLocaleString() : '—'}
+                          </div>
+                          <div style={{ fontSize: '0.85em' }}>
+                            Cutoff del fondo: {o.catalog?.fund_cutoff_local_time || o.instrument_identity?.fund_cutoff_local_time || '—'}
+                            {' · '}plazo estimado de liquidación: {o.catalog?.settlement_delay_days != null ? `${o.catalog.settlement_delay_days} día(s)` : '—'}
+                          </div>
+                          <div className="info-box info-blocked">
+                            Operación <strong>no inmediata</strong> y <strong>no ejecutable desde la app</strong>:
+                            la API oficial de IOL no expone un contrato verificado de suscripción/rescate.
+                            Realizala manualmente en IOL.
+                          </div>
+                        </>
+                      ) : (
+                        <>
+                          <div style={{ fontSize: '0.85em' }}>
+                            Clase: {o.instrument_identity?.execution_class || '—'}
+                            {' · '}moneda {o.instrument_identity?.currency || '—'}
+                            {' · '}mercado {o.instrument_identity?.market || '—'}
+                            {' · '}plazo {o.instrument_identity?.settlement || '—'}
+                          </div>
+                          <div style={{ fontSize: '0.85em' }}>
+                            Cantidad: {o.quantity_planned} · Cambio objetivo: {(Number(o.target_change_pct || 0) * 100).toFixed(2)}%
+                          </div>
+                          <div style={{ fontSize: '0.85em' }}>
+                            Posición actual: {Number(o.position_value_used || 0).toLocaleString()}
+                            {' → '}proyectada: {Number(projectedPosition(o)).toLocaleString()}
+                          </div>
+                          <div style={{ fontSize: '0.85em' }}>
+                            Cartera: {Number(o.portfolio_value_used || 0).toLocaleString()}
+                            {o.side === 'buy' && executionPreview.snapshot_cash_reference != null && (
+                              <>
+                                {' · '}saldo (ref. snapshot): {Number(executionPreview.snapshot_cash_reference).toLocaleString()} {executionPreview.snapshot_currency}
+                                {' → '}proyectado: {Number(executionPreview.snapshot_cash_reference - (o.estimated_notional || 0)).toLocaleString()}
+                                {' '}<em style={{ color: '#888' }}>(el saldo real se verifica en vivo antes de enviar)</em>
+                              </>
+                            )}
+                          </div>
+                          <div style={{ fontSize: '0.85em' }}>
+                            {o.side === 'buy' ? 'Ask usado' : 'Bid usado'} (ref): {Number(o.snapshot_price_ref || 0).toLocaleString()}
+                            {o.price_ref_source && ` (${o.price_ref_source})`}
+                            {' · '}monto: {Number(o.estimated_notional || 0).toLocaleString()}
+                            {' · '}% cartera: {(Number(o.portfolio_pct || 0) * 100).toFixed(2)}%
+                            {' · '}Válida: {o.valid ? 'sí' : 'no'}
+                          </div>
+                          {o.execution_scope?.fee_buffer_pct != null && (
+                            <div style={{ fontSize: '0.85em', color: '#888' }}>
+                              Buffer de costos: {(Number(o.execution_scope.fee_buffer_pct) * 100).toFixed(2)}%
+                              {' · '}reserva mínima: {Number(o.execution_scope.min_cash_reserve || 0).toLocaleString()}
+                            </div>
+                          )}
+                          {o.instrument_identity?.symbol && (
+                            <div style={{ fontSize: '0.85em', color: '#888' }}>
+                              Instrumento: {o.instrument_identity.symbol} · activo {o.instrument_identity.asset_type} · instrumento {o.instrument_identity.instrument_type}
+                            </div>
+                          )}
+                          {o.execution_scope?.quantity_step != null && (
+                            <div style={{ fontSize: '0.85em', color: '#888' }}>
+                              Límites: step {o.execution_scope.quantity_step} · alteración mínima {o.execution_scope.price_tick ?? '—'} · máx cantidad {Number(o.execution_scope.max_quantity || 0).toLocaleString()} · máx monto {Number(o.execution_scope.max_notional || 0).toLocaleString()}
+                              {o.execution_scope.max_daily_notional != null && ` · máx diario ${Number(o.execution_scope.max_daily_notional).toLocaleString()}`}
+                            </div>
+                          )}
+                        </>
                       )}
                       {o.blocked_reason && (
                         <div className="info-box info-blocked">{o.blocked_reason}</div>

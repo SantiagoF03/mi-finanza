@@ -35,3 +35,7 @@ backend/.env
 frontend/.env
 frontend/.env.production
 frontend/.env.local
+
+# Python virtualenvs
+.venv/
+venv/

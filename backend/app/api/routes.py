@@ -54,12 +54,61 @@ def broker_ping():
 
 
 @router.get("/broker/execution-readiness")
-def broker_execution_readiness(_auth=Depends(require_api_key)):
-    """Read-only execution readiness: environment, locks, configuration
-    booleans and blocking reasons. Never returns credentials or secrets,
-    and does not authenticate against IOL."""
+def broker_execution_readiness(db: Session = Depends(get_db), _auth=Depends(require_api_key)):
+    """Read-only execution readiness: environment, locks, per-capability
+    flags, class policies, catalog coverage and blocking reasons. Never
+    returns credentials or secrets, and does not authenticate against IOL."""
     from app.services.execution import get_execution_readiness
-    return get_execution_readiness()
+    return get_execution_readiness(db)
+
+
+@router.get("/broker/instrument-capabilities")
+def broker_instrument_capabilities(
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """READ-ONLY capability report per instrument.
+
+    Shows, for every instrument in the portfolio and in the execution
+    catalog: its detected class, its verified identity, what is missing,
+    whether it is buy-ready and sell-ready, and the exact blocking reasons.
+    Never touches the broker and never exposes secrets.
+    """
+    from app.services.instrument_capabilities import build_instrument_capabilities
+    return build_instrument_capabilities(db)
+
+
+@router.post("/broker/instrument-catalog/refresh")
+def broker_instrument_catalog_refresh(
+    db: Session = Depends(get_db),
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    _auth=Depends(require_api_key),
+):
+    """Refresh the EXECUTION catalog from READ-ONLY broker data.
+
+    Reads the live portfolio (a read-only call) to establish instrument
+    identity and writes catalog rows. It can never place, cancel or approve
+    an order. Requires the execution credential because the catalog is what
+    authorises identity.
+    """
+    from app.services.instrument_capabilities import refresh_execution_catalog
+    result = refresh_execution_catalog(db, execution_key=x_execution_key)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.get("/broker/fci-capability")
+def broker_fci_capability(_auth=Depends(require_api_key)):
+    """Whether the app can execute FCI subscriptions/redemptions.
+
+    Phase 0 result: it cannot. No official IOL contract for FCI
+    subscription/redemption has been verified by this repository, so the app
+    analyses, displays and recommends FCI, but the operation itself must be
+    performed manually in IOL. See docs/IOL_FCI_CAPABILITY.md.
+    """
+    from app.services.fci import get_fci_capability
+    return get_fci_capability()
 
 
 @router.post("/analysis/run")

@@ -37,6 +37,22 @@ class BrokerClient(ABC):
             "settlement": settlement,
         }
 
+    def get_live_cash(self, currency: str) -> dict:
+        """Live AVAILABLE balance in ONE currency, read immediately before a buy.
+
+        Contract: {available, cash, currency, committed, retrieved_at, source}.
+        `available` False means the balance could not be established — the
+        caller must block, never fall back to a snapshot value.
+        """
+        return {
+            "available": False,
+            "cash": None,
+            "currency": currency,
+            "committed": None,
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "source": "none",
+        }
+
 
 def _extract_iol_validation_errors(data: Any) -> str:
     """Summarize an IOL validation-error body, or "" if it is not one.
@@ -168,6 +184,104 @@ def map_iol_estadocuenta_cash(payload: dict[str, Any]) -> float:
             return total
 
     return 0.0
+
+
+def map_iol_estadocuenta_by_currency(payload: dict[str, Any], currency: str) -> dict:
+    """Available balance for ONE currency from /api/v2/estadocuenta.
+
+    Deliberately NOT the same as map_iol_estadocuenta_cash, which sums every
+    account regardless of currency. Summing pesos and dollars produces a
+    number that means nothing, and using it to authorise a buy would be a
+    silent overdraft. Here an account only counts when its `moneda` maps to
+    the requested currency; if none does, we fail closed.
+
+    Prefers the most conservative figure IOL exposes:
+      disponibleOperar  (what may actually be used to operate)
+      → disponible
+    and reports `committed` separately so the caller can show it.
+    """
+    target = (currency or "").strip().upper()
+    result = {
+        "available": False,
+        "cash": None,
+        "currency": target,
+        "committed": None,
+        "matched_accounts": 0,
+        "source": "estadocuenta",
+    }
+    if not target or not isinstance(payload, dict):
+        return result
+
+    def to_float(value) -> float | None:
+        if value is None or value == "" or isinstance(value, bool):
+            return None
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        return num if math.isfinite(num) else None
+
+    cuentas = payload.get("cuentas")
+    if isinstance(cuentas, dict):
+        cuentas = [cuentas]
+    if not isinstance(cuentas, list):
+        return result
+
+    total: float | None = None
+    committed_total: float | None = None
+    matched = 0
+
+    for cuenta in cuentas:
+        if not isinstance(cuenta, dict):
+            continue
+        if _map_currency(cuenta.get("moneda")) != target:
+            continue
+        matched += 1
+
+        account_available: float | None = None
+        saldos = cuenta.get("saldos")
+        if isinstance(saldos, list):
+            for saldo in saldos:
+                if not isinstance(saldo, dict):
+                    continue
+                candidate = to_float(saldo.get("disponibleOperar"))
+                if candidate is None:
+                    candidate = to_float(saldo.get("disponible"))
+                if candidate is None:
+                    continue
+                # Immediate settlement is the only bucket usable right now.
+                liquidacion = str(saldo.get("liquidacion") or "").strip().lower()
+                if liquidacion and liquidacion not in {"inmediato", "immediate", "0", "t0"}:
+                    continue
+                account_available = candidate if account_available is None else min(
+                    account_available, candidate
+                )
+                comp = to_float(saldo.get("comprometido"))
+                if comp is not None:
+                    committed_total = comp if committed_total is None else committed_total + comp
+
+        if account_available is None:
+            for key in ("disponibleOperar", "disponible", "saldoDisponible"):
+                account_available = to_float(cuenta.get(key))
+                if account_available is not None:
+                    break
+        if account_available is None:
+            # An account in the right currency whose balance we cannot read
+            # makes the whole answer untrustworthy — never treat it as zero.
+            return {**result, "matched_accounts": matched}
+
+        total = account_available if total is None else total + account_available
+
+    if matched == 0 or total is None:
+        return {**result, "matched_accounts": matched}
+
+    return {
+        **result,
+        "available": True,
+        "cash": total,
+        "committed": committed_total,
+        "matched_accounts": matched,
+    }
 
 
 def _normalize_asset_type(iol_tipo: str) -> str:
@@ -544,6 +658,32 @@ class IolBrokerClient(BrokerClient):
             "source": "bid" if side == "sell" else "ask",
         }
 
+    def get_live_cash(self, currency: str) -> dict:
+        """Live available balance in ONE currency, read right before a buy.
+
+        Any failure (network, auth, unreadable body, currency not present in
+        the account) yields available=False. The caller must block with
+        live_cash_unavailable — a snapshot cash figure is never a substitute.
+        """
+        retrieved_at = datetime.now(timezone.utc).isoformat()
+        base = {
+            "available": False,
+            "cash": None,
+            "currency": (currency or "").strip().upper(),
+            "committed": None,
+            "retrieved_at": retrieved_at,
+            "source": "estadocuenta",
+        }
+        try:
+            resp = self._authorized_get("/api/v2/estadocuenta")
+            data = resp.json()
+        except Exception:
+            return base
+        if not isinstance(data, dict):
+            return base
+        parsed = map_iol_estadocuenta_by_currency(data, currency)
+        return {**base, **parsed, "retrieved_at": retrieved_at}
+
     def submit_order_request(self, order_request: dict) -> dict:
         """Submit a canonical form-urlencoded order request (built by
         app.broker.order_request.build_iol_order_request) EXACTLY as given.
@@ -754,4 +894,19 @@ class MockBrokerClient(BrokerClient):
             "retrieved_at": datetime.now(timezone.utc).isoformat(),
             "market": market,
             "settlement": settlement,
+        }
+
+    def get_live_cash(self, currency: str) -> dict:
+        """Mock balance — matches the mock snapshot's own currency only, so a
+        currency mismatch is still exercised end to end without IOL."""
+        target = (currency or "").strip().upper()
+        snapshot = self.get_portfolio_snapshot()
+        matches = target == (snapshot.get("currency") or "").strip().upper()
+        return {
+            "available": matches,
+            "cash": float(snapshot.get("cash") or 0.0) if matches else None,
+            "currency": target,
+            "committed": 0.0 if matches else None,
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+            "source": "mock",
         }

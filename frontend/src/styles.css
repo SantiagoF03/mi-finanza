@@ -302,3 +302,34 @@ li { margin-bottom: 4px; }
   color: var(--primary);
   border-bottom-color: var(--primary);
 }
+
+/* Operation badges — buy / sell / FCI subscribe / FCI redeem must be
+   visually distinguishable at a glance in the review screen. */
+.op-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  vertical-align: middle;
+}
+
+.op-badge.op-buy {
+  background: #e6f4ea;
+  color: #1e7d3a;
+}
+
+.op-badge.op-sell {
+  background: #fdecea;
+  color: #b3261e;
+}
+
+/* Fund operations are not executable from the app — a deliberately neutral,
+   non-actionable colour keeps them from reading as a live order. */
+.op-badge.op-subscribe,
+.op-badge.op-redeem {
+  background: #eceff1;
+  color: #455a64;
+  border: 1px dashed #90a4ae;
+}
