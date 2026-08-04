@@ -148,15 +148,36 @@ estampaba `superseded_at` + metadata pero dejaba la recomendación previa en
 `pending`, lo que podía dejar dos recomendaciones abiertas a la vez. Ese
 helper fue eliminado.
 
-## Consumo transaccional de eventos
+## Asociación atómica de eventos (un solo commit)
 
-`consume_recalc_events(db, events, cycle_result)` es el **único** punto de
-consumo, usado por `scheduled_ingestion` **y** `scheduled_full_cycle` (antes
-el full cycle no consumía nada, así que sus eventos quedaban pendientes y
-podían generar una recomendación duplicada). Marca `triggered_recalc=True` y
-`recalc_recommendation_id` **solo** cuando el ciclo devolvió
-`recommendation_id`; en skip, cooldown, lease no disponible o error no
-consume nada, y ambos campos se commitean juntos.
+`Recommendation`, sus `RecommendationAction` y los `MarketEvent`
+incorporados se confirman en **un único commit**, dentro de
+`_run_cycle_locked`:
+
+```
+verify_can_persist_recommendation()     # lease + gate
+incorporated_events = get_pending_recalc_events(db)   # DESPUÉS de la ingesta interna
+db.add(rec_model); db.flush()           # obtiene recommendation_id, sin commit
+db.add(RecommendationAction ...)
+evt.triggered_recalc = True; evt.recalc_recommendation_id = rec_model.id
+db.commit()                             # <-- EL único commit
+```
+
+Antes había **dos** commits: el orquestador commiteaba la recomendación y
+después los jobs commiteaban los eventos con `consume_recalc_events`. Una
+caída entre ambos dejaba una recomendación con sus eventos todavía
+pendientes, y al resolverla esos mismos eventos podían generar una
+recomendación duplicada. Ese helper fue **eliminado**; los jobs ya no hacen
+ningún commit de eventos.
+
+Los eventos se leen **después** del `run_ingestion` interno de `run_cycle`,
+así que los que crea esa ingesta también quedan asociados (los jobs los
+capturaban antes del ciclo y los perdían). El análisis manual usa el mismo
+camino, con la misma atomicidad.
+
+**Rollback**: si el commit falla, `db.rollback()` y se devuelve un skip
+`recommendation_creation_conflict`. No sobrevive ninguna recomendación, ni
+acciones, ni eventos consumidos.
 
 ## Notificaciones
 
@@ -177,12 +198,37 @@ persistidos:
 | `review_notification_delivered_at` | ISO, solo en `delivered` |
 
 `review_notification_sent=True` se escribe **únicamente** en entrega real.
+
+### Reintento productivo
+
+`retry_pending_review_notifications(db)` corre al inicio de cada job del
+scheduler y **consulta la base**, no un `cycle_result` en memoria: el ciclo
+que creó la recomendación ya terminó y los ciclos siguientes quedan skipped
+por esa misma recomendación, así que nunca volverían a llamar al notifier.
+
+Reintenta recomendaciones abiertas con notificación `pending`, `failed`,
+nunca intentada, o `disabled` una vez que las notificaciones se habilitan.
+Con `notification_enabled=false` **no hace nada y no escribe nada** — no
+consume intentos ni toca la recomendación. Con `SCHEDULER_ENABLED=false` no
+existe ningún job, así que tampoco hay retry.
+
+**Compatibilidad legacy**: una recomendación con solo
+`review_notification_sent=true` (sin `review_notification_status`) se
+interpreta como **delivered**, para no re-notificar. Un status explícito
+(`pending`/`failed`/`disabled`) siempre gana sobre el flag viejo.
 Notificaciones deshabilitadas, excepciones y `sent=0` dejan un estado
 reintentable con cooldown de 300 s y máximo 3 intentos — el reintento aplica
 **solo al transporte**; el análisis y la ejecución nunca se reintentan. Un
 ciclo con skip no notifica.
 
 ## Observabilidad
+
+`record_cycle_outcome(result, source, job)` y `record_cycle_error(exc, source,
+job)` son el **único** punto de registro, usado por `scheduled_ingestion`,
+`scheduled_full_cycle` **y** `POST /api/analysis/run` (que antes no
+registraba nada). En éxito limpian `last_error` y los bloqueos obsoletos; en
+error setean `last_status=error` con su `last_source` y `last_job` reales.
+El status nunca mezcla datos de ejecuciones distintas.
 
 `last_status` distingue `created` / `skipped` / `error` / `no_cycle_needed`
 (antes decía `ok` incluso en skips) y `last_source` conserva el source real
