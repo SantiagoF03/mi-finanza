@@ -254,25 +254,94 @@ def test_scheduler_registers_premarket_ingestion_relative_to_1030():
         assert _cron_field(jobs_by_id["premarket_15"], "minute") == "15"
 
 
-def test_in_session_ingestion_lands_on_the_1030_grid():
-    """Slots follow the session grid, not a fixed hour grid.
+def _market_hours_slots(jobs_by_id) -> list[tuple[int, int]]:
+    """Every (hour, minute) the market-hours job(s) will actually fire at."""
+    slots = []
+    for job_id, job in jobs_by_id.items():
+        if not job_id.startswith("market_hours_ingestion"):
+            continue
+        minutes = [int(m) for m in _cron_field(job, "minute").split(",")]
+        hours = [int(h) for h in _cron_field(job, "hour").split(",")]
+        for hour in hours:
+            for minute in minutes:
+                slots.append((hour, minute))
+    return sorted(slots)
 
-    For a 10:30 open on a 30-minute interval the grid is :00/:30, which
-    already contains 10:30 — so the expression stays `*/30`. The extra 10:00
-    slot falls inside the premarket window, where ingestion is wanted anyway.
-    """
+
+def test_market_hours_job_never_fires_at_1000():
+    """REGRESSION: `minute=*/30, hour=10-16` also fires at 10:00 — half an
+    hour BEFORE the open — and that run then reports itself as market-hours
+    ingestion. The slots are enumerated now, so 10:00 cannot appear."""
     with _started_scheduler() as jobs_by_id:
-        job = jobs_by_id["market_hours_ingestion"]
-        assert _cron_field(job, "minute") == "*/30"
-        assert _cron_field(job, "hour") == "10-16"
+        slots = _market_hours_slots(jobs_by_id)
+    assert (10, 0) not in slots, f"10:00 is before the 10:30 open: {slots}"
 
 
-def test_in_session_grid_is_offset_for_a_non_aligned_open():
-    """A 10:20 open on a 30-minute interval must fire at :20 and :50 —
-    never on the untouched :00/:30 hour grid."""
+def test_first_market_slot_is_exactly_1030():
+    with _started_scheduler() as jobs_by_id:
+        slots = _market_hours_slots(jobs_by_id)
+    assert slots[0] == (10, 30)
+
+
+def test_market_slots_are_exactly_the_session_grid():
+    """10:30 … 16:30 inclusive, nothing before the open, nothing at/after
+    the 17:00 close."""
+    with _started_scheduler() as jobs_by_id:
+        slots = _market_hours_slots(jobs_by_id)
+
+    expected = [(10, 30)]
+    minute_of_day = 10 * 60 + 30 + 30
+    while minute_of_day < 17 * 60:
+        expected.append((minute_of_day // 60, minute_of_day % 60))
+        minute_of_day += 30
+    assert slots == sorted(expected)
+    assert slots[-1] == (16, 30)
+    assert all((h * 60 + m) < 17 * 60 for h, m in slots)
+
+
+def test_session_slots_for_a_non_aligned_open():
+    """A 10:20 open on a 30-minute interval fires at :20 and :50 only."""
     with _started_scheduler(scheduler_market_open_time="10:20") as jobs_by_id:
-        job = jobs_by_id["market_hours_ingestion"]
-        assert _cron_field(job, "minute") == "20-59/30"
+        slots = _market_hours_slots(jobs_by_id)
+    assert slots[0] == (10, 20)
+    assert {m for _h, m in slots} == {20, 50}
+    assert (10, 0) not in slots
+
+
+def test_session_ingestion_slots_helper_is_exact():
+    from app.market.calendar import session_ingestion_slots
+
+    with exec_settings(**_byma()):
+        slots = session_ingestion_slots(get_settings(), 30)
+    assert slots[0] == (10, 30)
+    assert slots[-1] == (16, 30)
+    assert (10, 0) not in slots
+    assert len(slots) == 13
+
+
+def test_market_hours_job_skips_when_the_session_is_closed():
+    """Defence in depth: a misfire grace period or a DST shift could still
+    fire the job outside the session. A job that calls itself market-hours
+    must actually run during market hours."""
+    from app.scheduler import jobs
+
+    closed = {"open": False, "code": "market_closed", "reason": "holiday"}
+    with exec_settings(**_byma()):
+        with mock.patch("app.market.calendar.market_session_state", return_value=closed), \
+             mock.patch.object(jobs, "scheduled_ingestion") as inner:
+            jobs.scheduled_market_hours_ingestion()
+    inner.assert_not_called()
+
+
+def test_market_hours_job_runs_when_the_session_is_open():
+    from app.scheduler import jobs
+
+    open_state = {"open": True, "code": None}
+    with exec_settings(**_byma()):
+        with mock.patch("app.market.calendar.market_session_state", return_value=open_state), \
+             mock.patch.object(jobs, "scheduled_ingestion") as inner:
+            jobs.scheduled_market_hours_ingestion()
+    inner.assert_called_once()
 
 
 def test_last_check_is_before_close_and_full_cycle_after():
@@ -330,7 +399,8 @@ _FORBIDDEN_EXECUTION_SYMBOLS = {
     "reconcile_execution", "OrderExecution", "_get_execution_broker",
     "_submit_prepared_order", "prepare_validated_execution_batch",
     # New capabilities must be just as unreachable from automatic modules.
-    "consume_daily_budget", "evaluate_buy_cash", "get_live_cash",
+    "reserve_daily_budget", "evaluate_buy_cash", "get_live_cash",
+    "cancel_order", "cancel_execution", "submit_fund_operation",
     "refresh_execution_catalog", "upsert_instrument",
     "fci_execution_blocked", "_preflight_one_order",
 }

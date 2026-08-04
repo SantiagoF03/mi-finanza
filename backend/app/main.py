@@ -55,6 +55,62 @@ def _patch_schema(engine_ref):
                     "ALTER TABLE recommendation_actions ADD COLUMN quantity_override INTEGER"
                 ))
 
+    # 3b. execution_instruments verification columns (added after PR #138
+    #     shipped the table without them). Nullable/defaulted, so existing
+    #     rows keep working — they simply start as `candidate`, i.e. NOT
+    #     executable until verified. That is the fail-closed direction.
+    if "execution_instruments" in existing_tables:
+        columns = {c["name"] for c in inspector.get_columns("execution_instruments")}
+        additions = {
+            "verification_status": "VARCHAR(20) DEFAULT 'candidate'",
+            "field_provenance": "JSON",
+            "pending_identity": "JSON",
+            "previous_identity": "JSON",
+            "identity_changed_at": "DATETIME",
+            "verification_audit": "JSON",
+        }
+        for column, ddl in additions.items():
+            if column not in columns:
+                with engine_ref.begin() as conn:
+                    conn.execute(text(
+                        f"ALTER TABLE execution_instruments ADD COLUMN {column} {ddl}"
+                    ))
+        # Pre-existing rows must NOT be grandfathered into `verified`: an
+        # entry whose tick came from a class default was never verified by
+        # anyone. SQLite's ADD COLUMN ... DEFAULT backfills existing rows, and
+        # the read path treats NULL/empty as `candidate` anyway — so no
+        # rewrite of existing data is needed, and none is performed.
+
+    # 3c. execution_daily_notional uniqueness (trade_date, execution_class,
+    #     currency). The table may already exist from PR #138 WITHOUT the
+    #     constraint, and SQLite cannot ADD CONSTRAINT — a unique INDEX is the
+    #     additive, idempotent equivalent.
+    #
+    #     If duplicates already exist we FAIL CLOSED and report, rather than
+    #     merging or deleting rows: those numbers gate real money, and
+    #     silently collapsing them could either hide spent budget or restore
+    #     allowance that was legitimately consumed.
+    if "execution_daily_notional" in existing_tables:
+        index_names = {ix["name"] for ix in inspector.get_indexes("execution_daily_notional")}
+        if "uq_execution_daily_notional_scope" not in index_names:
+            with engine_ref.begin() as conn:
+                duplicates = conn.execute(text(
+                    "SELECT trade_date, execution_class, currency, COUNT(*) AS n "
+                    "FROM execution_daily_notional "
+                    "GROUP BY trade_date, execution_class, currency HAVING n > 1"
+                )).fetchall()
+                if duplicates:
+                    raise RuntimeError(
+                        "execution_daily_notional has duplicate "
+                        "(trade_date, execution_class, currency) rows and cannot be "
+                        "made unique automatically. These rows gate real spending "
+                        f"limits and must be reconciled by hand: {duplicates!r}"
+                    )
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_execution_daily_notional_scope "
+                    "ON execution_daily_notional (trade_date, execution_class, currency)"
+                ))
+
     # 4. execution_instruments / execution_daily_notional — new tables only.
     #    create_all() already made them; nothing here rewrites or drops data.
     #

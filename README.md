@@ -125,17 +125,50 @@ Se alimenta con datos **read-only** del broker (la cartera real informa
 generado por un LLM: una cadena generada no puede declarar moneda, mercado ni
 tick.
 
-Una entrada sólo sirve si está **completa, activa y fresca**. Si no:
+### Estados de verificación
 
-| Código | Significado |
+Que un campo esté **presente** no es lo mismo que esté **verificado**. Cada
+entrada lleva un `verification_status` y una **procedencia por campo**:
+
+| Estado | Puede operar |
 |---|---|
-| `instrument_catalog_missing` | No hay entrada para el símbolo |
-| `instrument_catalog_incomplete` | Falta identidad, tick o step |
-| `instrument_catalog_stale` | La verificación venció |
-| `instrument_inactive` | Dada de baja |
-| `instrument_class_unsupported` | No mapea a ninguna clase operable |
+| `candidate` | ❌ resuelto read-only, todavía sin verificar |
+| `verified` | ✅ cada campo operativo tiene procedencia confiable |
+| `identity_changed` | ❌ congelado hasta decisión humana |
+| `rejected` | ❌ un humano lo rechazó |
+| `stale` | ❌ la verificación venció |
 
-No hay wildcard: un símbolo sin catálogo verificado **no se opera**.
+Procedencias que **cuentan** como verificación: `iol_portfolio`,
+`iol_title_detail`, `iol_quote`, `iol_fci_catalog`, `admin_verified_override`.
+**`class_policy_default` NO cuenta**: una política aporta un límite, pero
+nunca miró el instrumento y no puede afirmar que verificó su tick, su moneda
+ni sus capacidades.
+
+`buy_supported` / `sell_supported` **no se infieren por familia**: tener algo
+en cartera no prueba que se pueda comprar, vender o cotizar. Hace falta
+evidencia (una cotización real).
+
+### Cambio de identidad
+
+Si cambia moneda, tipo, mercado, plazo o símbolo, la entrada **no se
+sobrescribe**: se guarda la identidad anterior y la propuesta, pasa a
+`identity_changed`, se bloquean compra y venta, y `verified_at` **no** se
+toca. Un refresh automático posterior **no** puede resolverlo — hace falta
+`POST /api/broker/instruments/{symbol}/identity-decision`. Aceptar devuelve la
+entrada a `candidate`, no a `verified`: lo verificado bajo la identidad
+anterior ya no aplica.
+
+### Instrumentos no tenidos
+
+`POST /api/broker/instruments/resolve` resuelve read-only un símbolo que
+todavía no está en cartera, usando sólo endpoints oficiales de títulos y
+cotizaciones. Sólo se resuelven símbolos que ya están en una fuente acotada
+(recomendación abierta, watchlist, universo habilitado, posición): **un
+símbolo nunca es operable sólo porque alguien lo escribió**.
+
+Otros bloqueos: `instrument_catalog_missing`, `instrument_catalog_incomplete`,
+`instrument_catalog_stale`, `instrument_not_verified`, `instrument_inactive`,
+`instrument_class_unsupported`. No hay wildcard.
 
 ### 2. Políticas por clase (`EXECUTION_CLASS_POLICIES`)
 
@@ -146,7 +179,7 @@ no requiere escribir nada nuevo.
 |---|---|---|
 | `ACCIONES` | `securities` | operable |
 | `CEDEARS` | `securities` | operable |
-| `FCI` | `fund` | **no operable** (ver abajo) |
+| `FCI` | `fund` | contrato propio, apagado (ver abajo) |
 
 Cada política define: `buy_enabled`, `sell_enabled`, `currencies`, `markets`,
 `settlements`, `max_order_notional`, `max_daily_notional`, `max_quantity`,
@@ -219,28 +252,78 @@ El límite diario se consume **sólo en el punto de no retorno** (cuando la
 orden se commitea como `submitting`), así que un preflight bloqueado nunca
 gasta presupuesto del día.
 
-## FCI: análisis sí, ejecución no
+### Límite diario resistente a concurrencia
+
+`ExecutionDailyNotional` tiene unicidad real por
+`(trade_date, execution_class, currency)` y la reserva es **atómica**:
+
+```sql
+UPDATE ... SET submitted = submitted + :amt
+WHERE clave = ... AND submitted + :amt <= :limit
+```
+
+La aritmética y la comparación ocurren **dentro de la base**. Dos aprobaciones
+simultáneas que en un `SELECT` verían presupuesto disponible no pueden ganar
+ambas este `UPDATE`. Sin la unicidad, cada proceso insertaría su propia fila y
+se creería dueño de todo el cupo diario — exactamente el bug que la restricción
+existe para impedir.
+
+ARS y USD **no comparten ledger**, ni las clases entre sí, ni los días. Las
+compras pendientes se agrupan por **moneda y fecha operativa**: una compra en
+dólares ya no recorta el cupo en pesos, y una operación sin conciliar de hace
+un mes ya no reserva plata para siempre (se reporta aparte como
+`stale_pending_buys`).
+
+Una cancelación **no libera** presupuesto automáticamente: al enterarnos casi
+nunca podemos probar que la orden no consumió nada en el broker. Liberar es un
+acto administrativo explícito con motivo registrado.
+
+## FCI: familia separada con contrato oficial
+
+Los endpoints de FCI **son oficiales** y están implementados como una familia
+aparte — nunca sobre `OrderExecution`:
 
 ```
-fci_execution_supported = false
-bloqueo                 = fci_not_supported_by_iol_api
+GET  /api/v2/Titulos/FCI              catálogo de fondos
+GET  /api/v2/Titulos/FCI/{simbolo}    detalle
+POST /api/v2/operar/suscripcion/fci   suscripción
+POST /api/v2/operar/rescate/fci       rescate
 ```
 
-La API oficial de IOL **no expone un contrato verificado** de suscripción ni
-rescate de FCI, y los endpoints no se inventan. Por lo tanto la app:
+Modelos propios: `FundInstrument`, `FundOperation`, `FundOperationDecision`,
+con máquina de estados asincrónica (`prepared` → … → `pending_confirmation` →
+`confirmed`). **No existe el estado `executed`**: "enviada" nunca significa
+"ejecutada", porque el fondo confirma después, a un valor de cuotaparte que al
+enviar no existía.
 
-- ✅ analiza, muestra y recomienda FCI;
-- ✅ genera un **preview informativo** (sin precio límite, sin punta, sin
-  step — un fondo no tiene nada de eso) con el **cutoff propio del fondo** y
-  el plazo estimado;
-- ✅ indica operar manualmente en IOL;
-- ❌ **nunca** simula que puede enviar la operación;
-- ❌ un FCI no puede generar un `OrderExecution` ni viajar por el contrato de
-  títulos.
+Un FCI no tiene precio límite, punta, tick ni lote — el preview los expone
+como `None` por construcción. El **cutoff es por fondo**
+(`FundInstrument.cutoff_local_time`), leído del catálogo: no hay 15:00
+hardcodeado.
 
-Encender `FCI_SUBSCRIPTION_ENABLED` / `FCI_REDEMPTION_ENABLED` **no habilita
-nada**: `ready_for_real_fci_*` es `false` incondicionalmente mientras el
-contrato no esté verificado. Ver `docs/IOL_FCI_CAPABILITY.md`.
+**FCI sigue apagado en producción.** Encender los flags no alcanza: hace falta
+además `FCI_REQUEST_CONTRACT_VERIFIED=True`, hoy `False` porque los **nombres
+de campo** del request no están verificados en este repo y no se inventan (el
+armado falla cerrado con `fci_request_contract_unverified`). Ver
+`docs/IOL_FCI_CAPABILITY.md`.
+
+## Cancelación real de órdenes
+
+```
+DELETE /api/v2/operaciones/{numeroOperacion}
+```
+
+Con flag propio `ORDER_CANCELLATION_ENABLED=false`: poder enviar una orden no
+dice nada sobre poder cancelarla. Flujo: preview firmado que lee el estado
+**fresco** en IOL → `X-Execution-Key` + frase `CANCELAR EJECUCION {id}` →
+**exactamente un DELETE**, reclamado atómicamente.
+
+Nunca automática, nunca desde el scheduler ni el LLM. Un timeout o 5xx queda
+en `cancellation_unknown` y **jamás se reintenta**: reenviar un DELETE que no
+podemos probar que falló arriesga cancelar una orden **distinta y posterior**.
+
+`confirm_cancelled` conserva su significado original — registrar que un humano
+canceló en el panel de IOL — y **no** envía el DELETE.
 
 ## Calendario y horarios (minutos, no sólo horas)
 
@@ -255,10 +338,13 @@ MARKET_HOLIDAYS=
 **deprecadas** (sólo horas enteras, no pueden representar 10:30). Se siguen
 honrando mientras las variables HH:MM estén ausentes.
 
-El cron generado: premarket relativo a 10:30, ingesta durante la rueda sobre
-la grilla de la sesión, un último chequeo **antes** de las 17:00 y el ciclo
-completo después del cierre. Un horario irresoluble **no registra ningún job**
-en vez de adivinar una sesión.
+El cron genera **slots exactos**, enumerados: 10:30, 11:00, 11:30 … 16:30.
+Un `minute=*/30, hour=10-16` también dispara a las **10:00**, media hora antes
+de la apertura, y ese run se reportaba como "market hours" — ese bug está
+corregido y tiene test de regresión. Premarket (09:30, 10:15), último chequeo
+16:55 y ciclo de cierre 17:05 son jobs independientes. El job de rueda además
+**re-verifica la sesión al arrancar** (defensa en profundidad ante misfires o
+DST). Un horario irresoluble **no registra ningún job** en vez de adivinar.
 
 El calendario de títulos (BYMA) y el cutoff de cada FCI son cosas separadas:
 el cutoff vive en la entrada de catálogo del fondo, no en el calendario.
@@ -293,6 +379,12 @@ La app es instalable como PWA (Progressive Web App):
 | GET | `/api/executions/recent` | Ejecuciones recientes |
 | GET | `/api/executions/reconciliation-queue` | Órdenes que requieren conciliación manual |
 | POST | `/api/executions/{id}/reconcile` | Resolución manual (incluye `confirm_cancelled`) |
+| GET | `/api/executions/{id}/cancellation-preview` | Preview firmado de cancelación (no envía DELETE) |
+| POST | `/api/executions/{id}/cancel` | Envía **un** DELETE a IOL |
+| POST | `/api/broker/instruments/resolve` | Resolución read-only de instrumentos no tenidos |
+| POST | `/api/broker/instruments/{symbol}/identity-decision` | Aceptar/rechazar un cambio de identidad |
+| POST | `/api/broker/instruments/{symbol}/verify-fields` | Verificación administrativa de tick/step |
+| GET | `/api/broker/account-status-diagnostic` | Diagnóstico normalizado de `estadocuenta` |
 | POST | `/api/executions/{id}/refresh-broker-status` | Consulta read-only de estado al broker |
 | GET | `/api/executions/{id}` | Detalle de una ejecución |
 | GET | `/api/notifications/settings` | Config de notificaciones |

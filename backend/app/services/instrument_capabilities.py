@@ -217,3 +217,162 @@ def refresh_execution_catalog(db: Session, *, execution_key: str | None) -> dict
     })
     db.commit()
     return {**result, "class_policy_errors": class_errors}
+
+
+# ---------------------------------------------------------------------------
+# Administrative verification actions (read-only w.r.t. orders)
+# ---------------------------------------------------------------------------
+
+
+def _require_execution_key(execution_key: str | None) -> dict | None:
+    settings = get_settings()
+    if not settings.execution_admin_key:
+        return {
+            "error": "Bloqueado: credencial de ejecución no configurada en el servidor.",
+            "code": "execution_admin_key_not_configured",
+            "status_code": 423,
+        }
+    if not execution_key or not _secrets.compare_digest(
+        str(execution_key), settings.execution_admin_key
+    ):
+        return {
+            "error": "Credencial de ejecución inválida o ausente.",
+            "code": "invalid_execution_key",
+            "status_code": 403,
+        }
+    return None
+
+
+def decide_identity_change(
+    db: Session, symbol: str, *, execution_key: str | None, decision: str, note: str = ""
+) -> dict:
+    """Accept or reject a detected identity change. Never sends an order."""
+    from app.broker.instrument_catalog import (
+        STATUS_IDENTITY_CHANGED,
+        accept_identity_change,
+        reject_identity_change,
+        verification_status_of,
+    )
+
+    guard = _require_execution_key(execution_key)
+    if guard:
+        return guard
+    if decision not in ("accept", "reject"):
+        return {"error": f"Decisión inválida: '{decision}'.",
+                "code": "invalid_identity_decision", "status_code": 422}
+
+    entry = get_instrument(db, symbol)
+    if entry is None:
+        return {"error": "Instrument not found in execution catalog", "status_code": 404}
+    if verification_status_of(entry) != STATUS_IDENTITY_CHANGED:
+        return {"error": "El instrumento no tiene un cambio de identidad pendiente.",
+                "code": "no_pending_identity_change", "status_code": 409}
+
+    result = (
+        accept_identity_change(entry, note=note) if decision == "accept"
+        else reject_identity_change(entry, note=note)
+    )
+    app_log(db, "Decisión sobre cambio de identidad de instrumento", context={
+        "symbol": entry.broker_symbol,
+        "decision": decision,
+        "resulting_status": result.get("verification_status"),
+        "source": "manual_user",
+    })
+    db.commit()
+    return {
+        "symbol": entry.broker_symbol,
+        "decision": decision,
+        **result,
+        "unverified_fields": _unverified(entry),
+        "message": (
+            "Identidad aceptada. El instrumento vuelve a 'candidate': lo verificado "
+            "bajo la identidad anterior ya no aplica."
+            if decision == "accept"
+            else "Identidad rechazada. El instrumento queda inoperable hasta re-resolverlo."
+        ),
+    }
+
+
+def verify_instrument_fields(
+    db: Session, symbol: str, *, execution_key: str | None, fields: dict, note: str = ""
+) -> dict:
+    """Administratively verify tick/step/capabilities for ONE instrument."""
+    from app.broker.instrument_catalog import PROV_ADMIN_OVERRIDE, verify_fields
+
+    guard = _require_execution_key(execution_key)
+    if guard:
+        return guard
+
+    entry = get_instrument(db, symbol)
+    if entry is None:
+        return {"error": "Instrument not found in execution catalog", "status_code": 404}
+    if not isinstance(fields, dict) or not fields:
+        return {"error": "Se requiere al menos un campo a verificar.",
+                "code": "no_fields_provided", "status_code": 422}
+
+    result = verify_fields(
+        entry, fields=fields, provenance_source=PROV_ADMIN_OVERRIDE, note=note
+    )
+    if not result.get("changed"):
+        return {"error": f"No se pudo verificar: {result.get('reason')}.",
+                "code": result.get("reason", "verification_failed"), "status_code": 422}
+
+    app_log(db, "Verificación administrativa de campos de instrumento", context={
+        "symbol": entry.broker_symbol,
+        "fields": sorted(result.get("applied", {}).keys()),
+        "source": "manual_user",
+    })
+    db.commit()
+    return {"symbol": entry.broker_symbol, **result}
+
+
+def resolve_instruments(
+    db: Session, *, symbols: list[str], execution_key: str | None
+) -> dict:
+    """Resolve not-held instruments read-only into CANDIDATE entries."""
+    from app.broker.instrument_resolver import resolve_missing_instruments
+
+    guard = _require_execution_key(execution_key)
+    if guard:
+        return guard
+
+    settings = get_settings()
+    from app.services.orchestrator import _get_broker
+
+    try:
+        broker = _get_broker()
+    except Exception as exc:
+        return {"error": f"No se pudo instanciar el broker: {str(exc)[:200]}",
+                "code": "broker_unavailable", "status_code": 502}
+
+    return resolve_missing_instruments(
+        db, symbols=symbols or [], broker=broker, settings=settings
+    )
+
+
+def account_status_diagnostic(*, execution_key: str | None) -> dict:
+    """Normalized estadocuenta diagnosis. Never returns the raw payload."""
+    from app.broker.account_status import diagnose_account_status
+
+    guard = _require_execution_key(execution_key)
+    if guard:
+        return guard
+
+    from app.services.orchestrator import _get_broker
+
+    try:
+        broker = _get_broker()
+        payload = broker.get_account_status_raw()
+    except Exception as exc:
+        return {"error": f"No se pudo leer el estado de cuenta: {str(exc)[:200]}",
+                "code": "account_status_unavailable", "status_code": 502}
+
+    diagnosis = diagnose_account_status(payload)
+    # Deliberately NOT echoing the payload: it carries account numbers.
+    return {**diagnosis, "raw_payload_returned": False}
+
+
+def _unverified(entry) -> list[str]:
+    from app.broker.instrument_catalog import unverified_fields
+
+    return unverified_fields(entry)

@@ -1,6 +1,16 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -352,19 +362,55 @@ class ExecutionInstrument(Base):
     # entry unverified again instead of silently drifting.
     raw_identity_hash: Mapped[str] = mapped_column(String(64), default="")
     raw_identity: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    # --- Verification lifecycle -------------------------------------------
+    # candidate         resolved read-only, NOT yet executable
+    # verified          every operative field has a trustworthy provenance
+    # identity_changed  the broker now describes something different →
+    #                   frozen until a human accepts or rejects the change
+    # rejected          a human refused it
+    # stale             verification expired
+    # Only `verified` (plus active + fresh) may authorise an order.
+    verification_status: Mapped[str] = mapped_column(String(20), default="candidate", index=True)
+    # Per-field provenance, e.g. {"currency": "iol_portfolio",
+    # "price_tick": "admin_verified_override"}. A class policy may supply a
+    # LIMIT but may never claim it verified an instrument's identity.
+    field_provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    # When verification_status=identity_changed: what we had vs what the
+    # broker now reports. Neither is discarded — a human decides.
+    pending_identity: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    previous_identity: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    identity_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Append-only record of human verification decisions.
+    verification_audit: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ExecutionDailyNotional(Base):
-    """Per-day, per-class submitted notional — backs max_daily_notional.
+    """Per-day, per-class, per-CURRENCY submitted notional.
 
-    Incremented ONLY at the moment an order is committed as 'submitting'
-    (the point of no return), so a blocked or cancelled preflight never
-    consumes daily budget.
+    Backs max_daily_notional. Incremented ONLY at the moment an order is
+    committed as 'submitting' (the point of no return), so a blocked or
+    cancelled preflight never consumes daily budget.
+
+    CONCURRENCY: the unique constraint is what makes the budget safe. Without
+    it two processes can each insert their own row for the same key and each
+    believe the whole daily allowance is theirs. With it, the losing INSERT
+    raises IntegrityError and is forced through the conditional UPDATE, which
+    carries the limit in its WHERE clause.
+
+    Currency is part of the key: ARS and USD are different budgets and adding
+    them together produces a number that means nothing.
     """
 
     __tablename__ = "execution_daily_notional"
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_date", "execution_class", "currency",
+            name="uq_execution_daily_notional_scope",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # Local (America/Argentina/Buenos_Aires) operating day, YYYY-MM-DD.
@@ -374,6 +420,98 @@ class ExecutionDailyNotional(Base):
     submitted_notional: Mapped[float] = mapped_column(Float, default=0.0)
     order_count: Mapped[int] = mapped_column(Integer, default=0)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# FCI — Fondos Comunes de Inversión.
+#
+# A SEPARATE family with its own contract. A fund is subscribed or redeemed
+# by AMOUNT (or cuotapartes) at a valuation that does not exist yet; it has no
+# limit price, no order book and no tick. Reusing OrderExecution for it would
+# mean carrying meaningless fields and, worse, letting fund state transitions
+# ride on securities semantics.
+# ---------------------------------------------------------------------------
+
+
+class FundInstrument(Base):
+    """A fund, as identified by IOL's own FCI catalog."""
+
+    __tablename__ = "fund_instruments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(30), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(200), default="")
+    # Administradora / management company.
+    manager: Mapped[str] = mapped_column(String(200), default="")
+    currency: Mapped[str] = mapped_column(String(10), default="")
+    # Per-FUND cutoff: never hardcoded, never shared between funds.
+    cutoff_local_time: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    settlement_delay_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    minimum_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    minimum_redemption: Mapped[float | None] = mapped_column(Float, nullable=True)
+    subscription_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    redemption_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    verification_status: Mapped[str] = mapped_column(String(20), default="candidate", index=True)
+    field_provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(50), default="")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    stale_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    raw_detail: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class FundOperation(Base):
+    """One subscription or redemption. NEVER an OrderExecution.
+
+    States (asynchronous by nature — a fund confirms later, at a valuation
+    that did not exist when we submitted):
+
+        prepared → validation_requested → validated → approval_requested
+        → submitting → submitted → pending_confirmation → confirmed
+        | rejected | cancelled | submission_unknown | reconciliation_required
+    """
+
+    __tablename__ = "fund_operations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    recommendation_id: Mapped[int | None] = mapped_column(ForeignKey("recommendations.id"), nullable=True)
+    fund_symbol: Mapped[str] = mapped_column(String(30), index=True)
+    # "subscribe" | "redeem" — never buy/sell.
+    operation: Mapped[str] = mapped_column(String(20))
+    currency: Mapped[str] = mapped_column(String(10), default="")
+    # Amount OR cuotapartes, per the operation's contract. Exactly one is set.
+    amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quotaparts: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="prepared", index=True)
+    # IOL's own request identifier, when it returns one.
+    broker_operation_id: Mapped[str] = mapped_column(String(100), default="")
+    # Result of the soloValidar pre-check, when the contract offers it.
+    validation_result: Mapped[dict] = mapped_column(JSON, default=dict)
+    broker_response: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    blocked_reason: Mapped[str] = mapped_column(Text, default="")
+    preview_hash: Mapped[str] = mapped_column(String(64), default="")
+    cutoff_local_time: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    settlement_delay_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class FundOperationDecision(Base):
+    """The human decision that authorised a FundOperation."""
+
+    __tablename__ = "fund_operation_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fund_operation_id: Mapped[int] = mapped_column(ForeignKey("fund_operations.id"))
+    decision: Mapped[str] = mapped_column(String(20))  # approved | rejected
+    note: Mapped[str] = mapped_column(Text, default="")
+    preview_hash: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 # ---------------------------------------------------------------------------

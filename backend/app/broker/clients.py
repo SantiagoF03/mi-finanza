@@ -621,6 +621,75 @@ class IolBrokerClient(BrokerClient):
         except Exception as exc:
             return {"order_id": order_id, "status": "error", "error": str(exc)}
 
+    def cancel_order(self, order_id: str) -> dict:
+        """DELETE /api/v2/operaciones/{numero} — cancel ONE live order.
+
+        Sent AT MOST ONCE by the caller; this method never retries. Typed
+        outcome, mirroring submit_order_request:
+
+        - "cancelled": 2xx, IOL accepted the cancellation
+        - "rejected":  4xx after auth handling — evaluated and refused
+          (already executed, already cancelled, unknown operation)
+        - "cancellation_unknown": timeout / connection error / 5xx — the
+          DELETE may have been applied. NEVER re-send; reconcile manually.
+        """
+        endpoint = f"/api/v2/operaciones/{order_id}"
+        url = f"{self.api_base}{endpoint}"
+
+        # An auth failure BEFORE the DELETE is definitive: nothing was sent.
+        try:
+            self._ensure_auth()
+        except Exception as exc:
+            return {
+                "outcome": "rejected",
+                "endpoint_used": endpoint,
+                "raw_response": {},
+                "error": f"Auth failed before cancellation: {str(exc)[:200]}",
+            }
+
+        def _delete() -> httpx.Response:
+            return self._client.delete(
+                url, headers={"Authorization": f"Bearer {self._access_token}"}
+            )
+
+        try:
+            resp = _delete()
+            if resp.status_code in {401, 403} and self._refresh_access_token():
+                resp = _delete()
+        except Exception as exc:
+            return {
+                "outcome": "cancellation_unknown",
+                "endpoint_used": endpoint,
+                "raw_response": {},
+                "error": f"Network failure during cancellation: {str(exc)[:200]}",
+            }
+
+        try:
+            raw = resp.json()
+        except Exception:
+            raw = {"status_code": resp.status_code}
+
+        if 200 <= resp.status_code < 300:
+            return {
+                "outcome": "cancelled",
+                "endpoint_used": endpoint,
+                "raw_response": raw,
+                "error": "",
+            }
+        if 400 <= resp.status_code < 500:
+            return {
+                "outcome": "rejected",
+                "endpoint_used": endpoint,
+                "raw_response": raw,
+                "error": f"HTTP {resp.status_code}: cancellation not accepted.",
+            }
+        return {
+            "outcome": "cancellation_unknown",
+            "endpoint_used": endpoint,
+            "raw_response": raw,
+            "error": f"HTTP {resp.status_code}: cancellation outcome unknown.",
+        }
+
     def get_execution_quote(self, symbol: str, side: str, market: str, settlement: str) -> dict:
         """Executable quote: best bid for sell, best ask for buy.
 
@@ -681,8 +750,20 @@ class IolBrokerClient(BrokerClient):
             return base
         if not isinstance(data, dict):
             return base
-        parsed = map_iol_estadocuenta_by_currency(data, currency)
+        from app.broker.account_status import available_for_currency
+
+        parsed = available_for_currency(data, currency)
         return {**base, **parsed, "retrieved_at": retrieved_at}
+
+    def get_account_status_raw(self) -> dict:
+        """READ-ONLY estadocuenta payload, for contract diagnosis only.
+
+        Returned to the diagnostic endpoint, which normalizes it and never
+        echoes it back verbatim.
+        """
+        resp = self._authorized_get("/api/v2/estadocuenta")
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
 
     def submit_order_request(self, order_request: dict) -> dict:
         """Submit a canonical form-urlencoded order request (built by

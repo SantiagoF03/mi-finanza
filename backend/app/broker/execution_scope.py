@@ -208,8 +208,11 @@ def evaluate_order_authorization(
     # A fund can never travel through the securities order path. This is the
     # structural guarantee, independent of any flag.
     if family == FAMILY_FUND:
-        from app.services.fci import FCI_NOT_SUPPORTED_CODE
-
+        # A fund is not "unsupported" — it has its own official contract
+        # (POST /api/v2/operar/suscripcion|rescate/fci) and its own family.
+        # It simply must never travel the SECURITIES path, which would give
+        # it a limit price and an OrderExecution row it has no business
+        # having. Route it to the fund flow instead.
         return (
             {
                 "instrument_identity": instrument_identity(entry),
@@ -220,7 +223,7 @@ def evaluate_order_authorization(
                 },
                 "catalog": catalog_details,
             },
-            codes + [FCI_NOT_SUPPORTED_CODE],
+            codes + ["fund_requires_fci_contract"],
         )
     if family != FAMILY_SECURITIES:
         return empty, codes + ["instrument_class_unsupported"]
