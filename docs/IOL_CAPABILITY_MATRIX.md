@@ -13,16 +13,25 @@ habilita**.
 | **VERIFICADO-PRODUCCIÓN** | Confirmado por una operación real registrada en esta app. |
 | **NO VERIFICADO** | Sin contrato oficial comprobado por este repositorio. **Bloqueado.** |
 
+| **DOCUMENTADO** | Ruta y método publicados en la documentación oficial de IOL, provistos por el responsable del repositorio. Implementado, pero apagado hasta ejercitarlo en sandbox. |
+
 > **Limitación explícita del entorno de trabajo.** La política de red del
-> entorno donde se desarrolló este cambio **bloquea el dominio
-> `invertironline.com`** (el proxy responde `403` al CONNECT, y
-> `api-sandbox.invertironline.com` no resuelve por DNS). No fue posible leer
-> la documentación oficial desde acá. Por lo tanto **no se agregó ninguna
-> capacidad nueva por inferencia**: todo lo marcado VERIFICADO proviene de
-> evidencia de primera mano ya presente en el repositorio (tests de contrato
-> y la operación productiva 183382167), y todo lo demás queda NO VERIFICADO y
-> bloqueado. Esto es exactamente lo que pide la consigna: *no inferir
-> endpoints*.
+> entorno donde se desarrollaron estos cambios **bloquea `invertironline.com`
+> en el gateway**: `developers.invertironline.com`, `api.invertironline.com` y
+> `www.invertironline.com` responden `403` al CONNECT del proxy, y
+> `api-sandbox.invertironline.com` no resuelve por DNS. **No fue posible
+> revalidar los contratos leyendo la documentación oficial desde acá.**
+>
+> En consecuencia:
+>
+> - las **rutas y métodos** marcados DOCUMENTADO provienen de la lista
+>   provista explícitamente por el responsable del repositorio, que sí tiene
+>   acceso a la documentación;
+> - los **nombres de campo** que no estaban ya verificados en el repo **no se
+>   inventan**. Donde faltan (FCI), el armado de la request falla cerrado;
+> - todo lo marcado VERIFICADO proviene de evidencia de primera mano ya
+>   presente en el repositorio (tests de contrato contra la API real y la
+>   operación productiva 183382167).
 
 ---
 
@@ -106,54 +115,59 @@ evidencia propia.
 
 ## 4. FCI — Fondos Comunes de Inversión
 
-**`fci_execution_supported = false`** · bloqueo estable:
-**`fci_not_supported_by_iol_api`**
+**CORRECCIÓN respecto del PR #138.** Ese PR declaraba `fci_execution_supported
+= false` afirmando que *no existe contrato oficial*. **Esa afirmación era
+incorrecta.** La documentación oficial publica:
 
-| Capacidad requerida | Estado |
-|---|---|
-| Catálogo / identificación del fondo | NO VERIFICADO |
-| Suscripción | NO VERIFICADO |
-| Rescate | NO VERIFICADO |
-| Consulta de operación | NO VERIFICADO |
-| Cancelación | NO VERIFICADO |
-| Cutoff | NO VERIFICADO |
-| Plazo de liquidación | NO VERIFICADO |
-| Moneda | NO VERIFICADO |
-| Monto mínimo | NO VERIFICADO |
-| Sandbox | NO VERIFICADO |
+| Capacidad | Endpoint | Método | Estado |
+|---|---|---|---|
+| Catálogo de fondos | `/api/v2/Titulos/FCI` | GET | ✅ documentado, implementado |
+| Detalle de un fondo | `/api/v2/Titulos/FCI/{simbolo}` | GET | ✅ documentado |
+| Suscripción | `/api/v2/operar/suscripcion/fci` | POST | ✅ documentado |
+| Rescate | `/api/v2/operar/rescate/fci` | POST | ✅ documentado |
+| Validación previa | mismo endpoint con `soloValidar` | POST | ✅ documentado |
 
-Ver el detalle y las consecuencias en **`docs/IOL_FCI_CAPABILITY.md`**.
+Implementado como **familia separada** (`FundInstrument`, `FundOperation`,
+`FundOperationDecision`), nunca sobre `OrderExecution`.
 
-Que un FCI aparezca en `/api/v2/portafolio/{pais}` demuestra que IOL **lo
-informa como tenencia**; no demuestra en absoluto que exista un endpoint
-público para suscribirlo o rescatarlo. Son afirmaciones distintas y el motor
-no las confunde.
+**Lo que sigue sin verificar son los nombres exactos de los campos del
+request.** El entorno de build bloquea `invertironline.com`, así que no fue
+posible transcribirlos, y **no se inventan**:
+`FCI_REQUEST_CONTRACT_VERIFIED = False` hace fallar cerrado el armado de la
+request con `fci_request_contract_unverified`.
+
+FCI permanece **apagado en producción**. Detalle completo en
+**`docs/IOL_FCI_CAPABILITY.md`**.
 
 ---
 
 ## 5. Cancelación de órdenes
 
-**NO VERIFICADO** para cualquier instrumento. No se inventó un endpoint de
-cancelación.
+**CORRECCIÓN respecto del PR #138.** Ese PR declaraba que no había contrato de
+cancelación. La documentación oficial publica:
 
-Lo que sí existe y está implementado:
+```
+DELETE /api/v2/operaciones/{numeroOperacion}
+```
 
-- `cancellation_supported = false` en todas las entradas del catálogo
-  alimentadas por descubrimiento read-only;
-- **cancelación manual** como decisión humana registrada: la cola de
-  conciliación (`GET /api/executions/reconciliation-queue`) y
-  `POST /api/executions/{id}/reconcile` permiten resolver explícitamente una
-  orden (`confirm_not_sent`, `confirm_sent`, `confirm_rejected`,
-  `confirm_executed`) con frase exacta + credencial de ejecución;
-- **consulta read-only** del estado en el broker
-  (`POST /api/executions/{id}/refresh-broker-status`), que **nunca** cambia
-  el estado automáticamente.
+Implementado en `app/services/cancellation.py`, con estas garantías:
 
-Es decir: la app **no cancela en IOL**. Registra que un humano canceló (o
-verificó) en IOL. Eso es honesto y auditable; simular una cancelación que la
-API no expone no lo sería.
+- **flag propio** `ORDER_CANCELLATION_ENABLED` (default `false`) — poder
+  enviar una orden no dice nada sobre poder cancelarla;
+- preview firmado (HMAC + TTL) que lee el estado **fresco** de la operación en
+  IOL antes de decidir;
+- `X-Execution-Key` + frase exacta `CANCELAR EJECUCION {id}`;
+- **exactamente un DELETE**, reclamado atómicamente: una segunda solicitud
+  concurrente pierde y recibe 409;
+- **nunca automática**, nunca desde el scheduler, nunca desde el LLM;
+- timeout o 5xx → `cancellation_unknown` y **jamás se reintenta**: reenviar un
+  DELETE que no podemos probar que falló arriesga cancelar una orden
+  **distinta y posterior**;
+- consulta posterior read-only para conciliar.
 
----
+`confirm_cancelled` sigue existiendo con su significado original — registrar
+que **un humano canceló en el panel de IOL** — y **no** envía el DELETE. Son
+dos cosas distintas y el código no las confunde.
 
 ## 6. Sandbox
 
@@ -172,9 +186,9 @@ producción. Ver `docs/IOL_SANDBOX_GUIDE.md`.
 
 | Familia | Clase | Compra | Venta | Cotización | Cancelación |
 |---|---|---|---|---|---|
-| `securities` | `ACCIONES` | ✅ tras `SECURITIES_BUY_ENABLED` | ✅ tras `SECURITIES_SELL_ENABLED` | ✅ | ❌ manual |
-| `securities` | `CEDEARS` | ✅ tras `SECURITIES_BUY_ENABLED` | ✅ tras `SECURITIES_SELL_ENABLED` | ✅ | ❌ manual |
-| `fund` | `FCI` | ❌ `fci_not_supported_by_iol_api` | ❌ `fci_not_supported_by_iol_api` | n/a | ❌ |
+| `securities` | `ACCIONES` | ✅ tras `SECURITIES_BUY_ENABLED` | ✅ tras `SECURITIES_SELL_ENABLED` | ✅ | ✅ tras `ORDER_CANCELLATION_ENABLED` |
+| `securities` | `CEDEARS` | ✅ tras `SECURITIES_BUY_ENABLED` | ✅ tras `SECURITIES_SELL_ENABLED` | ✅ | ✅ tras `ORDER_CANCELLATION_ENABLED` |
+| `fund` | `FCI` | ⏸ contrato oficial, campos sin verificar | ⏸ ídem | n/a | ⏸ |
 | — | BONO / ON / TitulosPublicos / ETF | ❌ sin clase de ejecución | ❌ | — | ❌ |
 
 Todas las capacidades arrancan **apagadas**. El candado global

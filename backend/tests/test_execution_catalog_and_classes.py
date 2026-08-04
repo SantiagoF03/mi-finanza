@@ -47,6 +47,7 @@ from app.broker.instrument_catalog import (
 from app.core.config import get_settings
 from app.db.session import Base
 from app.models.models import PortfolioPosition
+from tests.testutils import verified_provenance
 
 ACCIONES_POLICY = {
     "buy_enabled": True, "sell_enabled": True,
@@ -117,6 +118,8 @@ def _catalog(db, symbol="BYMA", asset_type="ACCIONES", currency="ARS", **extra):
         quantity_step=1.0, price_tick=0.01, minimum_quantity=1.0,
         buy_supported=True, sell_supported=True, quote_supported=True,
         max_age_seconds=86400,
+        provenance=verified_provenance("fund" if asset_type == "FondoComundeInversion"
+                                       else "securities"),
     )
     kwargs.update(extra)
     entry, changed = upsert_instrument(db, **kwargs)
@@ -463,4 +466,6 @@ def test_fund_is_structurally_blocked_from_the_securities_path(db):
         execution_class_policies=_classes(**{CLASS_FCI: {**ACCIONES_POLICY,
                                                          "order_type": ""}}),
     )
-    assert "fci_not_supported_by_iol_api" in codes
+    # A fund is not "unsupported" — it has its own official contract and its
+    # own family. It simply must never travel the SECURITIES path.
+    assert "fund_requires_fci_contract" in codes

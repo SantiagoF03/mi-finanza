@@ -273,6 +273,30 @@ def scheduled_ingestion():
             db.close()
 
 
+def scheduled_market_hours_ingestion():
+    """In-session ingestion, with a mandatory session guard.
+
+    Defence in depth: the cron slots are already exact, but a misfire grace
+    period, a DST shift or a future edit to the trigger could still fire this
+    outside the session. A job that calls itself "market hours" must actually
+    run during market hours, so it re-checks and skips otherwise.
+
+    Skipping here is not an error: it is recorded as a normal no-cycle
+    outcome. This job can no more execute an order than any other scheduler
+    job — it only ingests.
+    """
+    from app.market.calendar import market_session_state
+
+    session = market_session_state(get_settings())
+    if not session.get("open"):
+        _scheduler_state["last_run_at"] = datetime.now(timezone.utc).isoformat()
+        _scheduler_state["last_job"] = "market_hours_ingestion"
+        _scheduler_state["last_status"] = "skipped_market_closed"
+        _scheduler_state["last_skip_code"] = session.get("code")
+        return
+    scheduled_ingestion()
+
+
 def scheduled_full_cycle():
     """Full analysis cycle (used at market close).
 
@@ -373,7 +397,11 @@ def start_scheduler() -> None:
     # Explicit timezone: APScheduler would otherwise fall back to the host TZ.
     scheduler.configure(timezone=scheduler_timezone())
 
-    from app.market.calendar import premarket_times
+    from app.market.calendar import (
+        group_slots_by_minute,
+        premarket_times,
+        session_ingestion_slots,
+    )
 
     session = _session_minutes(settings)
     if session is None:
@@ -410,19 +438,23 @@ def start_scheduler() -> None:
     # The offset makes the slots land ON the session grid (10:30, 11:00, …)
     # instead of the wall-clock hour grid, and the last slot stays strictly
     # before the close.
+    # EXACT slots, enumerated. A `minute=*/30, hour=10-16` expression also
+    # fires at 10:00 — half an hour before the market opens — and that run
+    # then reports itself as market-hours ingestion. Enumerating removes the
+    # whole class of off-by-one-grid bugs instead of patching the expression.
     interval = settings.scheduler_open_interval_minutes
-    offset = open_min % interval if interval > 0 else 0
-    minute_expr = f"{offset}-59/{interval}" if offset else f"*/{interval}"
-    scheduler.add_job(
-        scheduled_ingestion,
-        "cron",
-        hour=f"{open_h}-{close_h}" if close_min else f"{open_h}-{max(close_h - 1, open_h)}",
-        minute=minute_expr,
-        day_of_week="mon-fri",
-        id="market_hours_ingestion",
-        replace_existing=True,
-        misfire_grace_time=120,
-    )
+    slots = session_ingestion_slots(settings, interval)
+    for minute, hours in sorted(group_slots_by_minute(slots).items()):
+        scheduler.add_job(
+            scheduled_market_hours_ingestion,
+            "cron",
+            hour=",".join(str(h) for h in hours),
+            minute=str(minute),
+            day_of_week="mon-fri",
+            id=f"market_hours_ingestion_m{minute:02d}",
+            replace_existing=True,
+            misfire_grace_time=120,
+        )
 
     # Last in-session check, shortly BEFORE the close (never after it).
     last_check = max(close_m - 5, open_m)

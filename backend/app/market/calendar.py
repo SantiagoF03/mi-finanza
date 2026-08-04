@@ -163,6 +163,51 @@ def market_session_state(settings, *, now: datetime | None = None) -> dict:
     return {**detail, "open": True, "code": None}
 
 
+def session_ingestion_slots(settings, interval_minutes: int) -> list[tuple[int, int]]:
+    """EXACT in-session slots, starting AT the open and stopping before close.
+
+    For a 10:30–17:00 session on a 30-minute interval this is exactly
+    10:30, 11:00, … 16:30 — and notably NOT 10:00.
+
+    A naive cron of `minute=*/30, hour=10-16` also fires at 10:00, half an
+    hour before the market opens, and that slot then reports itself as
+    "market hours". Enumerating the slots removes the whole class of
+    off-by-one-grid bugs instead of patching the expression.
+    """
+    schedule = resolve_market_schedule(settings)
+    if schedule["errors"] or not schedule["open_time"] or not schedule["close_time"]:
+        return []
+    try:
+        interval = int(interval_minutes)
+    except (TypeError, ValueError):
+        return []
+    if interval <= 0:
+        return []
+
+    open_m = schedule["open_time"].hour * 60 + schedule["open_time"].minute
+    close_m = schedule["close_time"].hour * 60 + schedule["close_time"].minute
+
+    slots: list[tuple[int, int]] = []
+    current = open_m
+    while current < close_m:
+        slots.append((current // 60, current % 60))
+        current += interval
+    return slots
+
+
+def group_slots_by_minute(slots: list[tuple[int, int]]) -> dict[int, list[int]]:
+    """Group exact slots into {minute: [hours]} for compact cron triggers.
+
+    Two cron jobs (minute=30 hour=10-16, minute=0 hour=11-16) express the
+    13 real slots of a 10:30–17:00/30min session precisely, with no extra
+    firing.
+    """
+    grouped: dict[int, list[int]] = {}
+    for hour, minute in slots:
+        grouped.setdefault(minute, []).append(hour)
+    return {minute: sorted(set(hours)) for minute, hours in grouped.items()}
+
+
 def premarket_times(settings, minutes_before: list[int]) -> list[tuple[int, int]]:
     """(hour, minute) pairs N minutes before the open, on the same day.
 

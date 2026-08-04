@@ -98,6 +98,163 @@ def broker_instrument_catalog_refresh(
     return result
 
 
+class IdentityDecisionIn(BaseModel):
+    decision: str  # accept | reject
+    note: str = ""
+
+
+@router.post("/broker/instruments/{symbol}/identity-decision")
+def broker_instrument_identity_decision(
+    symbol: str,
+    payload: IdentityDecisionIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Accept or reject a detected instrument identity change.
+
+    An identity change (currency, type, market, settlement) freezes the
+    instrument: it is never absorbed automatically. Accepting returns it to
+    `candidate` — NOT `verified` — because the tick, step and capabilities
+    verified under the OLD identity mean nothing under the new one.
+    """
+    from app.services.instrument_capabilities import decide_identity_change
+    result = decide_identity_change(
+        db, symbol, execution_key=x_execution_key,
+        decision=payload.decision, note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+class VerifyFieldsIn(BaseModel):
+    fields: dict
+    note: str = ""
+
+
+@router.post("/broker/instruments/{symbol}/verify-fields")
+def broker_instrument_verify_fields(
+    symbol: str,
+    payload: VerifyFieldsIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Administratively verify tick/step/capabilities for ONE instrument.
+
+    This is the only way a price_tick becomes verified without official IOL
+    metadata: a human states it and it is recorded with
+    `admin_verified_override` provenance plus an audit entry. A class default
+    can never reach that state on its own.
+    """
+    from app.services.instrument_capabilities import verify_instrument_fields
+    result = verify_instrument_fields(
+        db, symbol, execution_key=x_execution_key,
+        fields=payload.fields, note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+class ResolveInstrumentsIn(BaseModel):
+    symbols: list[str]
+
+
+@router.post("/broker/instruments/resolve")
+def broker_resolve_instruments(
+    payload: ResolveInstrumentsIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Resolve instruments we do NOT hold, read-only, into CANDIDATE entries.
+
+    Only symbols already present in a bounded source (open recommendation,
+    watchlist, enabled universe, existing position) may be resolved — a
+    symbol is never tradeable just because someone typed it.
+    """
+    from app.services.instrument_capabilities import resolve_instruments
+    result = resolve_instruments(db, symbols=payload.symbols, execution_key=x_execution_key)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.get("/broker/account-status-diagnostic")
+def broker_account_status_diagnostic(
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    _auth=Depends(require_api_key),
+):
+    """READ-ONLY diagnosis of the estadocuenta contract.
+
+    Returns only a normalized diagnostic: currencies found, available balance
+    per currency, settlement buckets, recognized and missing fields. Never
+    tokens, never credentials, never the raw payload. Places no orders.
+    """
+    from app.services.instrument_capabilities import account_status_diagnostic
+    result = account_status_diagnostic(execution_key=x_execution_key)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+# --- Cancellation (real DELETE, explicit and human-only) -------------------
+
+
+@router.get("/executions/{execution_id}/cancellation-preview")
+def cancellation_preview_endpoint(
+    execution_id: int,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Signed preview of a cancellation. Reads the FRESH broker state and
+    sends no DELETE."""
+    from app.services.cancellation import build_cancellation_preview
+    result = build_cancellation_preview(db, execution_id, execution_key=x_execution_key)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+class CancelIn(BaseModel):
+    preview_hash: str
+    preview_generated_at: str
+    confirmation_text: str
+    note: str = ""
+
+
+@router.post("/executions/{execution_id}/cancel")
+def cancel_execution_endpoint(
+    execution_id: int,
+    payload: CancelIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Send EXACTLY ONE DELETE /api/v2/operaciones/{numero}.
+
+    Never automatic, never from the scheduler, never from the LLM. Requires
+    ORDER_CANCELLATION_ENABLED, X-Execution-Key, a signed non-expired preview
+    and the exact phrase. An ambiguous outcome becomes cancellation_unknown
+    and is never retried.
+    """
+    from app.services.cancellation import cancel_execution
+    result = cancel_execution(
+        db, execution_id,
+        execution_key=x_execution_key,
+        preview_hash=payload.preview_hash,
+        preview_generated_at=payload.preview_generated_at,
+        confirmation_text=payload.confirmation_text,
+        note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
 @router.get("/broker/fci-capability")
 def broker_fci_capability(_auth=Depends(require_api_key)):
     """Whether the app can execute FCI subscriptions/redemptions.

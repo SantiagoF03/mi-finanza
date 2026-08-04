@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     # configuration, read-only at runtime.
     securities_buy_enabled: bool = False
     securities_sell_enabled: bool = False
+    # Cancellation is its OWN capability: being allowed to send an order says
+    # nothing about being allowed to cancel one. DELETE /api/v2/operaciones/N
+    # is only ever issued by an explicit human action with this flag on.
+    order_cancellation_enabled: bool = False
     # FCI capability flags exist so readiness can report them explicitly.
     # They can never be sufficient on their own: subscription/redemption also
     # require a VERIFIED official IOL contract, which this repository does not

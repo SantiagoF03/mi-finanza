@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import json
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -318,18 +319,49 @@ def test_new_modules_never_import_httpx_directly():
         assert "httpx" not in imported, f"{module} must not open its own connection"
 
 
-def test_fci_module_has_no_executable_path():
-    """There is deliberately no code path where fci_execution_blocked can
-    answer 'allowed'."""
+def test_fci_never_uses_the_securities_execution_path():
+    """FCI has its own official contract, but it must never borrow the
+    securities one: no OrderExecution, no place_order, no limit price."""
     from app.services import fci
 
     source = (BACKEND_DIR / "app" / "services" / "fci.py").read_text()
     tree = ast.parse(source)
     referenced = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
-    assert not (referenced & {"place_order", "submit_order_request", "post", "commit"})
-    assert fci.FCI_EXECUTION_SUPPORTED is False
-    for operation in ("subscribe", "redeem", "anything", ""):
-        assert fci.fci_execution_blocked(operation)["code"] == fci.FCI_NOT_SUPPORTED_CODE
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.update(a.name for a in node.names)
+
+    assert not (referenced & {"place_order", "submit_order_request"})
+    assert "OrderExecution" not in names and "OrderExecution" not in imported
+    # The fund models are the ONLY persistence it may touch.
+    assert {"FundOperation", "FundInstrument"} <= imported
+
+    # Only the official documented endpoints appear.
+    assert fci.FCI_SUBSCRIBE_ENDPOINT == "/api/v2/operar/suscripcion/fci"
+    assert fci.FCI_REDEEM_ENDPOINT == "/api/v2/operar/rescate/fci"
+    assert fci.FCI_CATALOG_ENDPOINT == "/api/v2/Titulos/FCI"
+
+
+def test_fci_request_fields_are_never_invented():
+    """The endpoint PATHS are documented; the request FIELD NAMES are not
+    recorded here. Guessing them would produce a malformed real subscription,
+    so the builder fails closed until an operator verifies the mapping."""
+    from app.models.models import FundOperation
+    from app.services import fci
+
+    assert fci.FCI_REQUEST_CONTRACT_VERIFIED is False
+    assert fci.FCI_REQUEST_FIELDS == {}
+
+    operation = FundOperation(
+        fund_symbol="FCIX", operation=fci.OPERATION_SUBSCRIBE,
+        currency="ARS", amount=10_000.0, status=fci.STATE_PREPARED,
+    )
+    for solo_validar in (True, False):
+        request, error = fci.build_fund_request(operation, solo_validar=solo_validar)
+        assert request is None
+        assert error == fci.FCI_CONTRACT_UNVERIFIED_CODE
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -447,3 +479,185 @@ def test_cancellation_never_sends_or_retries_anything(mem_db):
             )
     broker_factory.assert_not_called()
     assert mem_db.query(OrderExecution).count() == 1
+
+
+# ───────────────────────────────────────────────────────────────────
+# 5 — upgrading a database that PR #138 already created
+# ───────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def pr138_db(tmp_path):
+    """A DB in the exact shape PR #138 left behind.
+
+    That is the real production starting point for this change: the new
+    tables exist, but WITHOUT the verification columns and WITHOUT the
+    uniqueness that makes the daily ledger safe.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    path = tmp_path / "pr138.db"
+    engine = create_engine(f"sqlite:///{path}")
+    Base.metadata.create_all(bind=engine)
+
+    with engine.begin() as conn:
+        # Undo this change's additions, leaving PR #138's shape. The index on
+        # verification_status must go first — SQLite refuses to drop a column
+        # an index still references.
+        conn.execute(text("DROP INDEX IF EXISTS ix_execution_instruments_verification_status"))
+        for column in ("verification_status", "field_provenance", "pending_identity",
+                       "previous_identity", "identity_changed_at", "verification_audit"):
+            conn.execute(text(f"ALTER TABLE execution_instruments DROP COLUMN {column}"))
+
+        # PR #138 created execution_daily_notional with NO uniqueness at all.
+        # SQLite cannot drop a table-level constraint, so recreate the table
+        # exactly as that version shipped it — this is what production has.
+        conn.execute(text("DROP TABLE execution_daily_notional"))
+        conn.execute(text(
+            "CREATE TABLE execution_daily_notional ("
+            " id INTEGER NOT NULL PRIMARY KEY,"
+            " trade_date VARCHAR(10),"
+            " execution_class VARCHAR(20),"
+            " currency VARCHAR(10),"
+            " submitted_notional FLOAT,"
+            " order_count INTEGER,"
+            " updated_at DATETIME NOT NULL)"
+        ))
+
+    inspector = sa_inspect(engine)
+    assert "verification_status" not in {
+        c["name"] for c in inspector.get_columns("execution_instruments")
+    }
+
+    session = sessionmaker(bind=engine)()
+    session.add(Recommendation(
+        id=PROD_RECOMMENDATION_ID, action="rebalancear", status="pending",
+        suggested_pct=0.1, confidence=0.7, rationale="reducir SPY",
+        risks="k", executive_summary="reducir SPY", metadata_json={"origin": "automatic"},
+    ))
+    session.add(Recommendation(
+        id=12, action="rebalancear", status="approved", suggested_pct=0.1,
+        confidence=0.7, rationale="r", risks="k", executive_summary="s",
+        metadata_json={},
+    ))
+    session.add(OrderExecution(
+        id=PROD_EXECUTION_ID, recommendation_id=12, symbol="BYMA", side="sell",
+        target_change_pct=-0.1, status="executed", broker_order_id=PROD_IOL_OPERATION,
+        quantity=1, quantity_planned=1, quantity_sent=1,
+        executed_quantity=1, executed_price=297.0,
+        endpoint_used="/api/v2/operar/Vender", broker_response={},
+    ))
+    # A PR #138 catalog row: fields present, nobody ever verified them.
+    session.execute(text(
+        "INSERT INTO execution_instruments "
+        "(broker_symbol, display_symbol, description, country, market, settlement, "
+        " asset_type, instrument_type, execution_family, execution_class, currency, "
+        " quantity_step, price_tick, active, buy_supported, sell_supported, "
+        " quote_supported, cancellation_supported, source, verified_at, "
+        " raw_identity_hash, raw_identity, created_at, updated_at) "
+        "VALUES ('BYMA','BYMA','','argentina','bCBA','t1','ACCIONES','ACCIONES',"
+        " 'securities','ACCIONES','ARS',1.0,0.01,1,1,1,1,0,'iol_portfolio',"
+        " :now,'oldhash','{}', :now, :now)"
+    ), {"now": datetime.utcnow()})
+    session.commit()
+    yield engine, session
+    session.close()
+    engine.dispose()
+
+
+def test_upgrading_a_pr138_database_preserves_production_rows(pr138_db):
+    engine, session = pr138_db
+    before = _fingerprint(session)
+
+    Base.metadata.create_all(bind=engine)
+    _patch_schema(engine)
+
+    session.expire_all()
+    assert _fingerprint(session) == before
+    assert session.get(Recommendation, PROD_RECOMMENDATION_ID).status == "pending"
+    execution = session.get(OrderExecution, PROD_EXECUTION_ID)
+    assert execution.status == "executed"
+    assert execution.broker_order_id == PROD_IOL_OPERATION
+    assert execution.executed_price == 297.0
+
+
+def test_pr138_catalog_rows_are_not_grandfathered_into_verified(pr138_db):
+    """Their tick came from a class default; nobody verified anything."""
+    from app.broker.instrument_catalog import (
+        STATUS_CANDIDATE,
+        catalog_entry_status,
+        get_instrument,
+        verification_status_of,
+    )
+
+    engine, session = pr138_db
+    Base.metadata.create_all(bind=engine)
+    _patch_schema(engine)
+    session.expire_all()
+
+    entry = get_instrument(session, "BYMA")
+    assert entry is not None
+    assert verification_status_of(entry) == STATUS_CANDIDATE
+    assert catalog_entry_status(entry, max_age_seconds=86400)[0] == "instrument_not_verified"
+
+
+def test_upgrade_adds_ledger_uniqueness(pr138_db):
+    from sqlalchemy import inspect as sa_inspect
+
+    engine, _session = pr138_db
+    Base.metadata.create_all(bind=engine)
+    _patch_schema(engine)
+
+    indexes = {ix["name"] for ix in sa_inspect(engine).get_indexes("execution_daily_notional")}
+    assert "uq_execution_daily_notional_scope" in indexes
+
+
+def test_upgrade_is_idempotent_on_a_pr138_database(pr138_db):
+    engine, session = pr138_db
+    Base.metadata.create_all(bind=engine)
+    _patch_schema(engine)
+    before = _fingerprint(session)
+
+    for _ in range(3):
+        Base.metadata.create_all(bind=engine)
+        _patch_schema(engine)
+
+    session.expire_all()
+    assert _fingerprint(session) == before
+
+
+def test_duplicate_ledger_rows_fail_closed_instead_of_being_merged(pr138_db):
+    """These numbers gate real spending. Silently collapsing them could hide
+    spent budget or restore allowance that was legitimately consumed."""
+    engine, session = pr138_db
+    with engine.begin() as conn:
+        for _ in range(2):
+            conn.execute(text(
+                "INSERT INTO execution_daily_notional "
+                "(trade_date, execution_class, currency, submitted_notional, "
+                " order_count, updated_at) "
+                "VALUES ('2026-08-04','ACCIONES','ARS',500,1,:now)"
+            ), {"now": datetime.utcnow()})
+
+    with pytest.raises(RuntimeError, match="duplicate"):
+        Base.metadata.create_all(bind=engine)
+        _patch_schema(engine)
+
+    # Nothing was merged or deleted: both rows are still there for a human.
+    with engine.begin() as conn:
+        remaining = conn.execute(text(
+            "SELECT COUNT(*) FROM execution_daily_notional"
+        )).scalar()
+    assert remaining == 2
+
+
+def test_new_fund_tables_start_empty(pr138_db):
+    from app.models.models import FundInstrument, FundOperation
+
+    engine, session = pr138_db
+    Base.metadata.create_all(bind=engine)
+    _patch_schema(engine)
+    assert session.query(FundInstrument).count() == 0
+    assert session.query(FundOperation).count() == 0
+    # And production history is still intact alongside them.
+    assert session.get(Recommendation, PROD_RECOMMENDATION_ID).status == "pending"

@@ -42,6 +42,7 @@ from app.services.execution import (
     confirmation_phrase,
 )
 from app.services.execution_limits import evaluate_buy_cash
+from tests.testutils import verified_provenance
 
 TEST_ADMIN_KEY = "test-execution-admin-key"
 TEST_PREVIEW_SECRET = "test-preview-secret"
@@ -142,6 +143,10 @@ def _catalog(db, symbol="BYMA", asset_type="ACCIONES", currency="ARS", **extra):
         quantity_step=1.0, price_tick=1.0, minimum_quantity=1.0,
         buy_supported=True, sell_supported=True, quote_supported=True,
         max_age_seconds=86400,
+        # Verified provenance: these tests are about execution, not about
+        # the verification lifecycle (which has its own tests).
+        provenance=verified_provenance("fund" if asset_type == "FondoComundeInversion"
+                                       else "securities"),
     )
     kwargs.update(extra)
     upsert_instrument(db, **kwargs)
@@ -586,7 +591,7 @@ def test_market_closed_cancels_the_batch_if_it_reaches_preflight(db):
 
 def test_daily_notional_limit_blocks_a_later_batch(db):
     """A per-order limit says nothing about the twentieth batch of the day."""
-    from app.services.execution_limits import consume_daily_budget, trade_date_for
+    from app.services.execution_limits import reserve_daily_budget, trade_date_for
 
     _snapshot(db)
     _catalog(db)
@@ -596,10 +601,10 @@ def test_daily_notional_limit_blocks_a_later_batch(db):
 
     with exec_settings(**_settings()):
         # Today's budget is already almost entirely consumed.
-        consume_daily_budget(
+        reserve_daily_budget(
             db, trade_date=trade_date_for(get_settings()),
             execution_class=CLASS_ACCIONES, currency="ARS",
-            notional=Decimal("499000"),
+            notional=Decimal("499000"), max_daily_notional=500_000.0,
         )
         db.commit()
         preview = build_execution_preview(db, rec.id)
@@ -622,10 +627,11 @@ def test_daily_budget_is_only_consumed_at_the_point_of_no_return(db):
     with exec_settings(**_settings()):
         preview = build_execution_preview(db, rec.id)
         _approve(db, rec, preview, broker)
-        assert get_daily_totals(db, trade_date_for(get_settings()), CLASS_ACCIONES) == 0
+        assert get_daily_totals(db, trade_date_for(get_settings()), CLASS_ACCIONES, "ARS") == 0
 
 
 def test_successful_buy_consumes_the_daily_budget(db):
+    """The budget is consumed in the order's OWN currency bucket."""
     from app.services.execution_limits import get_daily_totals, trade_date_for
 
     _snapshot(db)
@@ -637,7 +643,10 @@ def test_successful_buy_consumes_the_daily_budget(db):
     with exec_settings(**_settings()):
         preview = build_execution_preview(db, rec.id)
         _approve(db, rec, preview, broker)
-        assert get_daily_totals(db, trade_date_for(get_settings()), CLASS_ACCIONES) > 0
+        today = trade_date_for(get_settings())
+        assert get_daily_totals(db, today, CLASS_ACCIONES, "ARS") > 0
+        # A different currency has its own, untouched budget.
+        assert get_daily_totals(db, today, CLASS_ACCIONES, "USD") == 0
 
 
 # ───────────────────────────────────────────────────────────────────

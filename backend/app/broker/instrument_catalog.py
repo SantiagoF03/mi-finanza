@@ -43,6 +43,59 @@ IDENTITY_FIELDS = (
     "country",
 )
 
+# --- Verification lifecycle -------------------------------------------------
+STATUS_CANDIDATE = "candidate"
+STATUS_VERIFIED = "verified"
+STATUS_IDENTITY_CHANGED = "identity_changed"
+STATUS_REJECTED = "rejected"
+STATUS_STALE = "stale"
+
+VERIFICATION_STATUSES = (
+    STATUS_CANDIDATE, STATUS_VERIFIED, STATUS_IDENTITY_CHANGED,
+    STATUS_REJECTED, STATUS_STALE,
+)
+
+# --- Provenance -------------------------------------------------------------
+# WHERE a field's value came from. This is the difference between "IOL told
+# us this instrument trades in pesos" and "a class policy assumed pesos".
+PROV_IOL_PORTFOLIO = "iol_portfolio"        # the account's own holdings
+PROV_IOL_TITLE_DETAIL = "iol_title_detail"  # GET /api/v2/{mercado}/Titulos/{simbolo}
+PROV_IOL_QUOTE = "iol_quote"                # .../Cotizacion responded
+PROV_IOL_FCI = "iol_fci_catalog"            # GET /api/v2/Titulos/FCI
+PROV_ADMIN_OVERRIDE = "admin_verified_override"
+PROV_CLASS_DEFAULT = "class_policy_default"  # a GUESS, never a verification
+
+# Provenances that count as actual verification of a field's value. A class
+# default is deliberately absent: a policy may supply a LIMIT, but it has not
+# looked at the instrument and must never claim it did.
+VERIFYING_PROVENANCES = frozenset({
+    PROV_IOL_PORTFOLIO,
+    PROV_IOL_TITLE_DETAIL,
+    PROV_IOL_QUOTE,
+    PROV_IOL_FCI,
+    PROV_ADMIN_OVERRIDE,
+})
+
+# Fields that must each carry a verifying provenance before a SECURITY may
+# be executed. price_tick and quantity_step are here on purpose: IOL rejects
+# an order whose decimals do not match the real minimum alteration, so a
+# guessed tick is an order we know may be refused.
+#
+# `settlement` is deliberately NOT here. It is a POLICY choice — which plazo
+# we choose to trade — not a property of the instrument that anyone could
+# verify. Its provenance is still recorded, and the scope evaluator still
+# checks it against the class policy and the global order policy; it simply
+# cannot be "verified" the way a currency or a tick can.
+REQUIRED_SECURITIES_PROVENANCE = (
+    "broker_symbol", "asset_type", "instrument_type", "currency",
+    "market", "price_tick", "quantity_step",
+    "buy_supported", "sell_supported", "quote_supported",
+)
+
+REQUIRED_FUND_PROVENANCE = (
+    "broker_symbol", "asset_type", "instrument_type", "currency",
+)
+
 
 def normalize_symbol(symbol) -> str:
     return str(symbol or "").strip().upper()
@@ -86,6 +139,50 @@ def get_instrument(db: Session, symbol) -> ExecutionInstrument | None:
     )
 
 
+def verification_status_of(entry: ExecutionInstrument) -> str:
+    """Current verification status, treating NULL/empty as `candidate`.
+
+    Rows written before verification existed (PR #138) have no status. They
+    must read as `candidate` — NOT verified — because nobody ever checked
+    them. That is the fail-closed direction.
+    """
+    raw = (getattr(entry, "verification_status", "") or "").strip()
+    return raw if raw in VERIFICATION_STATUSES else STATUS_CANDIDATE
+
+
+def required_provenance_fields(entry: ExecutionInstrument) -> tuple[str, ...]:
+    if entry.execution_family == FAMILY_FUND:
+        return REQUIRED_FUND_PROVENANCE
+    return REQUIRED_SECURITIES_PROVENANCE
+
+
+def unverified_fields(entry: ExecutionInstrument) -> list[str]:
+    """Operative fields lacking a verifying provenance.
+
+    A field whose provenance is `class_policy_default` counts as unverified:
+    the policy supplied a number without ever looking at the instrument.
+    """
+    provenance = entry.field_provenance or {}
+    missing = []
+    for field in required_provenance_fields(entry):
+        source = provenance.get(field)
+        if source not in VERIFYING_PROVENANCES:
+            missing.append(field)
+    return sorted(missing)
+
+
+def recompute_verification_status(entry: ExecutionInstrument) -> str:
+    """Derive the status a freshly-refreshed entry deserves.
+
+    Never promotes out of identity_changed or rejected: those are human
+    decisions and an automatic refresh must not overwrite them.
+    """
+    current = verification_status_of(entry)
+    if current in (STATUS_IDENTITY_CHANGED, STATUS_REJECTED):
+        return current
+    return STATUS_CANDIDATE if unverified_fields(entry) else STATUS_VERIFIED
+
+
 def catalog_entry_status(
     entry: ExecutionInstrument | None,
     *,
@@ -104,6 +201,8 @@ def catalog_entry_status(
     if current.tzinfo is not None:
         current = current.astimezone(timezone.utc).replace(tzinfo=None)
 
+    provenance = entry.field_provenance or {}
+    status = verification_status_of(entry)
     details = {
         "broker_symbol": entry.broker_symbol,
         "execution_class": entry.execution_class or None,
@@ -111,6 +210,8 @@ def catalog_entry_status(
         "verified_at": entry.verified_at.isoformat() if entry.verified_at else None,
         "stale_after": entry.stale_after.isoformat() if entry.stale_after else None,
         "active": bool(entry.active),
+        "verification_status": status,
+        "field_provenance": dict(provenance),
     }
 
     if not entry.active:
@@ -118,6 +219,15 @@ def catalog_entry_status(
 
     if not entry.execution_class or not entry.execution_family:
         return "instrument_class_unsupported", details
+
+    # An identity change freezes the instrument until a human rules on it.
+    # Checked BEFORE completeness so the reason reported is the real one.
+    if status == STATUS_IDENTITY_CHANGED:
+        details["pending_identity"] = entry.pending_identity or {}
+        details["previous_identity"] = entry.previous_identity or {}
+        return "instrument_identity_changed", details
+    if status == STATUS_REJECTED:
+        return "instrument_rejected", details
 
     missing = [f for f in ("market", "asset_type", "instrument_type", "currency")
                if not (getattr(entry, f, "") or "").strip()]
@@ -142,6 +252,17 @@ def catalog_entry_status(
     if entry.verified_at is None:
         details["missing_fields"] = ["verified_at"]
         return "instrument_catalog_incomplete", details
+
+    # Every operative field must carry a VERIFYING provenance. A value that
+    # came from a class default is present but unverified — it makes the
+    # entry a candidate, never an executable instrument.
+    unverified = unverified_fields(entry)
+    if unverified:
+        details["unverified_fields"] = unverified
+        return "instrument_not_verified", details
+
+    if status != STATUS_VERIFIED:
+        return "instrument_not_verified", details
 
     # Freshness: the entry's own stale_after, plus the class-level maximum
     # age. The stricter of the two wins — a long-lived entry can never
@@ -199,12 +320,18 @@ def upsert_instrument(
     verified_at: datetime | None = None,
     max_age_seconds: float | None = None,
     active: bool = True,
+    provenance: dict | None = None,
 ) -> tuple[ExecutionInstrument, bool]:
     """Create or refresh ONE catalog entry.
 
-    Returns (entry, identity_changed). When the raw identity hash changes the
-    entry is NOT silently updated in place as if nothing happened: the caller
-    gets identity_changed=True so it can require re-verification.
+    `provenance` maps each field to WHERE its value came from. It is what
+    separates a verified instrument from a plausible guess: a field whose
+    provenance is `class_policy_default` keeps the entry a `candidate`, and a
+    candidate can never authorise an order.
+
+    Returns (entry, identity_changed). On an identity change the entry is NOT
+    overwritten and NOT re-verified — it is frozen as `identity_changed` for
+    a human to accept or reject.
     """
     key = normalize_symbol(broker_symbol)
     execution_class = resolve_execution_class(asset_type)
@@ -230,9 +357,37 @@ def upsert_instrument(
     identity_changed = False
     if entry is None:
         entry = ExecutionInstrument(broker_symbol=key)
+        entry.field_provenance = {}
+        entry.verification_audit = []
         db.add(entry)
     else:
-        identity_changed = entry.raw_identity_hash != identity_hash
+        # An entry that has never been given an identity hash (a fresh row,
+        # or a PR #138 row) is not "changed" — it is simply being populated.
+        identity_changed = bool(entry.raw_identity_hash) and (
+            entry.raw_identity_hash != identity_hash
+        )
+
+    if identity_changed:
+        # DO NOT overwrite and re-verify. The broker is now describing a
+        # different thing under the same symbol — different currency, market,
+        # settlement or type. Silently absorbing that is how an order ends up
+        # priced in the wrong currency. Freeze it and let a human rule.
+        entry.previous_identity = dict(entry.raw_identity or {})
+        entry.pending_identity = dict(identity)
+        entry.verification_status = STATUS_IDENTITY_CHANGED
+        entry.identity_changed_at = now
+        audit = list(entry.verification_audit or [])
+        audit.append({
+            "timestamp": now.isoformat(),
+            "event": "identity_change_detected",
+            "previous": dict(entry.raw_identity or {}),
+            "proposed": dict(identity),
+            "source": str(source or "")[:50],
+        })
+        entry.verification_audit = audit
+        # verified_at deliberately NOT touched: nothing was verified here.
+        db.flush()
+        return entry, True
 
     entry.display_symbol = normalize_symbol(display_symbol) or key
     entry.description = str(description or "")[:200]
@@ -258,10 +413,27 @@ def upsert_instrument(
     entry.settlement_delay_days = (int(settlement_delay_days)
                                    if isinstance(settlement_delay_days, int) else None)
     entry.source = str(source or "")[:50]
-    entry.verified_at = now
     entry.stale_after = stale_after
     entry.raw_identity_hash = identity_hash
     entry.raw_identity = identity
+
+    # Merge provenance: an ADMIN-verified field is never demoted by a later
+    # automatic refresh that could only offer a class default for it.
+    merged = dict(entry.field_provenance or {})
+    for field, origin in (provenance or {}).items():
+        if merged.get(field) == PROV_ADMIN_OVERRIDE and origin == PROV_CLASS_DEFAULT:
+            continue
+        merged[field] = origin
+    entry.field_provenance = merged
+
+    entry.verification_status = recompute_verification_status(entry)
+    # verified_at means "this is when the VERIFIED values were established".
+    # A candidate has nothing verified, so it must not carry a fresh stamp
+    # that would later read as a recent verification.
+    if entry.verification_status == STATUS_VERIFIED:
+        entry.verified_at = now
+    elif entry.verified_at is None:
+        entry.verified_at = now
     db.flush()
     return entry, identity_changed
 
@@ -319,6 +491,36 @@ def refresh_catalog_from_positions(
         market = policy["markets"][0] if policy.get("markets") else ""
         override = ticks.get(symbol) or {}
 
+        # PROVENANCE, honestly recorded.
+        #
+        # The portfolio genuinely establishes identity: it is IOL stating
+        # what the account holds. It establishes NOTHING about market,
+        # settlement, tick, step or capabilities — those come from the class
+        # policy, i.e. they are assumptions until verified elsewhere.
+        provenance = {
+            "broker_symbol": PROV_IOL_PORTFOLIO,
+            "asset_type": PROV_IOL_PORTFOLIO,
+            "instrument_type": PROV_IOL_PORTFOLIO,
+            "currency": PROV_IOL_PORTFOLIO,
+            "market": PROV_CLASS_DEFAULT,
+            "settlement": PROV_CLASS_DEFAULT,
+            "price_tick": (
+                PROV_ADMIN_OVERRIDE if "price_tick" in override else PROV_CLASS_DEFAULT
+            ),
+            "quantity_step": (
+                PROV_ADMIN_OVERRIDE if "quantity_step" in override else PROV_CLASS_DEFAULT
+            ),
+            "minimum_quantity": (
+                PROV_ADMIN_OVERRIDE if "minimum_quantity" in override else PROV_CLASS_DEFAULT
+            ),
+            # Capabilities are NOT inferred from the execution family. Holding
+            # something proves nothing about being able to buy, sell or quote
+            # it — that needs evidence, gathered by resolve_instrument().
+            "buy_supported": PROV_CLASS_DEFAULT,
+            "sell_supported": PROV_CLASS_DEFAULT,
+            "quote_supported": PROV_CLASS_DEFAULT,
+        }
+
         existed = get_instrument(db, symbol) is not None
         _, identity_changed = upsert_instrument(
             db,
@@ -334,14 +536,16 @@ def refresh_catalog_from_positions(
             price_tick=override.get("price_tick", policy.get("default_price_tick")),
             minimum_quantity=override.get("minimum_quantity",
                                           policy.get("default_quantity_step")),
-            # Read-only discovery can establish identity and quoting, never
-            # cancellation: no cancel contract has been verified for this app.
-            buy_supported=family == FAMILY_SECURITIES,
-            sell_supported=family == FAMILY_SECURITIES,
-            quote_supported=family == FAMILY_SECURITIES,
+            # Holding an instrument is not evidence that it can be bought,
+            # sold or quoted. These stay false until resolve_instrument()
+            # actually observes a quote and a title detail.
+            buy_supported=False,
+            sell_supported=False,
+            quote_supported=False,
             cancellation_supported=False,
             verified_at=verified_at,
             max_age_seconds=policy.get("catalog_max_age_seconds"),
+            provenance=provenance,
         )
         if identity_changed:
             identity_changes.append(symbol)
@@ -418,4 +622,151 @@ def catalog_to_dict(entry: ExecutionInstrument) -> dict:
         "verified_at": entry.verified_at.isoformat() if entry.verified_at else None,
         "stale_after": entry.stale_after.isoformat() if entry.stale_after else None,
         "raw_identity_hash": entry.raw_identity_hash or "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Identity-change decisions — explicit, human, auditable.
+# ---------------------------------------------------------------------------
+
+
+def accept_identity_change(
+    entry: ExecutionInstrument, *, note: str = "", now: datetime | None = None
+) -> dict:
+    """A human accepts the broker's new identity for this symbol.
+
+    The proposed identity becomes the entry's identity, but the entry drops
+    back to `candidate`, NOT `verified`: accepting that IOL now calls this a
+    dollar-denominated CEDEAR is not the same as having re-verified its tick,
+    step and capabilities under that new identity.
+    """
+    stamp = now or _utcnow_naive()
+    proposed = dict(entry.pending_identity or {})
+    if not proposed:
+        return {"changed": False, "reason": "no_pending_identity"}
+
+    entry.market = proposed.get("market", entry.market)
+    entry.settlement = proposed.get("settlement", entry.settlement)
+    entry.asset_type = proposed.get("asset_type", entry.asset_type)
+    entry.instrument_type = proposed.get("instrument_type", entry.instrument_type)
+    entry.currency = proposed.get("currency", entry.currency)
+    entry.country = proposed.get("country", entry.country)
+
+    execution_class = resolve_execution_class(entry.asset_type)
+    entry.execution_class = execution_class or ""
+    entry.execution_family = execution_family_of(execution_class) or ""
+
+    entry.raw_identity = proposed
+    entry.raw_identity_hash = compute_identity_hash(proposed)
+    entry.previous_identity = None
+    entry.pending_identity = None
+    entry.identity_changed_at = None
+
+    # The new identity invalidates every capability and numeric field that
+    # was verified under the OLD one.
+    entry.buy_supported = False
+    entry.sell_supported = False
+    entry.quote_supported = False
+    provenance = dict(entry.field_provenance or {})
+    for field in ("price_tick", "quantity_step", "minimum_quantity",
+                  "buy_supported", "sell_supported", "quote_supported"):
+        provenance[field] = PROV_CLASS_DEFAULT
+    entry.field_provenance = provenance
+    entry.verification_status = STATUS_CANDIDATE
+
+    audit = list(entry.verification_audit or [])
+    audit.append({
+        "timestamp": stamp.isoformat(),
+        "event": "identity_change_accepted",
+        "accepted": proposed,
+        "note": note[:300],
+        "resulting_status": STATUS_CANDIDATE,
+        "source": "manual_user",
+    })
+    entry.verification_audit = audit
+    return {"changed": True, "verification_status": STATUS_CANDIDATE}
+
+
+def reject_identity_change(
+    entry: ExecutionInstrument, *, note: str = "", now: datetime | None = None
+) -> dict:
+    """A human refuses the broker's new identity. The instrument is parked.
+
+    Deliberately NOT "keep the old identity and carry on": the broker is
+    telling us something we do not accept, so trading it on our old
+    assumption would be the worst of both. It becomes `rejected` and is
+    unusable until someone re-resolves it.
+    """
+    stamp = now or _utcnow_naive()
+    audit = list(entry.verification_audit or [])
+    audit.append({
+        "timestamp": stamp.isoformat(),
+        "event": "identity_change_rejected",
+        "refused": dict(entry.pending_identity or {}),
+        "note": note[:300],
+        "source": "manual_user",
+    })
+    entry.verification_audit = audit
+    entry.verification_status = STATUS_REJECTED
+    entry.pending_identity = None
+    entry.identity_changed_at = None
+    return {"changed": True, "verification_status": STATUS_REJECTED}
+
+
+def verify_fields(
+    entry: ExecutionInstrument,
+    *,
+    fields: dict,
+    provenance_source: str,
+    note: str = "",
+    now: datetime | None = None,
+) -> dict:
+    """Administratively verify specific numeric/capability fields.
+
+    This is the ONLY way a price_tick or quantity_step becomes verified
+    without official IOL metadata: a named human states the value and it is
+    recorded with `admin_verified_override` provenance plus an audit entry.
+    A class default can never reach this state on its own.
+    """
+    stamp = now or _utcnow_naive()
+    applied = {}
+    for field, value in (fields or {}).items():
+        if field in ("price_tick", "quantity_step", "minimum_quantity"):
+            parsed = _as_positive_float(value)
+            if parsed is None:
+                return {"changed": False, "reason": f"invalid_{field}"}
+            setattr(entry, field, parsed)
+            applied[field] = parsed
+        elif field in ("buy_supported", "sell_supported", "quote_supported",
+                       "cancellation_supported"):
+            if not isinstance(value, bool):
+                return {"changed": False, "reason": f"invalid_{field}"}
+            setattr(entry, field, value)
+            applied[field] = value
+        else:
+            return {"changed": False, "reason": "unsupported_field"}
+
+    provenance = dict(entry.field_provenance or {})
+    for field in applied:
+        provenance[field] = provenance_source
+    entry.field_provenance = provenance
+
+    audit = list(entry.verification_audit or [])
+    audit.append({
+        "timestamp": stamp.isoformat(),
+        "event": "fields_verified",
+        "fields": applied,
+        "provenance": provenance_source,
+        "note": note[:300],
+        "source": "manual_user",
+    })
+    entry.verification_audit = audit
+    entry.verification_status = recompute_verification_status(entry)
+    if entry.verification_status == STATUS_VERIFIED:
+        entry.verified_at = stamp
+    return {
+        "changed": True,
+        "applied": applied,
+        "verification_status": entry.verification_status,
+        "unverified_fields": unverified_fields(entry),
     }

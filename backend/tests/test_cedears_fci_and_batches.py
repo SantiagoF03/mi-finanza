@@ -40,13 +40,8 @@ from app.services.execution import (
     confirmation_phrase,
     get_execution_readiness,
 )
-from app.services.fci import (
-    FCI_EXECUTION_SUPPORTED,
-    FCI_NOT_SUPPORTED_CODE,
-    build_fci_informational_preview,
-    fci_execution_blocked,
-    get_fci_capability,
-)
+from tests.testutils import verified_provenance
+from app.services.fci import get_fci_capability
 
 TEST_ADMIN_KEY = "test-execution-admin-key"
 TEST_PREVIEW_SECRET = "test-preview-secret"
@@ -133,6 +128,10 @@ def _catalog(db, symbol, asset_type, currency="ARS", **extra):
         quantity_step=1.0, price_tick=1.0, minimum_quantity=1.0,
         buy_supported=True, sell_supported=True, quote_supported=True,
         max_age_seconds=86400,
+        # Verified provenance: these tests are about execution, not about
+        # the verification lifecycle (which has its own tests).
+        provenance=verified_provenance("fund" if asset_type == "FondoComundeInversion"
+                                       else "securities"),
     )
     kwargs.update(extra)
     upsert_instrument(db, **kwargs)
@@ -289,108 +288,6 @@ def test_unknown_symbol_is_blocked_even_if_recommended(db):
 
     assert "instrument_catalog_missing" in preview["blocking_reasons"]
     assert preview["can_submit_approval"] is False
-
-
-# ───────────────────────────────────────────────────────────────────
-# 2 — FCI: analysable, recommendable, never executable
-# ───────────────────────────────────────────────────────────────────
-
-
-def test_phase0_result_is_recorded_in_code():
-    assert FCI_EXECUTION_SUPPORTED is False
-    capability = get_fci_capability()
-    assert capability["fci_execution_supported"] is False
-    assert capability["subscription_supported"] is False
-    assert capability["redemption_supported"] is False
-    assert capability["blocking_code"] == FCI_NOT_SUPPORTED_CODE
-    # What the app CAN legitimately still do.
-    assert capability["analysis_supported"] is True
-    assert capability["recommendation_supported"] is True
-    assert capability["informational_preview_supported"] is True
-    assert capability["manual_operation_required"] is True
-
-
-@pytest.mark.parametrize("operation", ["subscribe", "redeem"])
-def test_any_fci_operation_is_refused(operation):
-    result = fci_execution_blocked(operation)
-    assert result["code"] == FCI_NOT_SUPPORTED_CODE
-    assert result["status_code"] == 501
-    assert result["fci_execution_supported"] is False
-    assert result["manual_operation_required"] is True
-
-
-def test_fci_flags_alone_can_never_authorise_execution():
-    """A flag cannot make an unverified contract executable."""
-    with exec_settings(**_settings(fci_subscription_enabled=True,
-                                   fci_redemption_enabled=True)):
-        readiness = get_execution_readiness()
-    assert readiness["fci_subscription_enabled"] is True
-    assert readiness["fci_redemption_enabled"] is True
-    assert readiness["ready_for_real_fci_subscription"] is False
-    assert readiness["ready_for_real_fci_redemption"] is False
-    assert readiness["fci_execution_supported"] is False
-
-
-def test_fci_informational_preview_has_no_securities_vocabulary():
-    preview = build_fci_informational_preview(
-        symbol="FCIX", side="buy", currency="ARS",
-        position_quantity=100.0, position_value=150_000.0,
-        fund_cutoff_local_time="15:00", settlement_delay_days=1,
-        fund_minimum_amount=1000.0,
-    )
-    assert preview["operation"] == "subscribe"
-    assert preview["execution_family"] == "fund"
-    # No price, no book, no step — a fund has none of these.
-    assert preview["limit_price"] is None
-    assert preview["best_bid"] is None
-    assert preview["best_ask"] is None
-    assert preview["quantity_step"] is None
-    # Explicitly non-executable and non-immediate.
-    assert preview["executable"] is False
-    assert preview["would_execute"] is False
-    assert preview["immediate"] is False
-    assert preview["manual_operation_required"] is True
-    assert preview["blocking_reasons"] == [FCI_NOT_SUPPORTED_CODE]
-    # Fund-specific fields ARE present.
-    assert preview["fund_cutoff_local_time"] == "15:00"
-    assert preview["settlement_delay_days"] == 1
-
-
-def test_fci_preview_normalises_sides_to_fund_vocabulary():
-    assert build_fci_informational_preview(symbol="F", side="sell")["operation"] == "redeem"
-    assert build_fci_informational_preview(symbol="F", side="redeem")["operation"] == "redeem"
-    assert build_fci_informational_preview(symbol="F", side="buy")["operation"] == "subscribe"
-
-
-def test_fci_cutoff_is_per_fund_not_hardcoded():
-    """Two funds may legitimately have different cutoffs."""
-    a = build_fci_informational_preview(symbol="A", side="buy", fund_cutoff_local_time="13:00")
-    b = build_fci_informational_preview(symbol="B", side="buy", fund_cutoff_local_time="15:30")
-    assert (a["fund_cutoff_local_time"], b["fund_cutoff_local_time"]) == ("13:00", "15:30")
-
-
-def test_fci_position_creates_no_order_execution(db):
-    """An FCI recommendation is analysed and previewed, never executed."""
-    _catalog(db, "FCIX", "FondoComundeInversion",
-             fund_minimum_amount=1000.0, fund_cutoff_local_time="15:00")
-    _snapshot(db, [dict(symbol="FCIX", asset_type="FondoComundeInversion",
-                        instrument_type="FondoComundeInversion", currency="ARS",
-                        quantity=100, market_value=150_000, avg_price=1500)])
-    rec = _recommendation(db, [("FCIX", -0.01)])
-    broker = _cedear_broker([])
-
-    with exec_settings(**_settings(execution_class_policies={
-        CLASS_ACCIONES: dict(CLASS_POLICY),
-        CLASS_CEDEARS: dict(CLASS_POLICY),
-        CLASS_FCI: {**CLASS_POLICY, "order_type": ""},
-    })):
-        preview = build_execution_preview(db, rec.id)
-        result = _approve(db, rec, preview, broker)
-
-    assert FCI_NOT_SUPPORTED_CODE in preview["blocking_reasons"]
-    assert result["code"] == FCI_NOT_SUPPORTED_CODE
-    broker.submit_order_request.assert_not_called()
-    assert db.query(OrderExecution).count() == 0
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -555,7 +452,8 @@ def test_instrument_capabilities_reports_readiness_and_reasons(db):
     assert by_symbol["STALE"]["sell_ready"] is False
     assert "instrument_catalog_stale" in by_symbol["STALE"]["sell_blocking_reasons"]
 
-    assert report["capabilities"]["fci"]["fci_execution_supported"] is False
+    # FCI has an official contract but its own family — never securities.
+    assert report["capabilities"]["fci"]["uses_order_execution"] is False
 
 
 def test_capability_report_exposes_no_secrets(db):

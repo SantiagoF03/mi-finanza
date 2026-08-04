@@ -39,7 +39,7 @@ from app.core.config import get_settings
 from app.market.calendar import market_session_state
 from app.services.execution_limits import (
     check_daily_budget,
-    consume_daily_budget,
+    reserve_daily_budget,
     evaluate_buy_cash,
     pending_buy_notional,
     trade_date_for,
@@ -828,7 +828,10 @@ def get_execution_readiness(db: Session | None = None) -> dict:
         "legacy_sell_only_bridge_active": legacy_sell_bridge_active(settings),
         "fci_subscription_enabled": bool(getattr(settings, "fci_subscription_enabled", False)),
         "fci_redemption_enabled": bool(getattr(settings, "fci_redemption_enabled", False)),
-        "fci_execution_supported": fci["fci_execution_supported"],
+        # The FCI endpoints are official and implemented as a separate
+        # family; what is still unverified is the exact request FIELD mapping.
+        "fci_contract_documented": fci["contract_documented"],
+        "fci_request_contract_verified": fci["request_contract_verified"],
         "fci_capability": fci,
 
         # --- Environments ---
@@ -894,10 +897,10 @@ def get_execution_readiness(db: Session | None = None) -> dict:
         "ready_for_real_securities_sell": (
             env["environment"] == "real" and not blocking and sell_enabled
         ),
-        # Always false while the FCI contract is unverified: a flag alone can
-        # never make an unknown contract executable.
-        "ready_for_real_fci_subscription": False,
-        "ready_for_real_fci_redemption": False,
+        # Requires BOTH the capability flag and a verified request-field
+        # mapping. A flag alone can never make an unverified wire format safe.
+        "ready_for_real_fci_subscription": fci["ready_for_real_subscription"],
+        "ready_for_real_fci_redemption": fci["ready_for_real_redemption"],
     }
 
 
@@ -1266,7 +1269,7 @@ def _validate_reinforced_authorization(
         "instrument_catalog_incomplete",
         "instrument_inactive",
         "instrument_class_unsupported",
-        "fci_not_supported_by_iol_api",
+        "fund_requires_fci_contract",
         "market_closed",
         "buy_execution_disabled",
         "sell_execution_disabled",
@@ -1682,7 +1685,7 @@ def _preflight_one_order(
     *,
     db: Session | None = None,
     live_cash_by_currency: dict | None = None,
-    pending_buys: Decimal | None = None,
+    pending_buys: dict | None = None,
     trade_date: str | None = None,
     daily_reserved: dict | None = None,
     cash_reserved: dict | None = None,
@@ -1813,23 +1816,25 @@ def _preflight_one_order(
     if max_pct is None or fresh_portfolio_pct > max_pct:
         return None, "fresh_portfolio_pct_limit_exceeded"
 
-    # 9b. Daily budget for this execution class, including everything this
-    # batch has already reserved. Only class policies define a daily cap;
-    # legacy policies keep their previous (per-order/per-batch) semantics.
+    # 9b. Daily budget — ADVISORY here. The real check-and-reserve is atomic
+    # and happens at the point of no return in _submit_prepared_order; doing
+    # it here too would either double-count or open a race. This early read
+    # only lets the batch fail fast with a useful reason.
     daily_audit = None
     if policy.get("max_daily_notional") is not None and db is not None:
-        reserved = (daily_reserved or {}).get(execution_class, Decimal("0"))
+        reserved = (daily_reserved or {}).get((execution_class, currency), Decimal("0"))
         daily_error, daily_audit = check_daily_budget(
             db,
             trade_date=trade_date or trade_date_for(settings),
             execution_class=execution_class,
+            currency=currency,
             additional_notional=actual_notional + reserved,
             max_daily_notional=policy["max_daily_notional"],
         )
         if daily_error:
             return None, daily_error
         if daily_reserved is not None:
-            daily_reserved[execution_class] = reserved + actual_notional
+            daily_reserved[(execution_class, currency)] = reserved + actual_notional
 
     # 9c. BUY ONLY — live balance, in the right currency, with a fee buffer
     # and a preserved reserve. snapshot.cash is never sufficient here.
@@ -1843,13 +1848,15 @@ def _preflight_one_order(
         # the account. Everything already reserved by earlier orders of this
         # same batch counts as pending, exactly like an external pending buy.
         already_reserved = (cash_reserved or {}).get(currency, Decimal("0"))
+        # Pending buys are looked up per currency — never a global total.
+        external_pending = (pending_buys or {}).get(currency, Decimal("0"))
         cash_error, cash_audit = evaluate_buy_cash(
             live_cash=live_cash,
             required_notional=actual_notional,
             currency=currency,
             fee_buffer_pct=_policy_number(policy, "fee_buffer_pct", 0.0),
             min_cash_reserve=_policy_number(policy, "min_cash_reserve", 0.0),
-            pending_notional=(pending_buys or Decimal("0")) + already_reserved,
+            pending_notional=external_pending + already_reserved,
         )
         if cash_error:
             return None, cash_error
@@ -1897,6 +1904,10 @@ def _preflight_one_order(
         "actual_notional": actual_notional,
         "execution_class": execution_class,
         "currency": currency,
+        # Carried so the atomic reservation at submission time uses exactly
+        # the limit and operating day this order was prepared against.
+        "max_daily_notional": policy.get("max_daily_notional"),
+        "trade_date": trade_date or trade_date_for(settings),
         "audit": audit,
     }, None
 
@@ -2072,9 +2083,21 @@ def prepare_validated_execution_batch(
                           f"could not read the live balance in {currency} ({str(exc)[:120]})")
             return None, "live_cash_unavailable"
 
-    pending_buys = pending_buy_notional(db, exclude_ids={o.id for o in intents})
     trade_date = trade_date_for(settings)
-    daily_reserved: dict[str, Decimal] = {}
+    # Pending buys are per CURRENCY and per operating day: a pending USD
+    # purchase must not shrink the peso allowance, and a submission left
+    # unreconciled last month must not reserve cash forever.
+    pending_by_currency: dict[str, Decimal] = {
+        currency: pending_buy_notional(
+            db,
+            currency=currency,
+            trade_date=trade_date,
+            settings=settings,
+            exclude_ids={o.id for o in intents},
+        )
+        for currency in buy_currencies
+    }
+    daily_reserved: dict[tuple[str, str], Decimal] = {}
     # Cash reserved by earlier buys of THIS batch, per currency.
     cash_reserved: dict[str, Decimal] = {}
 
@@ -2107,7 +2130,7 @@ def prepare_validated_execution_batch(
             live_positions, live_portfolio_value, policies,
             db=db,
             live_cash_by_currency=live_cash_by_currency,
-            pending_buys=pending_buys,
+            pending_buys=pending_by_currency,
             trade_date=trade_date,
             daily_reserved=daily_reserved,
             cash_reserved=cash_reserved,
@@ -2213,20 +2236,52 @@ def _submit_prepared_order(db: Session, prepared: dict, broker) -> str:
             return "uncertain"
         return "skipped"
 
+    # ATOMIC check-and-reserve of the daily budget, BEFORE the point of no
+    # return. This — not the advisory preflight read — is what enforces
+    # max_daily_notional: two concurrent approvals that each saw room in a
+    # plain SELECT cannot both win this UPDATE.
+    settings = get_settings()
+    execution_class = prepared.get("execution_class")
+    currency = prepared.get("currency") or ""
+    daily_limit = prepared.get("max_daily_notional")
+    trade_date = prepared.get("trade_date") or trade_date_for(settings)
+    if execution_class and daily_limit is not None:
+        reserve_error, reserve_audit = reserve_daily_budget(
+            db,
+            trade_date=trade_date,
+            execution_class=execution_class,
+            currency=currency,
+            notional=prepared["actual_notional"],
+            max_daily_notional=daily_limit,
+        )
+        if reserve_error:
+            # Nothing was sent: the reservation is what gates the send.
+            order_exec.status = "failed"
+            order_exec.error_message = (
+                f"{reserve_error}: daily budget could not be reserved atomically. "
+                "Order NOT sent."
+            )[:500]
+            order_exec.quantity_sent = None
+            order_exec.completed_at = datetime.now(timezone.utc)
+            br = dict(order_exec.broker_response or {})
+            audit = dict(br.get("request_audit") or {})
+            audit["daily_budget_reserve"] = reserve_audit
+            br["request_audit"] = audit
+            order_exec.broker_response = br
+            db.commit()
+            return "blocked"
+        br = dict(order_exec.broker_response or {})
+        audit = dict(br.get("request_audit") or {})
+        audit["daily_budget_reserve"] = reserve_audit
+        audit["trade_date"] = trade_date
+        audit["currency"] = currency
+        br["request_audit"] = audit
+        order_exec.broker_response = br
+
     # Point of no return: quantity_sent is set together with 'submitting',
-    # and the daily budget is consumed in the SAME commit. A preflight that
-    # never reached this line never eats into the day's allowance.
+    # in the SAME commit as the reservation above.
     order_exec.status = "submitting"
     order_exec.quantity_sent = order_exec.quantity_planned
-    execution_class = prepared.get("execution_class")
-    if execution_class:
-        consume_daily_budget(
-            db,
-            trade_date=trade_date_for(get_settings()),
-            execution_class=execution_class,
-            currency=prepared.get("currency") or "",
-            notional=prepared["actual_notional"],
-        )
     db.commit()
 
     try:

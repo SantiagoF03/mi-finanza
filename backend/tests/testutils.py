@@ -33,3 +33,47 @@ def decide_open_recommendations(db) -> list[int]:
     if decided:
         db.commit()
     return decided
+
+
+# ---------------------------------------------------------------------------
+# Execution catalog helpers
+# ---------------------------------------------------------------------------
+
+
+def verified_provenance(family: str = "securities") -> dict:
+    """Field provenance that makes a catalog entry `verified`.
+
+    Mirrors what a real resolution + administrative verification produces:
+    identity from IOL's title detail, quoting proven by an actual quote, and
+    tick/step explicitly signed off by a human. Tests whose subject is NOT
+    verification use this so they exercise their real assertion instead of
+    tripping over an unverified instrument.
+
+    Use plain `upsert_instrument(...)` without provenance to get a
+    `candidate` — that is the fail-closed default and has its own tests.
+    """
+    from app.broker.instrument_catalog import (
+        PROV_ADMIN_OVERRIDE,
+        PROV_IOL_QUOTE,
+        PROV_IOL_TITLE_DETAIL,
+    )
+
+    identity = {
+        "broker_symbol": PROV_IOL_TITLE_DETAIL,
+        "asset_type": PROV_IOL_TITLE_DETAIL,
+        "instrument_type": PROV_IOL_TITLE_DETAIL,
+        "currency": PROV_IOL_TITLE_DETAIL,
+    }
+    if family == "fund":
+        return identity
+    return {
+        **identity,
+        "market": PROV_IOL_TITLE_DETAIL,
+        "settlement": PROV_ADMIN_OVERRIDE,
+        "price_tick": PROV_ADMIN_OVERRIDE,
+        "quantity_step": PROV_ADMIN_OVERRIDE,
+        "minimum_quantity": PROV_ADMIN_OVERRIDE,
+        "buy_supported": PROV_IOL_QUOTE,
+        "sell_supported": PROV_IOL_QUOTE,
+        "quote_supported": PROV_IOL_QUOTE,
+    }
