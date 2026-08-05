@@ -48,6 +48,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets as _secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -57,7 +58,12 @@ from sqlalchemy.orm import Session
 from app.broker.execution_class import CLASS_FCI, FAMILY_FUND
 from app.broker.numeric import positive_decimal
 from app.core.config import get_settings
-from app.models.models import FundInstrument, FundOperation, FundOperationDecision
+from app.models.models import (
+    FundInstrument,
+    FundInstrumentVerification,
+    FundOperation,
+    FundOperationDecision,
+)
 from app.services.logs import app_log
 
 logger = logging.getLogger(__name__)
@@ -148,6 +154,45 @@ NO_RESUBMIT_STATES = {
     STATE_CONFIRMED, STATE_SUBMISSION_UNKNOWN, STATE_RECONCILIATION_REQUIRED,
 }
 
+# States that TIE UP capacity: money (or holdings) is committed even though
+# nothing is settled yet. `submission_unknown` counts precisely because we
+# cannot prove it did not reach IOL.
+CAPACITY_RESERVING_STATES = (
+    STATE_SUBMITTING, STATE_SUBMITTED, STATE_PENDING_CONFIRMATION,
+    STATE_SUBMISSION_UNKNOWN, STATE_RECONCILIATION_REQUIRED,
+)
+
+# Terminal states. `confirmed` belongs here too: once the fund confirms, the
+# real balance and the real holding reflect it, so counting it again would
+# subtract the same money twice.
+CAPACITY_FREE_STATES = (
+    STATE_PREPARED, STATE_VALIDATION_REQUESTED, STATE_VALIDATED,
+    STATE_APPROVAL_REQUESTED, STATE_CONFIRMED, STATE_REJECTED, STATE_CANCELLED,
+)
+
+# --- Daily ledger keys ------------------------------------------------------
+# Subscribing and redeeming are opposite flows and must never share a budget:
+# a day's worth of redemptions cannot license a subscription. They are also
+# separate from every securities class.
+LEDGER_CLASS_SUBSCRIBE = "FCI_SUBSCRIBE"
+LEDGER_CLASS_REDEEM = "FCI_REDEEM"
+
+# Keys written by earlier versions. Kept readable as audit, never counted:
+# adding them to the current key would charge the same money twice.
+LEGACY_LEDGER_CLASSES = {
+    OPERATION_SUBSCRIBE: f"{CLASS_FCI}:{OPERATION_SUBSCRIBE}",
+    OPERATION_REDEEM: f"{CLASS_FCI}:{OPERATION_REDEEM}",
+}
+
+
+def fci_ledger_class(operation: str) -> str:
+    """Explicit ledger key for one FCI side."""
+    if operation == OPERATION_SUBSCRIBE:
+        return LEDGER_CLASS_SUBSCRIBE
+    if operation == OPERATION_REDEEM:
+        return LEDGER_CLASS_REDEEM
+    raise ValueError(f"unknown fund operation: {operation!r}")
+
 
 def fund_confirmation_phrase(operation_id: int) -> str:
     return f"EJECUTAR OPERACION FCI {operation_id}"
@@ -224,6 +269,23 @@ def fci_execution_locked(settings) -> bool:
     return not bool(getattr(settings, "order_execution_enabled", False))
 
 
+def fund_capability_blocker(operation: str, settings) -> str | None:
+    """The per-capability flag for ONE side, or None if it is on.
+
+    Subscription and redemption are independent capabilities: being allowed to
+    put money into a fund says nothing about being allowed to take it out.
+    """
+    if operation == OPERATION_SUBSCRIBE:
+        if not bool(getattr(settings, "fci_subscription_enabled", False)):
+            return "fci_subscription_disabled"
+        return None
+    if operation == OPERATION_REDEEM:
+        if not bool(getattr(settings, "fci_redemption_enabled", False)):
+            return "fci_redemption_disabled"
+        return None
+    return "invalid_fund_operation"
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -235,6 +297,13 @@ def _err(message: str, code: str, status_code: int) -> dict:
 def get_fci_capability() -> dict:
     """Read-only capability report. Contains no secrets."""
     settings = get_settings()
+    locked = fci_execution_locked(settings)
+    subscription_flag = bool(getattr(settings, "fci_subscription_enabled", False))
+    redemption_flag = bool(getattr(settings, "fci_redemption_enabled", False))
+    limits_configured = bool(
+        getattr(settings, "fci_max_operation_amount", 0) > 0
+        and getattr(settings, "fci_max_daily_amount", 0) > 0
+    )
     return {
         "execution_class": CLASS_FCI,
         "execution_family": FAMILY_FUND,
@@ -248,31 +317,39 @@ def get_fci_capability() -> dict:
         "request_contract_verified": FCI_REQUEST_CONTRACT_VERIFIED,
         "request_fields": [FIELD_SIMBOLO, FIELD_MONTO, SOLO_VALIDAR_FIELD],
         "content_type": FCI_CONTENT_TYPE,
-        "subscription_flag_enabled": bool(getattr(settings, "fci_subscription_enabled", False)),
-        "redemption_flag_enabled": bool(getattr(settings, "fci_redemption_enabled", False)),
+        "subscription_flag_enabled": subscription_flag,
+        "redemption_flag_enabled": redemption_flag,
         # The GLOBAL lock is reported here too: a per-capability flag is a
         # second key, never a replacement for the master one.
-        "execution_locked": fci_execution_locked(settings),
-        "validation_ttl_seconds": getattr(settings, "fci_validation_ttl_seconds", 0),
-        "limits_configured": bool(
-            getattr(settings, "fci_max_operation_amount", 0) > 0
-            and getattr(settings, "fci_max_daily_amount", 0) > 0
+        "execution_locked": locked,
+        "global_execution_open": not locked,
+        # Validating and submitting are gated by the SAME two keys, reported
+        # separately so an operator can see which one is shut.
+        "can_validate_subscription": not locked and subscription_flag,
+        "can_validate_redemption": not locked and redemption_flag,
+        "can_submit_subscription": (
+            not locked and subscription_flag
+            and FCI_REQUEST_CONTRACT_VERIFIED and limits_configured
         ),
+        "can_submit_redemption": (
+            not locked and redemption_flag
+            and FCI_REQUEST_CONTRACT_VERIFIED and limits_configured
+        ),
+        "ledger_classes": {
+            OPERATION_SUBSCRIBE: LEDGER_CLASS_SUBSCRIBE,
+            OPERATION_REDEEM: LEDGER_CLASS_REDEEM,
+        },
+        "validation_ttl_seconds": getattr(settings, "fci_validation_ttl_seconds", 0),
+        "limits_configured": limits_configured,
         # Ready only when the global lock is OPEN, the capability flag is on,
         # the field mapping is verified and the limits are configured.
         "ready_for_real_subscription": (
-            FCI_REQUEST_CONTRACT_VERIFIED
-            and not fci_execution_locked(settings)
-            and bool(getattr(settings, "fci_subscription_enabled", False))
-            and getattr(settings, "fci_max_operation_amount", 0) > 0
-            and getattr(settings, "fci_max_daily_amount", 0) > 0
+            FCI_REQUEST_CONTRACT_VERIFIED and not locked
+            and subscription_flag and limits_configured
         ),
         "ready_for_real_redemption": (
-            FCI_REQUEST_CONTRACT_VERIFIED
-            and not fci_execution_locked(settings)
-            and bool(getattr(settings, "fci_redemption_enabled", False))
-            and getattr(settings, "fci_max_operation_amount", 0) > 0
-            and getattr(settings, "fci_max_daily_amount", 0) > 0
+            FCI_REQUEST_CONTRACT_VERIFIED and not locked
+            and redemption_flag and limits_configured
         ),
         "analysis_supported": True,
         "recommendation_supported": True,
@@ -293,6 +370,64 @@ def get_fund(db: Session, symbol) -> FundInstrument | None:
     if not key:
         return None
     return db.query(FundInstrument).filter(FundInstrument.symbol == key).first()
+
+
+FUND_STATUS_CANDIDATE = "candidate"
+FUND_STATUS_VERIFIED = "verified"
+FUND_STATUS_IDENTITY_CHANGED = "identity_changed"
+FUND_STATUS_REJECTED = "rejected"
+
+# What makes a fund the SAME fund. Cutoff, minimum and settlement delay are
+# operational parameters, not identity: they can be corrected without the
+# instrument becoming a different one.
+FUND_IDENTITY_FIELDS = ("symbol", "currency", "manager")
+
+
+def fund_identity_hash(fund: FundInstrument) -> str:
+    """Hash of what makes this fund THIS fund."""
+    canonical = json.dumps(
+        {field: str(getattr(fund, field, "") or "").strip().upper()
+         for field in FUND_IDENTITY_FIELDS},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def fund_operability_blockers(fund: FundInstrument, operation: str) -> list[str]:
+    """Stable codes explaining why a fund may not be operated. Empty = it may.
+
+    Order matters: the first code is what gets reported, so it must be the
+    most fundamental reason.
+    """
+    reasons: list[str] = []
+    if not bool(fund.active):
+        reasons.append("fund_inactive")
+    status = str(fund.verification_status or FUND_STATUS_CANDIDATE)
+    if status == FUND_STATUS_IDENTITY_CHANGED:
+        reasons.append("fund_identity_changed")
+    elif status == FUND_STATUS_REJECTED:
+        reasons.append("fund_rejected")
+    elif status != FUND_STATUS_VERIFIED:
+        reasons.append("fund_not_verified")
+
+    provenance = dict(fund.field_provenance or {})
+
+    def _verified(field: str) -> bool:
+        return provenance.get(field) in FUND_VERIFYING_PROVENANCES
+
+    if not fund.cutoff_local_time or not _verified("cutoff_local_time"):
+        reasons.append("fund_cutoff_unverified")
+    if not positive_decimal(fund.minimum_amount) or not _verified("minimum_amount"):
+        reasons.append("fund_minimum_unverified")
+    if not str(fund.currency or "").strip() or not _verified("currency"):
+        reasons.append("fund_currency_unverified")
+
+    if operation == OPERATION_SUBSCRIBE and not bool(fund.subscription_supported):
+        reasons.append("fund_subscription_unsupported")
+    if operation == OPERATION_REDEEM and not bool(fund.redemption_supported):
+        reasons.append("fund_redemption_unsupported")
+    return reasons
 
 
 def refresh_fund_catalog(db: Session, broker, *, settings=None) -> dict:
@@ -317,7 +452,7 @@ def refresh_fund_catalog(db: Session, broker, *, settings=None) -> dict:
 
     items = payload if isinstance(payload, list) else (payload or {}).get("titulos") or []
     now = _utcnow_naive()
-    created = updated = skipped = 0
+    created = updated = skipped = frozen = preserved = 0
 
     for item in items:
         if not isinstance(item, dict):
@@ -337,6 +472,15 @@ def refresh_fund_catalog(db: Session, broker, *, settings=None) -> dict:
         else:
             updated += 1
 
+        # --- Identity first. A refresh may correct operational parameters of
+        #     the SAME fund, but if the fund itself became something else, no
+        #     prior administrative verification applies to it.
+        previous_identity = {
+            field: getattr(fund, field, None) for field in FUND_IDENTITY_FIELDS
+        }
+        previous_hash = fund.identity_hash or ""
+        was_verified = fund.verification_status == FUND_STATUS_VERIFIED
+
         fund.name = str(item.get("descripcion") or item.get("nombre") or "")[:200]
         fund.manager = str(item.get("administradora") or "")[:200]
         fund.currency = _map_currency(item.get("moneda"))
@@ -344,6 +488,10 @@ def refresh_fund_catalog(db: Session, broker, *, settings=None) -> dict:
         fund.source = "iol_fci_catalog"
         fund.verified_at = now
         fund.active = True
+
+        new_hash = fund_identity_hash(fund)
+        identity_changed = bool(previous_hash) and previous_hash != new_hash
+        fund.identity_hash = new_hash
         # Identity is verified by IOL's own catalog. Operational parameters
         # (cutoff, minimum, delay) are only verified if the payload carries
         # them — otherwise they stay NULL and the fund cannot operate.
@@ -377,10 +525,45 @@ def refresh_fund_catalog(db: Session, broker, *, settings=None) -> dict:
             fund.settlement_delay_days = delay
             observed["settlement_delay_days"] = delay
 
-        # Preserve any field a human already verified: an automatic refresh
-        # must not silently demote an administrative confirmation.
         previous = dict(fund.field_provenance or {})
-        for field in ("cutoff_local_time", "minimum_amount", "settlement_delay_days"):
+
+        if identity_changed:
+            # FREEZE. The administrative override described a different fund,
+            # so it does not carry over — inheriting it is how an approval for
+            # fund A ends up authorising money into fund B.
+            fund.previous_identity = previous_identity
+            fund.pending_identity = {
+                field: getattr(fund, field, None) for field in FUND_IDENTITY_FIELDS
+            }
+            fund.verification_status = FUND_STATUS_IDENTITY_CHANGED
+            fund.subscription_supported = False
+            fund.redemption_supported = False
+            for field in observed:
+                provenance[field] = PROV_IOL_FCI_OBSERVED
+            fund.field_provenance = provenance
+            fund.raw_detail = {**(fund.raw_detail or {}),
+                               "_observed_operational": observed}
+            db.add(FundInstrumentVerification(
+                fund_symbol=fund.symbol,
+                action="identity_changed",
+                previous_status=FUND_STATUS_VERIFIED if was_verified
+                                else str(fund.verification_status or ""),
+                new_status=FUND_STATUS_IDENTITY_CHANGED,
+                currency=str(fund.currency or ""),
+                cutoff_local_time=fund.cutoff_local_time,
+                minimum_amount=fund.minimum_amount,
+                settlement_delay_days=fund.settlement_delay_days,
+                source="iol_fci_catalog",
+                note="La identidad del fondo cambió durante un refresh automático.",
+                identity_hash=new_hash,
+            ))
+            frozen += 1
+            continue
+
+        # Same fund: preserve any field a human already verified. An automatic
+        # refresh must not silently demote an administrative confirmation.
+        for field in ("cutoff_local_time", "minimum_amount", "settlement_delay_days",
+                      "currency"):
             if previous.get(field) == PROV_ADMIN_OVERRIDE:
                 provenance[field] = PROV_ADMIN_OVERRIDE
             elif field in observed:
@@ -396,16 +579,335 @@ def refresh_fund_catalog(db: Session, broker, *, settings=None) -> dict:
             if source in FUND_VERIFYING_PROVENANCES
         }
         operable = {"cutoff_local_time", "minimum_amount"} <= verified_fields
-        fund.verification_status = "verified" if operable else "candidate"
+        if fund.verification_status == FUND_STATUS_REJECTED:
+            # A human said no. A refresh is not an appeal.
+            fund.subscription_supported = False
+            fund.redemption_supported = False
+            continue
+        fund.verification_status = (
+            FUND_STATUS_VERIFIED if operable else FUND_STATUS_CANDIDATE
+        )
         # Capabilities are NOT inferred from cutoff+minimum being present.
-        # They stay off until a per-operation validation or an administrative
-        # confirmation says otherwise.
+        # They stay off until an administrative confirmation says otherwise.
         fund.subscription_supported = operable and bool(fund.subscription_supported)
         fund.redemption_supported = operable and bool(fund.redemption_supported)
+        if operable and was_verified:
+            preserved += 1
 
     db.commit()
     return {"created": created, "updated": updated, "skipped": skipped,
+            "identity_frozen": frozen, "verifications_preserved": preserved,
             "total": db.query(FundInstrument).count()}
+
+
+# ---------------------------------------------------------------------------
+# Administrative verification of a fund
+#
+# The catalog can READ a fund; only a human can VOUCH for it. These functions
+# never contact IOL, never touch a flag and never create an operation — they
+# record an assertion and change one row's verification state.
+# ---------------------------------------------------------------------------
+
+_CUTOFF_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+def _fund_verification_hash(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                   default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def verify_fund_instrument(
+    db: Session,
+    symbol: str,
+    *,
+    execution_key: str | None,
+    cutoff_local_time: str | None,
+    minimum_amount,
+    settlement_delay_days,
+    currency: str | None,
+    subscription_supported,
+    redemption_supported,
+    source: str = "",
+    note: str = "",
+) -> dict:
+    """Promote a fund to `verified` on a human's explicit assertion.
+
+    Every parameter must be stated. Nothing is inherited from the observed
+    catalog values: the whole point is that a human read the documentation and
+    is now asserting these numbers, so silently reusing an unverified reading
+    would defeat the exercise.
+
+    Never calls IOL. Never enables a flag. Never creates a FundOperation.
+    """
+    settings = get_settings()
+
+    if not settings.execution_admin_key:
+        return _err("Credencial de ejecución no configurada.",
+                    "execution_admin_key_not_configured", 423)
+    if not execution_key or not _secrets.compare_digest(
+        str(execution_key), settings.execution_admin_key
+    ):
+        return _err("Credencial de ejecución inválida o ausente.",
+                    "invalid_execution_key", 403)
+
+    if not str(note or "").strip():
+        return _err("Se requiere una nota que explique la verificación.",
+                    "verification_note_required", 422)
+
+    fund = get_fund(db, symbol)
+    if fund is None:
+        return _err("El fondo no está en el catálogo de FCI.",
+                    "fund_not_in_catalog", 404)
+
+    cutoff = str(cutoff_local_time or "").strip()
+    if not _CUTOFF_PATTERN.match(cutoff):
+        return _err("El cutoff debe tener formato HH:MM (24h).",
+                    "invalid_cutoff_format", 422)
+
+    minimum = positive_decimal(minimum_amount)
+    if minimum is None:
+        return _err("El monto mínimo debe ser mayor que cero.",
+                    "invalid_minimum_amount", 422)
+
+    try:
+        delay = int(settlement_delay_days)
+    except (TypeError, ValueError):
+        return _err("El plazo de liquidación debe ser un entero de días.",
+                    "invalid_settlement_delay", 422)
+    if delay < 0:
+        return _err("El plazo de liquidación no puede ser negativo.",
+                    "invalid_settlement_delay", 422)
+
+    stated_currency = str(currency or "").strip().upper()
+    if not stated_currency:
+        return _err("Se requiere confirmar la moneda del fondo.",
+                    "fund_currency_required", 422)
+    if stated_currency != str(fund.currency or "").strip().upper():
+        # The operator is describing a different fund from the one catalogued.
+        return _err(
+            f"La moneda declarada ({stated_currency}) no coincide con la del "
+            f"catálogo ({fund.currency}).",
+            "fund_currency_mismatch", 409,
+        )
+
+    # Both capabilities must be stated explicitly. Defaulting either one to
+    # True would hand out a capability nobody asked for.
+    if subscription_supported is None or redemption_supported is None:
+        return _err(
+            "Se requiere indicar explícitamente subscription_supported y "
+            "redemption_supported.",
+            "fund_capabilities_required", 422,
+        )
+    subscribe_ok = bool(subscription_supported)
+    redeem_ok = bool(redemption_supported)
+
+    if fund.verification_status == FUND_STATUS_IDENTITY_CHANGED:
+        # Verifying a frozen fund would rubber-stamp an identity change that
+        # nobody looked at. Resolve the change first.
+        return _err(
+            "El fondo está congelado por un cambio de identidad. "
+            "Revisá previous_identity y pending_identity antes de verificar.",
+            "fund_identity_changed", 409,
+        )
+
+    from app.broker.instrument_catalog import PROV_ADMIN_OVERRIDE, _utcnow_naive
+
+    previous_status = str(fund.verification_status or FUND_STATUS_CANDIDATE)
+    fund.cutoff_local_time = cutoff
+    fund.minimum_amount = float(minimum)
+    fund.settlement_delay_days = delay
+    fund.subscription_supported = subscribe_ok
+    fund.redemption_supported = redeem_ok
+    fund.verification_status = FUND_STATUS_VERIFIED
+    fund.verified_at = _utcnow_naive()
+    fund.identity_hash = fund_identity_hash(fund)
+    fund.field_provenance = {
+        **(fund.field_provenance or {}),
+        "cutoff_local_time": PROV_ADMIN_OVERRIDE,
+        "minimum_amount": PROV_ADMIN_OVERRIDE,
+        "settlement_delay_days": PROV_ADMIN_OVERRIDE,
+        "currency": PROV_ADMIN_OVERRIDE,
+    }
+
+    data_hash = _fund_verification_hash({
+        "symbol": fund.symbol,
+        "currency": stated_currency,
+        "cutoff_local_time": cutoff,
+        "minimum_amount": float(minimum),
+        "settlement_delay_days": delay,
+        "subscription_supported": subscribe_ok,
+        "redemption_supported": redeem_ok,
+    })
+    record = FundInstrumentVerification(
+        fund_symbol=fund.symbol,
+        action="verify",
+        previous_status=previous_status,
+        new_status=FUND_STATUS_VERIFIED,
+        currency=stated_currency,
+        cutoff_local_time=cutoff,
+        minimum_amount=float(minimum),
+        settlement_delay_days=delay,
+        subscription_supported=subscribe_ok,
+        redemption_supported=redeem_ok,
+        source=str(source or "")[:100],
+        note=str(note).strip()[:2000],
+        data_hash=data_hash,
+        identity_hash=fund.identity_hash,
+    )
+    db.add(record)
+    db.commit()
+
+    app_log(db, "Fondo FCI verificado administrativamente", context={
+        "fund_symbol": fund.symbol,
+        "previous_status": previous_status,
+        "new_status": fund.verification_status,
+        "verification_id": record.id,
+    })
+    db.commit()
+
+    return {
+        "fund_symbol": fund.symbol,
+        "previous_status": previous_status,
+        "verification_status": fund.verification_status,
+        "cutoff_local_time": fund.cutoff_local_time,
+        "minimum_amount": fund.minimum_amount,
+        "settlement_delay_days": fund.settlement_delay_days,
+        "subscription_supported": fund.subscription_supported,
+        "redemption_supported": fund.redemption_supported,
+        "verification_id": record.id,
+        "data_hash": data_hash,
+        # Said explicitly because it is the most likely misreading: verifying
+        # a fund does not turn any capability on.
+        "flags_unchanged": True,
+        "message": (
+            "Fondo verificado. Esto NO habilita la ejecución: siguen haciendo "
+            "falta ORDER_EXECUTION_ENABLED y el flag de la capacidad."
+        ),
+    }
+
+
+def _set_fund_status(
+    db: Session,
+    symbol: str,
+    *,
+    execution_key: str | None,
+    note: str,
+    action: str,
+    new_status: str,
+) -> dict:
+    """Shared body of reject and demote. Both block operation."""
+    settings = get_settings()
+    if not settings.execution_admin_key:
+        return _err("Credencial de ejecución no configurada.",
+                    "execution_admin_key_not_configured", 423)
+    if not execution_key or not _secrets.compare_digest(
+        str(execution_key), settings.execution_admin_key
+    ):
+        return _err("Credencial de ejecución inválida o ausente.",
+                    "invalid_execution_key", 403)
+    if not str(note or "").strip():
+        return _err("Se requiere una nota que explique la decisión.",
+                    "verification_note_required", 422)
+
+    fund = get_fund(db, symbol)
+    if fund is None:
+        return _err("El fondo no está en el catálogo de FCI.",
+                    "fund_not_in_catalog", 404)
+
+    from app.broker.instrument_catalog import PROV_ADMIN_OVERRIDE
+
+    previous_status = str(fund.verification_status or FUND_STATUS_CANDIDATE)
+    fund.verification_status = new_status
+    # Both capabilities go off. Neither a rejection nor a demotion leaves a
+    # fund half-operable.
+    fund.subscription_supported = False
+    fund.redemption_supported = False
+    # Withdraw the administrative provenance: the assertion is being taken
+    # back, so the fields must stop counting as verified.
+    fund.field_provenance = {
+        field: source for field, source in (fund.field_provenance or {}).items()
+        if source != PROV_ADMIN_OVERRIDE
+    }
+
+    record = FundInstrumentVerification(
+        fund_symbol=fund.symbol,
+        action=action,
+        previous_status=previous_status,
+        new_status=new_status,
+        currency=str(fund.currency or ""),
+        cutoff_local_time=fund.cutoff_local_time,
+        minimum_amount=fund.minimum_amount,
+        settlement_delay_days=fund.settlement_delay_days,
+        note=str(note).strip()[:2000],
+        identity_hash=fund.identity_hash or "",
+    )
+    db.add(record)
+    db.commit()
+
+    app_log(db, f"Fondo FCI {action}", context={
+        "fund_symbol": fund.symbol,
+        "previous_status": previous_status,
+        "new_status": new_status,
+        "verification_id": record.id,
+    })
+    db.commit()
+
+    return {
+        "fund_symbol": fund.symbol,
+        "previous_status": previous_status,
+        "verification_status": fund.verification_status,
+        "subscription_supported": False,
+        "redemption_supported": False,
+        "verification_id": record.id,
+        "message": "El fondo ya no puede operar.",
+    }
+
+
+def reject_fund_instrument(db: Session, symbol: str, *, execution_key, note: str) -> dict:
+    """A human refuses this fund. A later automatic refresh is not an appeal."""
+    return _set_fund_status(
+        db, symbol, execution_key=execution_key, note=note,
+        action="reject", new_status=FUND_STATUS_REJECTED,
+    )
+
+
+def demote_fund_instrument(db: Session, symbol: str, *, execution_key, note: str) -> dict:
+    """Withdraw a verification without refusing the fund outright."""
+    return _set_fund_status(
+        db, symbol, execution_key=execution_key, note=note,
+        action="demote", new_status=FUND_STATUS_CANDIDATE,
+    )
+
+
+def list_fund_verifications(db: Session, symbol: str) -> list[dict]:
+    """Append-only audit trail for one fund, newest first. No secrets."""
+    rows = (
+        db.query(FundInstrumentVerification)
+        .filter(FundInstrumentVerification.fund_symbol == str(symbol or "").strip().upper())
+        .order_by(FundInstrumentVerification.id.desc())
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "action": row.action,
+            "previous_status": row.previous_status,
+            "new_status": row.new_status,
+            "currency": row.currency,
+            "cutoff_local_time": row.cutoff_local_time,
+            "minimum_amount": row.minimum_amount,
+            "settlement_delay_days": row.settlement_delay_days,
+            "subscription_supported": row.subscription_supported,
+            "redemption_supported": row.redemption_supported,
+            "source": row.source,
+            "note": row.note,
+            "data_hash": row.data_hash,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -679,9 +1181,22 @@ def validate_fund_operation(db: Session, operation_id: int, broker) -> dict:
     # preparation for executing — with execution off, we do not make it.
     if fci_execution_locked(settings):
         return _err(
-            "Validación bloqueada: ejecución deshabilitada "
+            "Validación bloqueada: execution_locked "
             "(ORDER_EXECUTION_ENABLED=false).",
             "execution_locked", 423,
+        )
+
+    # And so does the per-capability flag. Validating a redemption we are not
+    # allowed to send is still an authenticated call about an operation that
+    # cannot happen: with the capability off there is nothing to pre-check.
+    # Refused BEFORE the broker is obtained, so no request of any kind exists,
+    # and BEFORE any write, so validated_at and the payload hash stay as they
+    # were.
+    capability_error = fund_capability_blocker(operation.operation, settings)
+    if capability_error:
+        return _err(
+            f"Operación de FCI deshabilitada por configuración: {capability_error}.",
+            capability_error, 423,
         )
 
     request, error = build_fund_request(operation, solo_validar=True)
@@ -773,15 +1288,12 @@ def submit_fund_operation(
             "execution_locked", 423,
         )
 
-    enabled = (
-        settings.fci_subscription_enabled if operation.operation == OPERATION_SUBSCRIBE
-        else settings.fci_redemption_enabled
-    )
-    if not enabled:
-        code = ("fci_subscription_disabled"
-                if operation.operation == OPERATION_SUBSCRIBE
-                else "fci_redemption_disabled")
-        return _err("Operación de FCI deshabilitada por configuración.", code, 423)
+    capability_error = fund_capability_blocker(operation.operation, settings)
+    if capability_error:
+        return _err(
+            f"Operación de FCI deshabilitada por configuración: {capability_error}.",
+            capability_error, 423,
+        )
 
     # A FRESH validation describing THIS request is mandatory.
     validation = validation_state(operation, settings=settings)
@@ -835,6 +1347,8 @@ def submit_fund_operation(
     except Exception as exc:
         return _err(f"Broker no disponible: {str(exc)[:200]}", "broker_unavailable", 502)
 
+    # READ-ONLY. Consumes no budget, so an operation refused here for having
+    # no cash or no holding costs the day's allowance nothing.
     preflight_error, preflight_audit = fund_live_preflight(
         db, operation, broker=broker, settings=settings
     )
@@ -844,17 +1358,21 @@ def submit_fund_operation(
         return _err(f"Preflight de FCI bloqueado: {preflight_error}.",
                     preflight_error, 409)
 
-    # Atomic claim → exactly one submission.
-    claimed = (
-        db.query(FundOperation)
-        .filter(FundOperation.id == operation.id,
-                FundOperation.status.notin_(sorted(NO_RESUBMIT_STATES)))
-        .update({"status": STATE_SUBMITTING}, synchronize_session=False)
+    # --- Claim + reserve, together or not at all. Only now does anything
+    #     become irreversible.
+    claim_error, claim_audit = claim_and_reserve_fund_operation(
+        db, operation, settings=settings
     )
-    if claimed != 1:
-        db.rollback()
-        return _err("La operación ya fue reclamada por otra solicitud.",
-                    "fund_operation_already_submitted", 409)
+    if claim_error:
+        db.refresh(operation)
+        if claim_error == "fund_operation_already_submitted":
+            return _err("La operación ya fue reclamada por otra solicitud.",
+                        claim_error, 409)
+        operation.blocked_reason = claim_error
+        db.commit()
+        return _err(f"Reserva de presupuesto bloqueada: {claim_error}.",
+                    claim_error, 409)
+
     db.add(FundOperationDecision(
         fund_operation_id=operation.id, decision="approved",
         note=note, preview_hash=str(preview_hash),
@@ -862,14 +1380,75 @@ def submit_fund_operation(
     db.commit()
     db.refresh(operation)
 
+    # The lifecycle dict lets us tell "never sent" from "may have been sent"
+    # even if the client raises: `request_started` is stamped by the client
+    # immediately before the POST begins.
+    lifecycle: dict = {}
     try:
-        result = broker.submit_fund_request(request)
+        result = broker.submit_fund_request(request, lifecycle=lifecycle)
     except Exception as exc:
-        result = {"outcome": "submission_unknown", "operation_id": "",
-                  "raw_response": {}, "http_requests_sent": 1,
-                  "error": f"Unexpected failure: {str(exc)[:200]}"}
+        # The client is supposed to convert failures into outcomes, so
+        # reaching here means the client itself broke. Which side of the point
+        # of no return it broke on is NOT a guess: it is recorded.
+        logger.exception("submit_fund_request raised for fund operation %s", operation.id)
+        started = bool(lifecycle.get("request_started"))
+        result = {
+            "outcome": "submission_unknown" if started else "local_error",
+            "operation_id": "",
+            "raw_response": {},
+            "http_requests_sent": 1 if started else 0,
+            "request_started": started,
+            "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+        }
 
     outcome = result.get("outcome")
+    requests_sent = int(result.get("http_requests_sent") or 0)
+
+    # --- Nothing left the process: undo the reservation and let the operator
+    #     try again. This is the ONLY path that releases budget automatically,
+    #     and it is safe precisely because no request exists to reconcile.
+    if requests_sent == 0 and outcome in ("local_error", "rejected"):
+        released = release_fund_budget(
+            db, operation, settings=settings,
+            reason=f"fund_submission_never_sent:{outcome}",
+        )
+        # Back to where the human left it. The claim already moved the row to
+        # `submitting`, so restore the validated status FIRST and then ask
+        # whether that validation is still alive — asking while the row says
+        # `submitting` would always answer no, and would silently demand a
+        # re-validation that the TTL had not actually expired.
+        operation.status = STATE_VALIDATED
+        if not validation_state(operation, settings=settings)["valid"]:
+            operation.status = STATE_PREPARED
+        operation.broker_response = result.get("raw_response", {}) or {}
+        operation.error_message = (result.get("error") or "")[:500]
+        operation.blocked_reason = str(outcome)
+        db.commit()
+        app_log(db, "Envío de FCI abortado antes de salir", context={
+            "fund_operation_id": operation.id,
+            "outcome": outcome,
+            "budget_released": released.get("released"),
+            "status": operation.status,
+        })
+        db.commit()
+        return {
+            "fund_operation_id": operation.id,
+            "operation": operation.operation,
+            "status": operation.status,
+            "broker_operation_id": "",
+            "outcome": outcome,
+            "http_requests_sent": 0,
+            "requires_reconciliation": False,
+            "budget_released": released,
+            "message": (
+                "No se envió ninguna request. El presupuesto reservado se liberó "
+                "y la operación puede reintentarse."
+            ),
+        }
+
+    # --- A request DID start. The budget stays reserved from here on: an
+    #     operation that may be live at IOL must not free capacity for a
+    #     second one.
     operation.broker_response = result.get("raw_response", {}) or {}
     if outcome == "submitted":
         operation.broker_operation_id = str(result.get("operation_id") or "")
@@ -878,6 +1457,10 @@ def submit_fund_operation(
         # exist when we submitted.
         operation.status = STATE_PENDING_CONFIRMATION
     elif outcome == "rejected":
+        # Refused by IOL AFTER the request arrived. Terminal, but the budget
+        # is not returned automatically — releasing it is an administrative
+        # act, because "IOL says no" and "IOL received nothing" are different
+        # facts and only the second one is provable here.
         operation.status = STATE_REJECTED
         operation.error_message = (result.get("error") or "Rejected")[:500]
     else:
@@ -893,6 +1476,8 @@ def submit_fund_operation(
         "operation": operation.operation,
         "fund_symbol": operation.fund_symbol,
         "status": operation.status,
+        "request_started": bool(result.get("request_started", True)),
+        "response_received": bool(result.get("response_received", False)),
     })
 
     return {
@@ -900,6 +1485,10 @@ def submit_fund_operation(
         "operation": operation.operation,
         "status": operation.status,
         "broker_operation_id": operation.broker_operation_id,
+        "outcome": outcome,
+        "http_requests_sent": requests_sent,
+        "request_started": bool(result.get("request_started", True)),
+        "response_received": bool(result.get("response_received", False)),
         "requires_reconciliation": operation.status == STATE_SUBMISSION_UNKNOWN,
         "immediate": False,
         "submissions_sent": 1,
@@ -916,27 +1505,30 @@ def submit_fund_operation(
 # ---------------------------------------------------------------------------
 
 
-def pending_fund_amount(db: Session, *, currency: str, exclude_id: int | None = None) -> Decimal:
-    """Amount tied up by fund operations we cannot yet call resolved.
-
-    A submitted-but-unconfirmed subscription has already committed money even
-    though the balance may not show it, and an ambiguous one may have too.
-    Counted per CURRENCY — pesos and dollars are separate.
-    """
+def _pending_fund_total(
+    db: Session,
+    *,
+    operation: str,
+    currency: str,
+    symbol: str | None = None,
+    exclude_id: int | None = None,
+) -> Decimal:
+    """Amount tied up by unresolved fund operations of ONE side."""
     rows = (
         db.query(FundOperation)
-        .filter(FundOperation.status.in_(
-            [STATE_SUBMITTING, STATE_SUBMITTED, STATE_PENDING_CONFIRMATION,
-             STATE_SUBMISSION_UNKNOWN, STATE_RECONCILIATION_REQUIRED]
-        ))
+        .filter(FundOperation.operation == operation)
+        .filter(FundOperation.status.in_(list(CAPACITY_RESERVING_STATES)))
         .all()
     )
     total = Decimal("0")
-    target = (currency or "").strip().upper()
+    target_currency = (currency or "").strip().upper()
+    target_symbol = (symbol or "").strip().upper() or None
     for row in rows:
         if exclude_id is not None and row.id == exclude_id:
             continue
-        if str(row.currency or "").strip().upper() != target:
+        if str(row.currency or "").strip().upper() != target_currency:
+            continue
+        if target_symbol and str(row.fund_symbol or "").strip().upper() != target_symbol:
             continue
         amount = positive_decimal(row.amount)
         if amount is not None:
@@ -944,19 +1536,60 @@ def pending_fund_amount(db: Session, *, currency: str, exclude_id: int | None = 
     return total
 
 
+def pending_fund_subscriptions(
+    db: Session, *, currency: str, exclude_id: int | None = None
+) -> Decimal:
+    """Cash already committed by unresolved SUBSCRIPTIONS, per currency.
+
+    Affects the spendable balance and nothing else. A pending subscription is
+    money on its way out; it does not make any holding smaller, so it must
+    never be subtracted from a redeemable position.
+
+    Not grouped by symbol: every subscription in a currency competes for the
+    same cash, whichever fund it goes to.
+    """
+    return _pending_fund_total(
+        db, operation=OPERATION_SUBSCRIBE, currency=currency, exclude_id=exclude_id
+    )
+
+
+def pending_fund_redemptions(
+    db: Session, *, symbol: str, currency: str, exclude_id: int | None = None
+) -> Decimal:
+    """Holding already committed by unresolved REDEMPTIONS of ONE fund.
+
+    Grouped by SYMBOL as well as currency: redeeming from fund A says nothing
+    about how much of fund B is left. And a pending redemption is money on its
+    way in — it never reduces the cash available to subscribe.
+    """
+    return _pending_fund_total(
+        db,
+        operation=OPERATION_REDEEM,
+        currency=currency,
+        symbol=symbol,
+        exclude_id=exclude_id,
+    )
+
+
 def fund_live_preflight(
     db: Session, operation: FundOperation, *, broker, settings, now: datetime | None = None
 ) -> tuple[str | None, dict]:
-    """Everything that must be true at the LAST possible moment.
+    """Everything that must be true at the LAST possible moment. READ-ONLY.
 
     Deliberately re-reads the world instead of trusting the preview: the
     preview is what a human approved, not a reservation of cash or holdings.
 
-    Subscription: live balance in the fund's OWN currency, minus pending fund
-    operations, minus the reserve, plus the cost buffer, above the minimum.
-    Redemption: live portfolio position in that exact fund, enough to cover
-    the amount, minus already-pending redemptions.
-    Both: the fund's own cutoff must still be open, and the daily cap must fit.
+    Subscription: live balance in the fund's OWN currency, minus pending
+    subscriptions, minus the reserve, plus the cost buffer, above the minimum.
+    Redemption: live position in that exact fund, minus pending redemptions of
+    that same fund.
+    Both: the fund's own cutoff must still be open.
+
+    This function does NOT touch the daily ledger. It used to reserve budget
+    before checking the live balance, so an operation refused for having no
+    money still burned that day's allowance — a preflight that fails must cost
+    nothing. Reserving is `claim_and_reserve_fund_operation`, called only once
+    every check here has passed.
     """
     audit: dict = {"operation": operation.operation, "currency": operation.currency}
     fund = get_fund(db, operation.fund_symbol)
@@ -983,27 +1616,22 @@ def fund_live_preflight(
         if amount < minimum:
             return "fund_minimum_amount_not_met", audit
 
-    # --- Daily cap, per currency ---
-    from app.services.execution_limits import reserve_daily_budget, trade_date_for
-
-    trade_date = trade_date_for(settings)
-    max_daily = getattr(settings, "fci_max_daily_amount", 0)
-    reserve_error, reserve_audit = reserve_daily_budget(
-        db,
-        trade_date=trade_date,
-        execution_class=f"{CLASS_FCI}:{operation.operation}",
-        currency=currency,
-        notional=amount,
-        max_daily_notional=max_daily,
-    )
-    audit["daily_budget"] = reserve_audit
-    if reserve_error:
-        return reserve_error, audit
-
-    pending = pending_fund_amount(db, currency=currency, exclude_id=operation.id)
-    audit["pending_fund_amount"] = float(pending)
+    # --- Per-operation cap. A read-only comparison; nothing is consumed. ---
+    max_operation = positive_decimal(getattr(settings, "fci_max_operation_amount", 0))
+    if max_operation is None:
+        return "fci_limits_not_configured", audit
+    audit["max_operation_amount"] = float(max_operation)
+    if amount > max_operation:
+        return "fci_operation_limit_exceeded", audit
 
     if operation.operation == OPERATION_SUBSCRIBE:
+        # Only OTHER subscriptions compete for this cash. A pending redemption
+        # is money coming IN and must not shrink the spendable balance.
+        pending = pending_fund_subscriptions(
+            db, currency=currency, exclude_id=operation.id
+        )
+        audit["pending_fund_subscriptions"] = float(pending)
+
         try:
             live_cash = broker.get_live_cash(currency)
         except Exception:
@@ -1023,7 +1651,12 @@ def fund_live_preflight(
             return cash_error, audit
         return None, {**audit, "passed": True}
 
-    # --- Redemption: the live holding must cover it ---
+    # --- Redemption: the live holding of THIS fund must cover it ---
+    pending = pending_fund_redemptions(
+        db, symbol=operation.fund_symbol, currency=currency, exclude_id=operation.id
+    )
+    audit["pending_fund_redemptions"] = float(pending)
+
     try:
         live = broker.get_portfolio_snapshot() or {}
     except Exception:
@@ -1053,6 +1686,95 @@ def fund_live_preflight(
         return "live_fund_position_insufficient", audit
 
     return None, {**audit, "passed": True}
+
+
+def claim_and_reserve_fund_operation(
+    db: Session, operation: FundOperation, *, settings
+) -> tuple[str | None, dict]:
+    """Claim the operation AND reserve its daily budget, together or not at all.
+
+    This is the point of no return's doorway, and the two writes are coupled on
+    purpose:
+
+    - claim without reserve → an operation stuck in `submitting` that never
+      gets sent and can never be retried;
+    - reserve without claim → a day's allowance burned by an operation someone
+      else is already submitting.
+
+    Both happen inside ONE uncommitted transaction, so a failure of either
+    rolls the other back. Concurrency is settled by the claim's conditional
+    UPDATE (only one caller can move the row out of a resubmittable state) and
+    by the ledger's own conditional UPDATE (the limit lives in the WHERE
+    clause, so the arithmetic happens in the database).
+
+    Returns (error_code, audit). None means: claimed, reserved, committed.
+    """
+    from app.services.execution_limits import reserve_daily_budget, trade_date_for
+
+    amount = positive_decimal(operation.amount)
+    currency = str(operation.currency or "").strip().upper()
+    trade_date = trade_date_for(settings)
+    ledger_class = fci_ledger_class(operation.operation)
+    audit = {
+        "trade_date": trade_date,
+        "execution_class": ledger_class,
+        "currency": currency,
+    }
+    if amount is None:
+        return "invalid_fund_amount", audit
+
+    claimed = (
+        db.query(FundOperation)
+        .filter(FundOperation.id == operation.id,
+                FundOperation.status.notin_(sorted(NO_RESUBMIT_STATES)))
+        .update({"status": STATE_SUBMITTING}, synchronize_session=False)
+    )
+    if claimed != 1:
+        # Someone else got there first. Nothing was reserved: the ledger write
+        # is below this line, not above it.
+        db.rollback()
+        return "fund_operation_already_submitted", {**audit, "claimed": False}
+    audit["claimed"] = True
+
+    reserve_error, reserve_audit = reserve_daily_budget(
+        db,
+        trade_date=trade_date,
+        execution_class=ledger_class,
+        currency=currency,
+        notional=amount,
+        max_daily_notional=getattr(settings, "fci_max_daily_amount", 0),
+    )
+    audit["daily_budget"] = reserve_audit
+    if reserve_error:
+        # Rolls back the claim too, so the operation does NOT stay in
+        # `submitting` for a submission that will never happen.
+        db.rollback()
+        return reserve_error, {**audit, "reserved": False}
+
+    audit["reserved"] = True
+    return None, audit
+
+
+def release_fund_budget(db: Session, operation: FundOperation, *, settings, reason: str) -> dict:
+    """Give back budget reserved for a submission that never left.
+
+    Called ONLY when we can prove no request started. An ambiguous outcome
+    keeps its reservation: releasing budget for an operation that may be live
+    at IOL would let the day's allowance be spent twice on the same money.
+    """
+    from app.services.execution_limits import release_daily_budget, trade_date_for
+
+    amount = positive_decimal(operation.amount)
+    if amount is None:
+        return {"released": False, "reason": "invalid_notional"}
+    return release_daily_budget(
+        db,
+        trade_date=trade_date_for(settings),
+        execution_class=fci_ledger_class(operation.operation),
+        currency=str(operation.currency or "").strip().upper(),
+        notional=amount,
+        reason=reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1089,6 +1811,19 @@ def create_fund_operation(
         # something to send money to.
         return _err("El fondo no está en el catálogo de FCI.",
                     "fund_not_in_catalog", 404)
+
+    # Being IN the catalog is not the same as being fit to operate. Reading a
+    # fund read-only makes it visible; only an administrative verification
+    # makes its cutoff, its minimum and its currency trustworthy enough to
+    # time and size real money. An approvable operation on a `candidate` is
+    # exactly the thing that looks safe and is not.
+    blocked = fund_operability_blockers(fund, operation)
+    if blocked:
+        return _err(
+            f"El fondo no está habilitado para operar: {blocked[0]}. "
+            "Verificá el fondo con POST /api/funds/catalog/{symbol}/verify.",
+            blocked[0], 409,
+        )
 
     # The documented contract expresses BOTH sides by Monto, so a positive
     # amount is always required — there is no cuotapartes request to build.

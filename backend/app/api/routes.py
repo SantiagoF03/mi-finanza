@@ -62,6 +62,59 @@ def broker_execution_readiness(db: Session = Depends(get_db), _auth=Depends(requ
     return get_execution_readiness(db)
 
 
+@router.get("/broker/pilot-readiness")
+def broker_pilot_readiness(
+    symbols: str | None = None,
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Technical aptitude for a controlled pilot, per symbol and per class.
+
+    READ-ONLY: no orders, no catalog writes, no flag changes. It may read a
+    quote to check that the side of the book it needs actually exists; without
+    a broker it reports that as unavailable rather than assuming it.
+
+    This is NOT investment advice. `suggested_pilot_max_*` are technical
+    ceilings (one lot, the tightest applicable limit), not targets.
+
+    `symbols=BYMA,SPY` restricts the report; omitted, every catalogued
+    securities instrument is evaluated.
+    """
+    from app.services.pilot_readiness import evaluate_pilot_readiness
+
+    requested = [s.strip() for s in (symbols or "").split(",") if s.strip()]
+
+    broker = None
+    try:
+        from app.services.execution import _get_execution_broker
+        broker = _get_execution_broker()
+    except Exception:
+        # A quote probe is a nice-to-have. The catalog and policy half of the
+        # report is still worth returning, with the quote half marked
+        # unavailable — which is honest, and blocks either way.
+        broker = None
+
+    return evaluate_pilot_readiness(db, symbols=requested or None, broker=broker)
+
+
+@router.get("/broker/pilot-policy-template")
+def broker_pilot_policy_template(
+    symbols: str | None = None,
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """A reviewable JSON draft of the execution policy variables.
+
+    Writes nothing — not the database, not the environment, not Railway. Every
+    unverified value comes back as `null` on purpose: filling one in by hand is
+    an assertion, and the template must never make that assertion for you.
+    """
+    from app.services.pilot_readiness import build_pilot_policy_template
+
+    requested = [s.strip() for s in (symbols or "").split(",") if s.strip()]
+    return build_pilot_policy_template(db, symbols=requested or None)
+
+
 @router.get("/broker/instrument-capabilities")
 def broker_instrument_capabilities(
     db: Session = Depends(get_db),
@@ -457,14 +510,146 @@ def refresh_fund_catalog_endpoint(
     return result
 
 
+class FundVerifyIn(BaseModel):
+    """Every operational parameter, stated explicitly by a human.
+
+    Nothing defaults to the observed catalog value: the whole point of this
+    endpoint is that someone read the documentation and is now asserting these
+    numbers. Silently reusing an unverified reading would defeat that.
+    """
+
+    cutoff_local_time: str
+    minimum_amount: float
+    settlement_delay_days: int
+    currency: str
+    subscription_supported: bool
+    redemption_supported: bool
+    note: str
+    source: str = ""
+
+
+@router.post("/funds/catalog/{symbol}/verify")
+def verify_fund_endpoint(
+    symbol: str,
+    payload: FundVerifyIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Promote a catalogued fund to `verified`, on the record.
+
+    Contacts nothing: no IOL call, no flag change, no FundOperation. It writes
+    one audit row and one verification state. Operating still requires the
+    global lock open AND the capability flag.
+    """
+    from app.services.fci import verify_fund_instrument
+    result = verify_fund_instrument(
+        db, symbol,
+        execution_key=x_execution_key,
+        cutoff_local_time=payload.cutoff_local_time,
+        minimum_amount=payload.minimum_amount,
+        settlement_delay_days=payload.settlement_delay_days,
+        currency=payload.currency,
+        subscription_supported=payload.subscription_supported,
+        redemption_supported=payload.redemption_supported,
+        source=payload.source,
+        note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+class FundVerificationDecisionIn(BaseModel):
+    note: str
+
+
+@router.post("/funds/catalog/{symbol}/reject")
+def reject_fund_endpoint(
+    symbol: str,
+    payload: FundVerificationDecisionIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Refuse a fund. A later automatic refresh does not overturn this."""
+    from app.services.fci import reject_fund_instrument
+    result = reject_fund_instrument(
+        db, symbol, execution_key=x_execution_key, note=payload.note
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.post("/funds/catalog/{symbol}/demote")
+def demote_fund_endpoint(
+    symbol: str,
+    payload: FundVerificationDecisionIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Withdraw a verification without refusing the fund outright."""
+    from app.services.fci import demote_fund_instrument
+    result = demote_fund_instrument(
+        db, symbol, execution_key=x_execution_key, note=payload.note
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.get("/funds/catalog/{symbol}")
+def get_fund_catalog_entry(
+    symbol: str,
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Read-only fund state + verification audit trail. No secrets.
+
+    Informational for a `candidate` too: seeing why a fund cannot operate is
+    exactly what tells an operator what to verify.
+    """
+    from app.services.fci import (
+        OPERATION_REDEEM,
+        OPERATION_SUBSCRIBE,
+        fund_operability_blockers,
+        get_fund,
+        list_fund_verifications,
+    )
+
+    fund = get_fund(db, symbol)
+    if fund is None:
+        raise HTTPException(404, "El fondo no está en el catálogo de FCI.")
+    return {
+        "symbol": fund.symbol,
+        "name": fund.name,
+        "manager": fund.manager,
+        "currency": fund.currency,
+        "active": fund.active,
+        "verification_status": fund.verification_status,
+        "cutoff_local_time": fund.cutoff_local_time,
+        "minimum_amount": fund.minimum_amount,
+        "settlement_delay_days": fund.settlement_delay_days,
+        "subscription_supported": fund.subscription_supported,
+        "redemption_supported": fund.redemption_supported,
+        "field_provenance": fund.field_provenance or {},
+        "previous_identity": fund.previous_identity,
+        "pending_identity": fund.pending_identity,
+        "subscription_blockers": fund_operability_blockers(fund, OPERATION_SUBSCRIBE),
+        "redemption_blockers": fund_operability_blockers(fund, OPERATION_REDEEM),
+        "verifications": list_fund_verifications(db, fund.symbol),
+    }
+
+
 @router.get("/broker/fci-capability")
 def broker_fci_capability(_auth=Depends(require_api_key)):
     """Whether the app can execute FCI subscriptions/redemptions.
 
-    Phase 0 result: it cannot. No official IOL contract for FCI
-    subscription/redemption has been verified by this repository, so the app
-    analyses, displays and recommends FCI, but the operation itself must be
-    performed manually in IOL. See docs/IOL_FCI_CAPABILITY.md.
+    The endpoints and the request contract are official and implemented; what
+    keeps FCI off is configuration — the global lock, the per-capability flags
+    and the FCI limits. See docs/IOL_FCI_CAPABILITY.md.
     """
     from app.services.fci import get_fci_capability
     return get_fci_capability()
@@ -961,6 +1146,54 @@ def create_execution_pilot(
         quantity=payload.quantity,
         confirmation_text=payload.confirmation_text,
         note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.post("/execution-pilot/securities")
+def create_securities_pilot(
+    payload: ExecutionPilotIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Create ONE controlled securities pilot (ACCIONES or CEDEARS, buy or sell).
+
+    Four independent pilots share this endpoint; which one you get is decided
+    entirely by the explicit symbol + side you pass. Nothing is implied: no
+    default symbol, no default side, no default quantity, and a confirmation
+    phrase that names all three, so the phrase for one pilot cannot authorise
+    another.
+
+    Creates a `pending` Recommendation and nothing else. It never quotes for
+    execution, never approves, never sends, and never reuses or supersedes an
+    existing recommendation — an open pending decision blocks creation instead.
+
+    The only execution path remains POST /recommendations/{id}/approve.
+    """
+    from app.services.execution_pilot import create_securities_pilot_recommendation
+
+    broker = None
+    try:
+        from app.services.execution import _get_execution_broker
+        broker = _get_execution_broker()
+    except Exception:
+        # No broker ⇒ no quote ⇒ the side is not technically ready ⇒ refused.
+        # That is the correct outcome: a pilot must not be created for a side
+        # we could not price.
+        broker = None
+
+    result = create_securities_pilot_recommendation(
+        db,
+        execution_key=x_execution_key,
+        symbol=payload.symbol,
+        side=payload.side,
+        quantity=payload.quantity,
+        confirmation_text=payload.confirmation_text,
+        note=payload.note,
+        broker=broker,
     )
     if "error" in result:
         raise HTTPException(result.get("status_code", 400), result["error"])

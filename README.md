@@ -231,10 +231,50 @@ FCI_REDEMPTION_ENABLED=false
 `EXECUTION_SELL_ONLY` está **deprecado pero no eliminado**: mientras esté en
 `true` sigue bloqueando toda compra y sigue autorizando el camino legacy de
 venta, así que la configuración productiva actual no cambia de comportamiento.
-Migración: poner `SECURITIES_SELL_ENABLED=true` y recién después
-`EXECUTION_SELL_ONLY=false`.
+
+Migración por etapas, cada una con su propia política:
+
+| Etapa | Flags | Qué habilita |
+|---|---|---|
+| **Legacy** | `EXECUTION_SELL_ONLY=true`, ambos `SECURITIES_*=false` | Sólo la venta legacy de BYMA, tal como ya se ejecutó |
+| **ACCIONES** | `EXECUTION_SELL_ONLY=false`, `SECURITIES_BUY_ENABLED=true`, `SECURITIES_SELL_ENABLED=true` | Con una policy `ACCIONES` conservadora |
+| **CEDEARS** | Mismos flags globales | Con una policy `CEDEARS` **independiente** |
+
+`GET /api/broker/execution-readiness` reporta cada tramo por separado —
+`legacy_byma.legacy_sell_path_ready`, `acciones.buy_ready`,
+`acciones.sell_ready`, `cedears.buy_ready`, `cedears.sell_ready`— y **nunca
+declara lista una clase entera porque un símbolo lo esté**: `covered_symbols` y
+`*_ready` son datos distintos, reportados aparte por eso mismo.
+
+También devuelve `next_safe_action` (determinístico, derivado de los bloqueos:
+`resolve_instruments` → `verify_instrument_fields` → `configure_class_policies`
+→ `configure_fci_limits` → `verify_fund` → `run_sandbox_validation` →
+`ready_for_controlled_pilot`) y distingue `technically_ready_but_locked` de
+`ready_for_real_execution`: con el candado cerrado, lo segundo es `false` por
+construcción.
 
 Ni el scheduler ni ningún endpoint público pueden cambiar estos flags.
+
+### Pilotos controlados
+
+`POST /api/execution-pilot/securities` crea **una** recomendación `pending`
+marcada `metadata_json.execution_pilot=true`. Cuatro pilotos independientes
+(ACCIONES buy/sell, CEDEARS buy/sell) comparten el endpoint; cuál se crea lo
+decide únicamente el símbolo y el lado explícitos. Nada se implica: sin símbolo
+por defecto, sin lado por defecto, sin cantidad por defecto, y con una frase de
+confirmación que nombra los tres —`CREAR PILOTO SELL BYMA 1`— **así que la
+frase de un piloto no autoriza otro**.
+
+Exige `EXECUTION_PILOT_CREATION_ENABLED=true`, el símbolo `technically_ready`
+para **ese lado**, cantidad múltiplo del step y dentro del tope técnico. Crear
+no es aprobar y no es enviar: si hay una decisión pendiente, la creación se
+**bloquea** en vez de superponerse — Recommendation 13 nunca se toca.
+
+El camino legacy (`POST /api/execution-pilot/recommendations`, frase
+`CREAR PILOTO BYMA 1`) sigue existiendo sin cambios: ya ejecutó una venta real
+de punta a punta y migrarlo no es gratis.
+
+Runbook completo: `docs/SECURITIES_ACTIVATION_RUNBOOK.md`.
 
 ## Compra de títulos: preflight de saldo vivo
 
@@ -375,13 +415,83 @@ broker hecha en preparación para ejecutar. Devuelve `423 execution_locked`.
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/api/funds/operations` | Prepara la operación (no llama al broker) |
+| POST | `/api/funds/operations` | Prepara la operación (sólo fondos `verified`) |
 | POST | `/api/funds/operations/{id}/validate` | `soloValidar=true`, un solo POST |
 | GET | `/api/funds/operations/{id}/preview` | Preview firmado, read-only |
 | POST | `/api/funds/operations/{id}/submit` | `soloValidar=false`, un solo POST |
 | GET | `/api/funds/operations/{id}` | Estado, sin secretos |
 | POST | `/api/funds/operations/{id}/reconcile` | Conciliación humana |
 | POST | `/api/funds/catalog/refresh` | Refresca el catálogo de fondos |
+| GET | `/api/funds/catalog/{symbol}` | Estado del fondo + auditoría de verificación |
+| POST | `/api/funds/catalog/{symbol}/verify` | Verificación administrativa |
+| POST | `/api/funds/catalog/{symbol}/reject` | Rechaza el fondo |
+| POST | `/api/funds/catalog/{symbol}/demote` | Retira la verificación |
+
+### Un fondo catalogado no es un fondo operable
+
+`create_fund_operation` exige `verification_status=verified`, no sólo que el
+símbolo exista. Un `candidate` se rechaza con `fund_not_verified`: leer un
+fondo lo hace visible, no confiable para temporizar y dimensionar plata real.
+
+`POST /api/funds/catalog/{symbol}/verify` promueve un fondo **sobre la
+afirmación explícita de un humano**: cutoff, mínimo, plazo, moneda y cada
+capacidad por separado, todos obligatorios, ninguno heredado del valor
+observado. Escribe una fila de auditoría (`FundInstrumentVerification`) con el
+hash de lo verificado. **No llama a IOL, no enciende ningún flag y no crea
+ninguna operación.**
+
+Un refresh automático **preserva** esa verificación mientras símbolo, moneda y
+administradora no cambien. Si cambian, el fondo se **congela** en
+`identity_changed`: una aprobación dada para el fondo A no autoriza plata al
+fondo B.
+
+### El orden del envío: la reserva va después de las consultas vivas
+
+1. validaciones puras (estado, monto, cutoff, mínimo, flags, validación fresca,
+   preview firmado, credencial, frase);
+2. consultas **vivas** read-only (saldo, tenencia, pendientes por tipo);
+3. **claim atómico + reserva del cupo diario, en la misma transacción**;
+4. **un** POST.
+
+Antes, la reserva ocurría en el paso 2: una operación rechazada por falta de
+saldo igual quemaba cupo del día, y la siguiente —fondeada— podía chocar con un
+límite que la primera nunca tuvo derecho a consumir. Y el claim y la reserva
+viven o mueren juntos: un claim sin reserva dejaría la operación en
+`submitting` para siempre, ni enviable ni reintentable.
+
+### Pendientes por tipo, no por total
+
+| Función | Afecta | Agrupa por |
+|---|---|---|
+| `pending_fund_subscriptions` | efectivo disponible | moneda |
+| `pending_fund_redemptions` | tenencia rescatable | símbolo **y** moneda |
+
+Una suscripción pendiente es plata saliendo: no achica ninguna tenencia. Un
+rescate pendiente es plata entrando: no achica el efectivo. Y rescatar del
+fondo A no dice nada sobre cuánto queda del B.
+
+Reservan capacidad: `submitting`, `submitted`, `pending_confirmation`,
+`submission_unknown`, `reconciliation_required`. No reservan: `prepared`,
+`validated`, `rejected`, `cancelled` y `confirmed` — este último porque el
+saldo real ya lo refleja, y contarlo otra vez restaría la misma plata dos
+veces.
+
+### El ciclo de vida de la request: "no se envió" ≠ "quizás se envió"
+
+El cliente estampa un `lifecycle` a medida que avanza: `before_send`,
+`request_started`, `response_received`, `response_parsed`. `request_started` se
+marca justo antes de que empiece el POST, que es el único límite demostrable:
+antes de ahí no salió nada, después no podemos probar que no salió.
+
+| Falla | `http_requests_sent` | Estado | Cupo |
+|---|---|---|---|
+| Antes del POST (auth, request inválida, bug local) | **0** | vuelve a `validated` | **se libera** |
+| Durante o después del POST (timeout, 5xx, 2xx sin `numeroOperacion`) | 1 | `submission_unknown` | **se conserva** |
+
+Un `except Exception` que inventa `http_requests_sent=1` deja una operación
+esperando conciliación humana para siempre por un bug que nunca tocó la red.
+
+Runbook completo: `docs/FCI_ACTIVATION_RUNBOOK.md`.
 
 ## Cancelación real de órdenes
 
@@ -448,7 +558,10 @@ La app es instalable como PWA (Progressive Web App):
 |---|---|---|
 | POST | `/api/recommendations/{id}/approve` | Aprobar y ejecutar órdenes |
 | POST | `/api/recommendations/{id}/reject` | Rechazar sin ejecutar |
-| GET | `/api/broker/execution-readiness` | Readiness por capacidad, límites y cobertura |
+| GET | `/api/broker/execution-readiness` | Readiness por capacidad, por clase, límites y `next_safe_action` |
+| GET | `/api/broker/pilot-readiness` | Aptitud **técnica** por símbolo y lado (puede leer cotización) |
+| GET | `/api/broker/pilot-policy-template` | Borrador JSON de políticas, para revisar. No escribe nada |
+| POST | `/api/execution-pilot/securities` | Crea UN piloto controlado (`pending`, sin aprobar) |
 | GET | `/api/broker/instrument-capabilities` | Matriz read-only: buy/sell ready y motivos de bloqueo |
 | POST | `/api/broker/instrument-catalog/refresh` | Refresca identidad desde datos read-only del broker |
 | GET | `/api/broker/fci-capability` | Estado de la capacidad FCI (bloqueada y por qué) |

@@ -739,6 +739,7 @@ def get_execution_readiness(db: Session | None = None) -> dict:
         sell_capability_enabled,
     )
     from app.services.fci import get_fci_capability
+    from app.services.pilot_readiness import next_safe_action
 
     settings = get_settings()
     env = resolve_execution_environment(settings)
@@ -794,7 +795,10 @@ def get_execution_readiness(db: Session | None = None) -> dict:
         )
     )
 
-    return {
+    per_class = _per_class_readiness(db, settings, class_policies, buy_enabled, sell_enabled)
+    fund_report = _fund_readiness(db)
+
+    report = {
         "broker_mode": settings.broker_mode,
         "configured_broker_mode": settings.broker_mode,
         "environment": env["environment"],
@@ -901,6 +905,105 @@ def get_execution_readiness(db: Session | None = None) -> dict:
         # mapping. A flag alone can never make an unverified wire format safe.
         "ready_for_real_fci_subscription": fci["ready_for_real_subscription"],
         "ready_for_real_fci_redemption": fci["ready_for_real_redemption"],
+
+        # --- Per-class rollup. A class is never ready because ONE symbol is:
+        #     `covered_symbols` and `*_ready` are deliberately separate facts.
+        "legacy_byma": {
+            "legacy_sell_path_ready": legacy_sell_bridge_active(settings),
+            "execution_sell_only": bool(settings.execution_sell_only),
+            "symbol": "BYMA",
+            "note": (
+                "Camino legacy conservado por compatibilidad con el piloto ya "
+                "ejecutado. Migración: SECURITIES_SELL_ENABLED=true y luego "
+                "EXECUTION_SELL_ONLY=false."
+            ),
+        },
+        "acciones": per_class["ACCIONES"],
+        "cedears": per_class["CEDEARS"],
+        "fci": {
+            "subscription_ready": fci["ready_for_real_subscription"],
+            "redemption_ready": fci["ready_for_real_redemption"],
+            "can_validate_subscription": fci["can_validate_subscription"],
+            "can_validate_redemption": fci["can_validate_redemption"],
+            "limits_configured": fci["limits_configured"],
+            **fund_report,
+        },
+    }
+
+    # `next_safe_action` is derived from the report, so it can never disagree
+    # with the blockers printed next to it.
+    report["next_safe_action"] = next_safe_action(report)
+    # "Everything technical is done" and "we are allowed to send" are two
+    # different statements, and collapsing them is how a locked system reads
+    # as ready.
+    report["technically_ready_but_locked"] = bool(
+        blocking == ["execution_locked"] and not settings.order_execution_enabled
+    )
+    return report
+
+
+def _per_class_readiness(
+    db: Session | None, settings, class_policies: dict,
+    buy_enabled: bool, sell_enabled: bool,
+) -> dict:
+    """Coverage per securities class, without touching the broker.
+
+    Symbol-level readiness lives in /api/broker/pilot-readiness, which may read
+    quotes. This one answers the cheaper question — is the class configured,
+    and which of its catalogued instruments are usable — so the readiness
+    endpoint stays free of network calls.
+    """
+    from app.broker.execution_class import CLASS_ACCIONES, CLASS_CEDEARS
+    from app.broker.instrument_catalog import catalog_entry_status, list_catalog
+
+    result: dict = {}
+    entries = list_catalog(db) if db is not None else []
+    for execution_class in (CLASS_ACCIONES, CLASS_CEDEARS):
+        policy = class_policies.get(execution_class)
+        members = [e for e in entries if e.execution_class == execution_class]
+        covered: list[str] = []
+        blocked: list[dict] = []
+        for entry in members:
+            code, _ = catalog_entry_status(
+                entry, max_age_seconds=(policy or {}).get("catalog_max_age_seconds")
+            )
+            if code:
+                blocked.append({"symbol": entry.broker_symbol, "reasons": [code]})
+            else:
+                covered.append(entry.broker_symbol)
+        result[execution_class] = {
+            "policy_configured": policy is not None,
+            "class_buy_enabled": bool((policy or {}).get("buy_enabled")),
+            "class_sell_enabled": bool((policy or {}).get("sell_enabled")),
+            # Policy AND global flag AND at least one usable instrument.
+            "buy_ready": bool(policy) and bool(policy.get("buy_enabled")) and buy_enabled
+                         and bool(covered),
+            "sell_ready": bool(policy) and bool(policy.get("sell_enabled")) and sell_enabled
+                          and bool(covered),
+            "covered_symbols": sorted(covered),
+            "blocked_symbols": blocked,
+        }
+    return result
+
+
+def _fund_readiness(db: Session | None) -> dict:
+    """Which funds are verified and which are still candidates."""
+    if db is None:
+        return {"verified_funds": [], "candidate_funds": [], "catalog_available": False}
+
+    from app.models.models import FundInstrument
+
+    verified: list[str] = []
+    candidates: list[str] = []
+    for fund in db.query(FundInstrument).order_by(FundInstrument.symbol).all():
+        if fund.verification_status == "verified" and bool(fund.active):
+            verified.append(fund.symbol)
+        else:
+            candidates.append(fund.symbol)
+    return {
+        "verified_funds": verified,
+        "candidate_funds": candidates,
+        "catalog_available": True,
     }
 
 

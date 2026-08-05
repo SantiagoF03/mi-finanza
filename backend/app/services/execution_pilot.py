@@ -280,3 +280,260 @@ def _create_pilot_locked(db: Session, snapshot, position, note: str, lease_owner
 # superseded_at/metadata but left the previous recommendation `pending`,
 # which could leave two open recommendations at once. The central gate now
 # blocks pilot creation instead of superseding anything.
+
+
+# ---------------------------------------------------------------------------
+# Generic controlled pilots — one per (class, side)
+#
+# Four independent pilots: ACCIONES buy, ACCIONES sell, CEDEARS buy, CEDEARS
+# sell. Independent because proving a sell works proves nothing about a buy:
+# a buy needs live cash and an ask, a sell needs a live holding and a bid.
+#
+# This creates a Recommendation and nothing else. It never quotes, never
+# approves, never sends, and never touches an existing recommendation — in
+# particular not Recommendation 12 (the executed BYMA sell) or 13 (still
+# pending): both are history, and a pilot that recycled either would rewrite
+# a record instead of making a new one.
+# ---------------------------------------------------------------------------
+
+PILOT_TYPE_BY_SIDE = {"buy": "security_buy", "sell": "security_sell"}
+
+
+def securities_pilot_phrase(symbol: str, side: str, quantity) -> str:
+    """The exact phrase for ONE pilot. Different pilot ⇒ different phrase."""
+    qty = positive_decimal(quantity)
+    rendered = format(qty.normalize(), "f") if qty is not None else str(quantity)
+    return f"CREAR PILOTO {str(side).strip().upper()} {str(symbol).strip().upper()} {rendered}"
+
+
+def create_securities_pilot_recommendation(
+    db: Session,
+    *,
+    execution_key: str | None,
+    symbol: str | None,
+    side: str | None,
+    quantity,
+    confirmation_text: str | None,
+    note: str = "",
+    broker=None,
+) -> dict:
+    """Create ONE controlled securities pilot. Never sends an order.
+
+    Everything is validated before any write, so a refusal leaves nothing
+    behind. Ordered credential → flag → phrase → payload → technical
+    readiness, so a caller without the credential learns nothing about the
+    catalog.
+    """
+    from app.broker.execution_class import CLASS_ACCIONES, CLASS_CEDEARS
+    from app.broker.instrument_catalog import get_instrument
+    from app.services.pilot_readiness import evaluate_pilot_readiness
+
+    settings = get_settings()
+
+    if not settings.execution_admin_key:
+        return _err("Credencial de ejecución no configurada.",
+                    "execution_admin_key_not_configured", 423)
+    if not execution_key or not _secrets.compare_digest(
+        str(execution_key), settings.execution_admin_key
+    ):
+        return _err("Credencial de ejecución inválida o ausente.",
+                    "invalid_execution_key", 403)
+
+    if not settings.execution_pilot_creation_enabled:
+        return _err(
+            "Creación de piloto deshabilitada (EXECUTION_PILOT_CREATION_ENABLED=false).",
+            "execution_pilot_creation_disabled", 423,
+        )
+
+    clean_symbol = normalize_symbol(symbol)
+    clean_side = str(side or "").strip().lower()
+    qty = positive_decimal(quantity)
+
+    if not clean_symbol:
+        return _err("Se requiere un símbolo explícito.", "pilot_symbol_required", 422)
+    if clean_side not in PILOT_TYPE_BY_SIDE:
+        return _err(f"side debe ser buy o sell (recibido: {side!r}).",
+                    "pilot_side_not_allowed", 422)
+    if qty is None:
+        return _err("Se requiere una cantidad explícita y positiva.",
+                    "pilot_quantity_required", 422)
+
+    expected_phrase = securities_pilot_phrase(clean_symbol, clean_side, qty)
+    if not confirmation_text or confirmation_text.strip() != expected_phrase:
+        return _err(
+            f"Confirmación incorrecta. Frase requerida exacta: '{expected_phrase}'.",
+            "confirmation_mismatch", 422,
+        )
+
+    entry = get_instrument(db, clean_symbol)
+    if entry is None:
+        return _err(
+            f"{clean_symbol} no está en el catálogo de ejecución. Resolvelo "
+            "read-only antes de crear un piloto.",
+            "instrument_catalog_missing", 409,
+        )
+    if entry.execution_class not in (CLASS_ACCIONES, CLASS_CEDEARS):
+        return _err(
+            f"{clean_symbol} pertenece a la clase {entry.execution_class or 'desconocida'}, "
+            "que no tiene piloto de títulos.",
+            "instrument_class_unsupported", 409,
+        )
+
+    # --- Technical readiness for THIS side. The same evaluator the readiness
+    #     endpoint uses, so a pilot can never be created for a symbol the
+    #     report calls blocked.
+    readiness = evaluate_pilot_readiness(
+        db, symbols=[clean_symbol], broker=broker, settings=settings
+    )
+    report = next((r for r in readiness["symbols"] if r["symbol"] == clean_symbol), None)
+    if report is None:
+        return _err("No se pudo evaluar la aptitud técnica del símbolo.",
+                    "pilot_readiness_unavailable", 409)
+    side_report = report[clean_side]
+    if not side_report["technically_ready"]:
+        reasons = side_report["blocking_reasons"]
+        return _err(
+            f"{clean_symbol} no está técnicamente listo para {clean_side}: "
+            f"{', '.join(reasons)}.",
+            reasons[0] if reasons else "pilot_not_technically_ready", 409,
+        )
+
+    # --- Quantity must fit the instrument's own step and the class limit.
+    step = entry.quantity_step
+    if step is None:
+        return _err(
+            f"El quantity_step de {clean_symbol} no está verificado.",
+            "quantity_step_unverified", 409,
+        )
+    step_f = float(step)
+    if step_f <= 0 or abs((float(qty) / step_f) - round(float(qty) / step_f)) > 1e-9:
+        return _err(f"La cantidad {qty} no respeta el quantity_step {step_f}.",
+                    "quantity_step_mismatch", 422)
+
+    max_notional = report.get("suggested_pilot_max_notional")
+    reference_price = (
+        side_report["quote"].get("price") if side_report["quote"].get("available") else None
+    )
+    if reference_price is not None and max_notional is not None:
+        try:
+            projected = float(qty) * float(reference_price)
+        except (TypeError, ValueError):
+            projected = None
+        if projected is not None and projected > float(max_notional) + 1e-9:
+            return _err(
+                f"El monto proyectado ({projected:.2f}) supera el tope técnico del "
+                f"piloto ({float(max_notional):.2f}).",
+                "pilot_notional_limit_exceeded", 422,
+            )
+
+    # --- Same lease and same gate as the analysis cycle: a pilot must not be
+    #     able to open a second recommendation behind its back, and it never
+    #     supersedes a pending human decision (Recommendation 13 included).
+    lease_owner, lease_error = acquire_analysis_lease(db)
+    if lease_owner is None:
+        return _err("Otro ciclo de análisis está en curso. Reintentá en unos segundos.",
+                    lease_error or "analysis_lease_unavailable", 409)
+    try:
+        gate = check_recommendation_creation_allowed(db)
+        if not gate.allowed:
+            return _err(
+                (gate.detail or "Hay una decisión pendiente.")
+                + " Resolvela explícitamente antes de crear el piloto.",
+                gate.code or "open_recommendation_requires_decision", 409,
+            )
+        return _create_securities_pilot_locked(
+            db,
+            entry=entry,
+            symbol=clean_symbol,
+            side=clean_side,
+            quantity=float(qty),
+            note=note,
+            phrase=expected_phrase,
+        )
+    finally:
+        release_analysis_lease(db, lease_owner)
+
+
+def _create_securities_pilot_locked(
+    db: Session, *, entry, symbol: str, side: str, quantity: float,
+    note: str, phrase: str,
+) -> dict:
+    """Persist ONE new pilot recommendation. No broker, no quote, no order."""
+    settings = get_settings()
+    pilot_type = PILOT_TYPE_BY_SIDE[side]
+    verb = "Comprar" if side == "buy" else "Vender"
+
+    rec = Recommendation(
+        action="rebalancear",
+        status="pending",
+        suggested_pct=0.0,
+        confidence=1.0,
+        rationale=(
+            f"Piloto administrativo de ejecución controlada: {verb.lower()} "
+            f"{quantity} {symbol} ({entry.execution_class}). Creado manualmente, "
+            "sin envío de orden."
+        ),
+        risks=(
+            "Piloto de ejecución real controlado. Requiere aprobación manual "
+            "explícita y el candado global abierto."
+        ),
+        executive_summary=f"[PILOTO] {verb} {quantity} {symbol}",
+        metadata_json={
+            "execution_pilot": True,
+            "pilot_type": pilot_type,
+            "execution_class": entry.execution_class,
+            "symbol": symbol,
+            "quantity": quantity,
+            "side": side,
+            "currency": entry.currency,
+            "market": entry.market,
+            "settlement": entry.settlement,
+            "created_manually": True,
+            "confirmation_phrase": phrase,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "note": (note or "").strip(),
+        },
+    )
+    db.add(rec)
+    db.flush()
+
+    action = RecommendationAction(
+        recommendation_id=rec.id,
+        symbol=symbol,
+        # Informative only: the executed quantity comes from quantity_override.
+        target_change_pct=(0.0001 if side == "buy" else -0.0001),
+        reason=f"Piloto controlado: {verb.lower()} explícitamente {quantity} {symbol}.",
+        quantity_override=quantity,
+    )
+    db.add(action)
+    db.flush()
+
+    app_log(db, "Recomendación piloto de títulos creada manualmente", context={
+        "recommendation_id": rec.id,
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "execution_class": entry.execution_class,
+        "pilot_type": pilot_type,
+    })
+    db.commit()
+
+    return {
+        "recommendation_id": rec.id,
+        "recommendation_action_id": action.id,
+        "status": rec.status,
+        "execution_pilot": True,
+        "pilot_type": pilot_type,
+        "execution_class": entry.execution_class,
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "approved": False,
+        "order_sent": False,
+        "order_execution_enabled": settings.order_execution_enabled,
+        "message": (
+            "Recomendación piloto creada en estado pending. NO se aprobó y NO se "
+            f"envió ninguna orden. Revisá GET /api/recommendations/{rec.id}/"
+            "execution-preview antes de decidir."
+        ),
+    }

@@ -131,15 +131,22 @@ def _fund(db, symbol="FCIAR", cutoff="23:59", minimum=100.0):
 def _broker(*, validate="validated", submit="submitted", operation_id="FCI-1"):
     broker = mock.MagicMock()
 
-    def _submit(request):
+    def _submit(request, *, lifecycle=None):
+        # Mirrors the real client's lifecycle contract: a double that cannot
+        # report how far it got would make "never sent" indistinguishable from
+        # "may have been sent".
+        if isinstance(lifecycle, dict):
+            lifecycle.update({"before_send": True, "request_started": True,
+                              "response_received": True, "response_parsed": True})
         if request.get("solo_validar"):
             return {"outcome": validate, "operation_id": "",
                     "endpoint_used": request["endpoint"], "raw_response": {},
-                    "http_requests_sent": 1, "error": ""}
+                    "http_requests_sent": 1, "request_started": True, "error": ""}
         return {"outcome": submit, "operation_id": operation_id if submit == "submitted" else "",
                 "endpoint_used": request["endpoint"],
                 "raw_response": {"numeroOperacion": operation_id},
-                "http_requests_sent": 1, "error": "" if submit == "submitted" else submit}
+                "http_requests_sent": 1, "request_started": True,
+                "error": "" if submit == "submitted" else submit}
 
     broker.submit_fund_request.side_effect = _submit
     broker.get_live_cash.return_value = {
@@ -480,16 +487,55 @@ def test_the_global_lock_blocks_validation_preview_and_submission(db, client):
     assert db.query(FundOperationDecision).count() == 0
 
 
+@pytest.mark.parametrize("operation,flag,code", [
+    ("subscribe", "fci_subscription_enabled", "fci_subscription_disabled"),
+    ("redeem", "fci_redemption_enabled", "fci_redemption_disabled"),
+])
+def test_each_capability_flag_gates_its_own_operation(db, client, operation, flag, code):
+    """The capability flag stops the operation at VALIDATION, not at submit.
+
+    `soloValidar=true` creates nothing, but it is still an authenticated call
+    to the broker made in preparation for an operation we are not allowed to
+    perform. With the capability off there is nothing to pre-check, so no
+    request is made at all — and the operation's validation state is left
+    exactly as it was.
+    """
+    _fund(db)
+    broker = _broker()
+    with exec_settings(**_live(**{flag: False})):
+        created = _prepare(client, operation=operation, amount=10_000.0)
+        operation_id = created.json()["fund_operation_id"]
+        with _with_broker(broker):
+            validated = client.post(
+                f"/api/funds/operations/{operation_id}/validate", headers=EXEC_HEADERS
+            )
+
+    assert validated.status_code == 423
+    assert code in validated.text
+    broker.submit_fund_request.assert_not_called()
+
+    record = db.get(FundOperation, operation_id)
+    db.refresh(record)
+    assert record.status == fci_service.STATE_PREPARED
+    assert record.validated_at is None
+    assert record.validated_payload_hash == ""
+    assert db.query(FundOperationDecision).count() == 0
+
+
 @pytest.mark.parametrize("operation,flag", [
     ("subscribe", "fci_subscription_enabled"),
     ("redeem", "fci_redemption_enabled"),
 ])
-def test_each_capability_flag_gates_its_own_operation(db, client, operation, flag):
+def test_turning_a_capability_off_after_validating_still_blocks_the_submit(
+    db, client, operation, flag
+):
+    """Validating while allowed does not buy a right to submit later."""
     _fund(db)
     broker = _broker()
-    with exec_settings(**_live(**{flag: False})):
+    with exec_settings(**_live()):
         operation_id, preview = _full_flow(client, db, broker, operation=operation)
-        broker.submit_fund_request.reset_mock()
+    broker.submit_fund_request.reset_mock()
+    with exec_settings(**_live(**{flag: False})):
         with _with_broker(broker):
             response = _submit(client, operation_id, preview)
 
@@ -704,7 +750,7 @@ def test_the_daily_cap_is_per_currency_and_blocks_a_later_operation(db, client):
         # Consume most of today's FCI subscription budget in ARS.
         reserve_daily_budget(
             db, trade_date=trade_date_for(get_settings()),
-            execution_class="FCI:subscribe", currency="ARS",
+            execution_class=fci_service.LEDGER_CLASS_SUBSCRIBE, currency="ARS",
             notional=__import__("decimal").Decimal("14000"),
             max_daily_notional=15_000.0,
         )

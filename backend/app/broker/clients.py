@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,11 @@ from typing import Any
 import httpx
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+# Every IOL operar endpoint — securities and funds alike — is form-urlencoded.
+IOL_FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 
 
 class BrokerClient(ABC):
@@ -727,15 +733,32 @@ class IolBrokerClient(BrokerClient):
             "error": f"HTTP {resp.status_code}: cancellation outcome unknown.",
         }
 
-    def submit_fund_request(self, request: dict) -> dict:
+    def submit_fund_request(self, request: dict, *, lifecycle: dict | None = None) -> dict:
         """POST an FCI subscription/redemption EXACTLY as built.
 
         Contract: application/x-www-form-urlencoded with Simbolo / Monto /
         soloValidar. Never JSON, never retried.
 
+        LIFECYCLE
+        ---------
+        The caller may pass a mutable `lifecycle` dict. It is stamped as the
+        call progresses:
+
+            before_send       reached the method, nothing sent yet
+            request_started   we began `self._client.post` — from here on we
+                              CANNOT prove nothing left the process
+            response_received a response object came back
+            response_parsed   the body was read
+
+        This exists so that an exception escaping this method is not guesswork
+        for the caller. Everything before `request_started` is definitively
+        "not sent" and must NOT become `submission_unknown`; stranding an
+        operation in a state that requires human reconciliation because of a
+        local bug is a worse failure than the bug.
+
         Outcomes depend on `soloValidar`:
 
-        soloValidar=true  → "validated" | "rejected"
+        soloValidar=true  → "validated" | "rejected" | "validation_unknown"
           A validation NEVER creates an operation, so it can never come back
           as submitted, and an ambiguous validation is simply not validated
           (safe: the caller stays in `prepared`).
@@ -744,68 +767,79 @@ class IolBrokerClient(BrokerClient):
           A subscription is not idempotent — a duplicate is real money — so
           anything we cannot prove is `submission_unknown` and reconciled by
           hand.
-        """
-        endpoint = request["endpoint"]
-        form_data = request["form_data"]
-        solo_validar = bool(request.get("solo_validar"))
-        url = f"{self.api_base}{endpoint}"
 
-        # Auth resolved BEFORE the point of no return: a failure here is
-        # definitively "not sent".
-        try:
-            self._ensure_auth()
-        except Exception as exc:
+        `local_error` is the one outcome that means "nothing was sent, and it
+        was our fault". It carries http_requests_sent=0.
+        """
+        marks = lifecycle if isinstance(lifecycle, dict) else {}
+        marks.update({
+            "before_send": True,
+            "request_started": False,
+            "response_received": False,
+            "response_parsed": False,
+        })
+
+        def _envelope(**extra) -> dict:
             return {
-                "outcome": "rejected",
                 "operation_id": "",
-                "endpoint_used": endpoint,
                 "raw_response": {},
-                "http_requests_sent": 0,
-                "solo_validar": solo_validar,
-                "error": f"Auth failed before submission: {str(exc)[:200]}",
+                "solo_validar": bool(request.get("solo_validar")),
+                "request_started": marks["request_started"],
+                "response_received": marks["response_received"],
+                "response_parsed": marks["response_parsed"],
+                **extra,
             }
+
+        # --- Everything here is BEFORE the point of no return. A failure is
+        #     provably "not sent", so it is a local error, never ambiguity.
+        try:
+            endpoint = request["endpoint"]
+            form_data = request["form_data"]
+            solo_validar = bool(request.get("solo_validar"))
+            content_type = request.get("content_type", IOL_FORM_CONTENT_TYPE)
+            url = f"{self.api_base}{endpoint}"
+            self._ensure_auth()
+            headers = {
+                "Authorization": f"Bearer {self._access_token}",
+                "Content-Type": content_type,
+            }
+        except Exception as exc:
+            logger.exception("submit_fund_request failed before sending anything")
+            return _envelope(
+                outcome="local_error",
+                endpoint_used=str(request.get("endpoint") or ""),
+                http_requests_sent=0,
+                error=f"Failed before sending: {type(exc).__name__}: {str(exc)[:200]}",
+            )
 
         # --- POINT OF NO RETURN: exactly ONE request. No refresh-and-retry.
+        #     Anything raised from here on is ambiguous by construction — once
+        #     the call begins we cannot prove the bytes did not leave.
+        marks["request_started"] = True
         try:
-            resp = self._client.post(
-                url,
-                data=form_data,
-                headers={
-                    "Authorization": f"Bearer {self._access_token}",
-                    "Content-Type": request.get(
-                        "content_type", "application/x-www-form-urlencoded"
-                    ),
-                },
+            resp = self._client.post(url, data=form_data, headers=headers)
+            marks["response_received"] = True
+        except Exception as exc:
+            return _envelope(
+                outcome="validation_unknown" if solo_validar else "submission_unknown",
+                endpoint_used=endpoint,
+                http_requests_sent=1,
+                error=f"Failure after the request started: {str(exc)[:200]}",
             )
-        except httpx.HTTPError as exc:
-            # ONLY transport errors are ambiguous. A programming error here
-            # (a NameError, a bad argument) never reached the network, and
-            # reporting it as "may have been sent" would strand the operation
-            # in submission_unknown forever for a bug that sent nothing — so
-            # those propagate instead of being disguised.
-            return {
-                "outcome": "validation_unknown" if solo_validar else "submission_unknown",
-                "operation_id": "",
-                "endpoint_used": endpoint,
-                "raw_response": {},
-                "http_requests_sent": 1,
-                "solo_validar": solo_validar,
-                "error": f"Network failure during submission: {str(exc)[:200]}",
-            }
 
         try:
             data = resp.json()
         except Exception:
             data = None
+        marks["response_parsed"] = True
 
-        base = {
-            "operation_id": "",
-            "endpoint_used": endpoint,
-            "raw_response": data if isinstance(data, (dict, list)) else
-                            {"status_code": resp.status_code},
-            "http_requests_sent": 1,
-            "solo_validar": solo_validar,
-        }
+        base = _envelope(
+            endpoint_used=endpoint,
+            raw_response=data if isinstance(data, (dict, list)) else
+                         {"status_code": resp.status_code},
+            http_requests_sent=1,
+            status_code=resp.status_code,
+        )
 
         rejection = _extract_iol_validation_errors(data)
 
