@@ -282,6 +282,15 @@ def cancel_execution(
 
     now = _utcnow()
     outcome = result.get("outcome")
+    # How many HTTP requests actually left the process. A client that failed
+    # before sending reports 0; anything that reached the wire reports 1.
+    http_requests_sent = result.get("http_requests_sent")
+    if http_requests_sent is None:
+        # A client (or a test double) that does not report it: assume the
+        # conservative answer — it may have been sent.
+        http_requests_sent = 0 if outcome == "rejected" and not result.get(
+            "raw_response"
+        ) else 1
     if outcome == "cancelled":
         new_status = STATUS_CANCELLED
         message = "Cancelación aceptada por el broker."
@@ -317,7 +326,10 @@ def cancel_execution(
         "outcome": outcome,
         "error": (result.get("error") or "")[:300],
         "note": (note or "").strip()[:300],
-        "attempts": 1,
+        # The REAL number of HTTP requests the client issued, reported by the
+        # client itself. Hardcoding 1 here would hide a double-send bug in the
+        # transport layer, which is exactly the class of bug this audits.
+        "http_requests_sent": http_requests_sent,
         "source": "manual_user",
     })
     br["cancellation_audit"] = audit
@@ -340,7 +352,7 @@ def cancel_execution(
         "new_status": new_status,
         "outcome": outcome,
         "requires_reconciliation": outcome == "cancellation_unknown",
-        "delete_requests_sent": 1,
+        "delete_requests_sent": http_requests_sent,
         "message": message,
         "cancellation_audit": audit,
     }

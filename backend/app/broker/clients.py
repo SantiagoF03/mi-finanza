@@ -88,6 +88,23 @@ def _extract_iol_validation_errors(data: Any) -> str:
     return " | ".join(parts)[:400]
 
 
+def _extract_fund_operation_id(data: Any) -> str:
+    """Operation identifier from an FCI response.
+
+    Only field names that are documented for orders (`numeroOperacion`) or
+    that are their obvious direct casings are read. If none is present we say
+    so instead of inventing one — an operation we cannot identify is an
+    operation we cannot reconcile.
+    """
+    if not isinstance(data, dict):
+        return ""
+    for key in ("numeroOperacion", "numerooperacion", "NumeroOperacion"):
+        value = data.get(key)
+        if value not in (None, "", 0):
+            return str(value)
+    return ""
+
+
 def _positive_price(value) -> float | None:
     """Finite positive price, or None. Rejects NaN/Infinity/junk."""
     if value is None or isinstance(value, bool):
@@ -636,7 +653,12 @@ class IolBrokerClient(BrokerClient):
         endpoint = f"/api/v2/operaciones/{order_id}"
         url = f"{self.api_base}{endpoint}"
 
-        # An auth failure BEFORE the DELETE is definitive: nothing was sent.
+        # --- BEFORE the point of no return: authentication is fully resolved.
+        # A DELETE is not idempotent from our side: IOL may apply it even if we
+        # never see the response, and by the time we could retry, the operation
+        # number may already belong to a DIFFERENT, later order. So the token
+        # is renewed HERE, where nothing has been sent yet and a failure is
+        # definitively "not sent".
         try:
             self._ensure_auth()
         except Exception as exc:
@@ -644,23 +666,26 @@ class IolBrokerClient(BrokerClient):
                 "outcome": "rejected",
                 "endpoint_used": endpoint,
                 "raw_response": {},
+                "http_requests_sent": 0,
                 "error": f"Auth failed before cancellation: {str(exc)[:200]}",
             }
 
-        def _delete() -> httpx.Response:
-            return self._client.delete(
+        # --- POINT OF NO RETURN: exactly ONE HTTP request from here on. ---
+        # There is deliberately no refresh-and-retry: a 401/403 arriving AFTER
+        # the request was written is classified without sending anything else.
+        try:
+            resp = self._client.delete(
                 url, headers={"Authorization": f"Bearer {self._access_token}"}
             )
-
-        try:
-            resp = _delete()
-            if resp.status_code in {401, 403} and self._refresh_access_token():
-                resp = _delete()
-        except Exception as exc:
+        except httpx.HTTPError as exc:
+            # ONLY transport errors are ambiguous — the request may have been
+            # written before the failure. A local programming error sent
+            # nothing and must not be disguised as an uncertain cancellation.
             return {
                 "outcome": "cancellation_unknown",
                 "endpoint_used": endpoint,
                 "raw_response": {},
+                "http_requests_sent": 1,
                 "error": f"Network failure during cancellation: {str(exc)[:200]}",
             }
 
@@ -669,25 +694,159 @@ class IolBrokerClient(BrokerClient):
         except Exception:
             raw = {"status_code": resp.status_code}
 
+        base = {
+            "endpoint_used": endpoint,
+            "raw_response": raw,
+            "http_requests_sent": 1,
+        }
+
         if 200 <= resp.status_code < 300:
+            return {**base, "outcome": "cancelled", "error": ""}
+        if resp.status_code in {401, 403}:
+            # Authentication was valid when we sent this, so a 401/403 now is
+            # ambiguous: it may have been evaluated and refused, or the token
+            # may have expired mid-flight after IOL already applied it. We do
+            # NOT re-send to find out.
             return {
-                "outcome": "cancelled",
-                "endpoint_used": endpoint,
-                "raw_response": raw,
-                "error": "",
+                **base,
+                "outcome": "cancellation_unknown",
+                "error": (
+                    f"HTTP {resp.status_code} after the cancellation was sent — "
+                    "not retried. Outcome unknown."
+                ),
             }
         if 400 <= resp.status_code < 500:
             return {
+                **base,
                 "outcome": "rejected",
-                "endpoint_used": endpoint,
-                "raw_response": raw,
                 "error": f"HTTP {resp.status_code}: cancellation not accepted.",
             }
         return {
+            **base,
             "outcome": "cancellation_unknown",
-            "endpoint_used": endpoint,
-            "raw_response": raw,
             "error": f"HTTP {resp.status_code}: cancellation outcome unknown.",
+        }
+
+    def submit_fund_request(self, request: dict) -> dict:
+        """POST an FCI subscription/redemption EXACTLY as built.
+
+        Contract: application/x-www-form-urlencoded with Simbolo / Monto /
+        soloValidar. Never JSON, never retried.
+
+        Outcomes depend on `soloValidar`:
+
+        soloValidar=true  → "validated" | "rejected"
+          A validation NEVER creates an operation, so it can never come back
+          as submitted, and an ambiguous validation is simply not validated
+          (safe: the caller stays in `prepared`).
+
+        soloValidar=false → "submitted" | "rejected" | "submission_unknown"
+          A subscription is not idempotent — a duplicate is real money — so
+          anything we cannot prove is `submission_unknown` and reconciled by
+          hand.
+        """
+        endpoint = request["endpoint"]
+        form_data = request["form_data"]
+        solo_validar = bool(request.get("solo_validar"))
+        url = f"{self.api_base}{endpoint}"
+
+        # Auth resolved BEFORE the point of no return: a failure here is
+        # definitively "not sent".
+        try:
+            self._ensure_auth()
+        except Exception as exc:
+            return {
+                "outcome": "rejected",
+                "operation_id": "",
+                "endpoint_used": endpoint,
+                "raw_response": {},
+                "http_requests_sent": 0,
+                "solo_validar": solo_validar,
+                "error": f"Auth failed before submission: {str(exc)[:200]}",
+            }
+
+        # --- POINT OF NO RETURN: exactly ONE request. No refresh-and-retry.
+        try:
+            resp = self._client.post(
+                url,
+                data=form_data,
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Content-Type": request.get(
+                        "content_type", "application/x-www-form-urlencoded"
+                    ),
+                },
+            )
+        except httpx.HTTPError as exc:
+            # ONLY transport errors are ambiguous. A programming error here
+            # (a NameError, a bad argument) never reached the network, and
+            # reporting it as "may have been sent" would strand the operation
+            # in submission_unknown forever for a bug that sent nothing — so
+            # those propagate instead of being disguised.
+            return {
+                "outcome": "validation_unknown" if solo_validar else "submission_unknown",
+                "operation_id": "",
+                "endpoint_used": endpoint,
+                "raw_response": {},
+                "http_requests_sent": 1,
+                "solo_validar": solo_validar,
+                "error": f"Network failure during submission: {str(exc)[:200]}",
+            }
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+
+        base = {
+            "operation_id": "",
+            "endpoint_used": endpoint,
+            "raw_response": data if isinstance(data, (dict, list)) else
+                            {"status_code": resp.status_code},
+            "http_requests_sent": 1,
+            "solo_validar": solo_validar,
+        }
+
+        rejection = _extract_iol_validation_errors(data)
+
+        if 200 <= resp.status_code < 300:
+            if rejection:
+                # IOL answers 2xx with a body of validation errors when it
+                # refuses — a DEFINITIVE rejection, not an uncertain send.
+                return {**base, "outcome": "rejected",
+                        "error": f"HTTP {resp.status_code}: {rejection}"}
+            if solo_validar:
+                return {**base, "outcome": "validated", "error": ""}
+            numero = _extract_fund_operation_id(data)
+            if numero:
+                return {**base, "outcome": "submitted",
+                        "operation_id": str(numero), "error": ""}
+            # 2xx but we cannot tell whether the operation was created.
+            return {
+                **base,
+                "outcome": "submission_unknown",
+                "error": (
+                    f"HTTP {resp.status_code} without an operation identifier — "
+                    "outcome unknown."
+                ),
+            }
+
+        if 400 <= resp.status_code < 500:
+            # Evaluated and refused. Definitive for both modes.
+            return {
+                **base,
+                "outcome": "rejected",
+                "error": (
+                    f"HTTP {resp.status_code}: not accepted."
+                    + (f" {rejection}" if rejection else "")
+                ),
+            }
+
+        # 5xx or anything else: no contract says the operation was NOT created.
+        return {
+            **base,
+            "outcome": "validation_unknown" if solo_validar else "submission_unknown",
+            "error": f"HTTP {resp.status_code}: outcome unknown.",
         }
 
     def get_execution_quote(self, symbol: str, side: str, market: str, settlement: str) -> dict:

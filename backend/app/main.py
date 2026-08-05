@@ -111,6 +111,21 @@ def _patch_schema(engine_ref):
                     "ON execution_daily_notional (trade_date, execution_class, currency)"
                 ))
 
+    # 3d. fund_operations validation columns. Nullable/empty defaults, so an
+    #     existing operation simply reads as "not validated" — which blocks
+    #     submission. That is the fail-closed direction.
+    if "fund_operations" in existing_tables:
+        columns = {c["name"] for c in inspector.get_columns("fund_operations")}
+        for column, ddl in (
+            ("validated_at", "DATETIME"),
+            ("validated_payload_hash", "VARCHAR(64) DEFAULT ''"),
+        ):
+            if column not in columns:
+                with engine_ref.begin() as conn:
+                    conn.execute(text(
+                        f"ALTER TABLE fund_operations ADD COLUMN {column} {ddl}"
+                    ))
+
     # 4. execution_instruments / execution_daily_notional — new tables only.
     #    create_all() already made them; nothing here rewrites or drops data.
     #

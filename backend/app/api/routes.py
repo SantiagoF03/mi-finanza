@@ -255,6 +255,208 @@ def cancel_execution_endpoint(
     return result
 
 
+# ---------------------------------------------------------------------------
+# FCI — a SEPARATE family with its own flow. Never an OrderExecution.
+#
+# prepare → validate (soloValidar=true) → preview (signed) → submit (one POST)
+#         → reconcile (human states what happened at IOL)
+# ---------------------------------------------------------------------------
+
+
+class FundOperationIn(BaseModel):
+    fund_symbol: str
+    operation: str  # subscribe | redeem
+    amount: float
+    note: str = ""
+
+
+@router.post("/funds/operations")
+def create_fund_operation_endpoint(
+    payload: FundOperationIn,
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Prepare an FCI operation. Does NOT contact IOL and sends nothing.
+
+    Only symbols present in the FCI catalog are accepted, and the documented
+    Mi Cuenta contract expresses both sides by `Monto`, so a positive amount
+    is required — cuotapartes are not accepted for execution.
+    """
+    from app.services.fci import create_fund_operation
+    result = create_fund_operation(
+        db,
+        fund_symbol=payload.fund_symbol,
+        operation=payload.operation,
+        amount=payload.amount,
+        note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.post("/funds/operations/{operation_id}/validate")
+def validate_fund_operation_endpoint(
+    operation_id: int,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Pre-check via the official `soloValidar=true`. ONE call, no retry.
+
+    A validation is never an execution: it creates no operation, records no
+    approval decision, and cannot move the operation into a submitted state.
+    """
+    import secrets as _s
+
+    from app.services.execution import _get_execution_broker
+    from app.services.fci import validate_fund_operation
+
+    settings = get_settings()
+    if not settings.execution_admin_key:
+        raise HTTPException(423, "Credencial de ejecución no configurada.")
+    if not x_execution_key or not _s.compare_digest(
+        str(x_execution_key), settings.execution_admin_key
+    ):
+        raise HTTPException(403, "Credencial de ejecución inválida o ausente.")
+
+    try:
+        broker = _get_execution_broker()
+    except Exception as exc:
+        raise HTTPException(502, f"Broker no disponible: {str(exc)[:200]}")
+
+    result = validate_fund_operation(db, operation_id, broker)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.get("/funds/operations/{operation_id}/preview")
+def fund_operation_preview_endpoint(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Signed, read-only preview. would_execute=false, sends nothing."""
+    from app.services.fci import build_fund_operation_preview
+    result = build_fund_operation_preview(db, operation_id)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+class FundSubmitIn(BaseModel):
+    preview_hash: str
+    preview_generated_at: str
+    confirmation_text: str
+    note: str = ""
+
+
+@router.post("/funds/operations/{operation_id}/submit")
+def submit_fund_operation_endpoint(
+    operation_id: int,
+    payload: FundSubmitIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Send EXACTLY ONE subscription/redemption POST.
+
+    Requires the global lock open, the capability flag, a fresh matching
+    validation, a signed unexpired preview, the exact phrase and a live
+    preflight. Never retried.
+    """
+    from app.services.fci import submit_fund_operation
+    result = submit_fund_operation(
+        db, operation_id,
+        execution_key=x_execution_key,
+        preview_hash=payload.preview_hash,
+        preview_generated_at=payload.preview_generated_at,
+        confirmation_text=payload.confirmation_text,
+        note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.get("/funds/operations/{operation_id}")
+def get_fund_operation_endpoint(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """State and audit trail for one operation. No secrets."""
+    from app.services.fci import get_fund_operation
+    result = get_fund_operation(db, operation_id)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 404), result["error"])
+    return result
+
+
+class FundReconcileIn(BaseModel):
+    outcome: str  # confirmed | rejected | cancelled | reconciliation_required
+    note: str
+    broker_operation_id: str | None = None
+
+
+@router.post("/funds/operations/{operation_id}/reconcile")
+def reconcile_fund_operation_endpoint(
+    operation_id: int,
+    payload: FundReconcileIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Record what actually happened at IOL. NEVER re-sends.
+
+    This is the only exit from `submission_unknown`: a human checks the IOL
+    panel and states the truth.
+    """
+    from app.services.fci import reconcile_fund_operation
+    result = reconcile_fund_operation(
+        db, operation_id,
+        execution_key=x_execution_key,
+        outcome=payload.outcome,
+        note=payload.note,
+        broker_operation_id=payload.broker_operation_id,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
+@router.post("/funds/catalog/refresh")
+def refresh_fund_catalog_endpoint(
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Refresh the FCI catalog from IOL, READ-ONLY. Places no operation."""
+    import secrets as _s
+
+    from app.services.fci import refresh_fund_catalog
+    from app.services.orchestrator import _get_broker
+
+    settings = get_settings()
+    if not settings.execution_admin_key:
+        raise HTTPException(423, "Credencial de ejecución no configurada.")
+    if not x_execution_key or not _s.compare_digest(
+        str(x_execution_key), settings.execution_admin_key
+    ):
+        raise HTTPException(403, "Credencial de ejecución inválida o ausente.")
+
+    try:
+        broker = _get_broker()
+    except Exception as exc:
+        raise HTTPException(502, f"Broker no disponible: {str(exc)[:200]}")
+
+    result = refresh_fund_catalog(db, broker, settings=settings)
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 502), result["error"])
+    return result
+
+
 @router.get("/broker/fci-capability")
 def broker_fci_capability(_auth=Depends(require_api_key)):
     """Whether the app can execute FCI subscriptions/redemptions.

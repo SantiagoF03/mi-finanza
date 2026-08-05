@@ -144,19 +144,35 @@ Procedencias que **cuentan** como verificación: `iol_portfolio`,
 nunca miró el instrumento y no puede afirmar que verificó su tick, su moneda
 ni sus capacidades.
 
-`buy_supported` / `sell_supported` **no se infieren por familia**: tener algo
-en cartera no prueba que se pueda comprar, vender o cotizar. Hace falta
-evidencia (una cotización real).
+`buy_supported` / `sell_supported` **no se infieren por familia ni uno del
+otro**: tener algo en cartera no prueba que se pueda comprar, vender o
+cotizar, y poder venderlo no prueba que se pueda comprarlo. Cada lado exige su
+propia evidencia y del lado correcto del libro: `sell_supported` requiere una
+punta compradora real (`source == "bid"`, precio positivo) y `buy_supported`
+una punta vendedora (`source == "ask"`). Un instrumento con sólo una de las
+dos queda operable de un solo lado.
 
 ### Cambio de identidad
 
-Si cambia moneda, tipo, mercado, plazo o símbolo, la entrada **no se
-sobrescribe**: se guarda la identidad anterior y la propuesta, pasa a
-`identity_changed`, se bloquean compra y venta, y `verified_at` **no** se
-toca. Un refresh automático posterior **no** puede resolverlo — hace falta
+Identidad es **qué instrumento es**: símbolo, mercado, tipo, moneda, país. El
+**plazo de liquidación no es identidad** — es un parámetro de la orden, que el
+mismo instrumento puede tener en t0 o t1 según cómo se opere. Tratarlo como
+identidad congelaba instrumentos correctos cada vez que el broker devolvía el
+plazo del otro lado.
+
+Si cambia algún campo de identidad, la entrada **no se sobrescribe**: se
+guarda la identidad anterior y la propuesta, pasa a `identity_changed`, se
+bloquean compra y venta, y `verified_at` **no** se toca. Un refresh automático
+posterior **no** puede resolverlo — hace falta
 `POST /api/broker/instruments/{symbol}/identity-decision`. Aceptar devuelve la
 entrada a `candidate`, no a `verified`: lo verificado bajo la identidad
 anterior ya no aplica.
+
+El hash de identidad está **versionado** (`IDENTITY_HASH_VERSION`). Cambiar la
+definición de identidad cambia todos los hashes; sin versión, ese cambio de
+esquema se leía como "el broker cambió el instrumento" y congelaba la cartera
+entera de golpe. Una entrada guardada con una versión anterior se recalcula,
+no se marca como cambiada.
 
 ### Instrumentos no tenidos
 
@@ -278,6 +294,27 @@ Una cancelación **no libera** presupuesto automáticamente: al enterarnos casi
 nunca podemos probar que la orden no consumió nada en el broker. Liberar es un
 acto administrativo explícito con motivo registrado.
 
+### Leer `estadocuenta`: disponible ≠ disponible hoy
+
+El saldo vivo sale de los buckets de liquidación **inmediata** de
+`/api/v2/estadocuenta`, nunca del total de la cuenta: plata que liquida en t+1
+no paga una compra de hoy.
+
+Un bucket cuya etiqueta de plazo viene **vacía** no es inmediato. Antes, una
+etiqueta vacía pasaba el filtro y su saldo se contaba como disponible hoy —
+un saldo a plazo mal etiquetado se leía como efectivo. Hoy la etiqueta tiene
+que estar presente **y** ser una de las inmediatas conocidas.
+
+Cuando una cuenta no expone ningún bucket inmediato legible, el resultado es
+`available = None` con `unreadable = True` y `no_immediate_bucket = True` —
+**no** `0` y **no** el total. Cero significaría "no tenés plata" y el total
+significaría "tenés toda"; las dos son afirmaciones que el payload no
+respalda. `None` bloquea con `live_cash_unavailable`, que es la respuesta
+correcta a "no sé".
+
+`GET /api/broker/account-status-diagnostic` muestra la normalización completa,
+bucket por bucket, para poder auditarla sin adivinar.
+
 ## FCI: familia separada con contrato oficial
 
 Los endpoints de FCI **son oficiales** y están implementados como una familia
@@ -290,6 +327,23 @@ POST /api/v2/operar/suscripcion/fci   suscripción
 POST /api/v2/operar/rescate/fci       rescate
 ```
 
+El contrato del request está **completo y verificado** — tres campos
+form-urlencoded, iguales en ambos endpoints:
+
+```
+Content-Type: application/x-www-form-urlencoded
+Simbolo=ADBAICA&Monto=145.54&soloValidar=true
+```
+
+El **rescate también se expresa por `Monto`**. No existe campo oficial para
+cuotapartes, así que no se envía ninguno: agregar un campo inventado a un
+rescate real es cómo una orden se reinterpreta en silencio. Corolario: no hay
+forma de pedir "rescatá todo".
+
+`Monto` se serializa con `Decimal`, nunca con `str(float)` — un float binario
+imprime `145.54000000000002` o `1e+05` según el valor, y ese string entra en
+el hash firmado del preview.
+
 Modelos propios: `FundInstrument`, `FundOperation`, `FundOperationDecision`,
 con máquina de estados asincrónica (`prepared` → … → `pending_confirmation` →
 `confirmed`). **No existe el estado `executed`**: "enviada" nunca significa
@@ -301,11 +355,33 @@ como `None` por construcción. El **cutoff es por fondo**
 (`FundInstrument.cutoff_local_time`), leído del catálogo: no hay 15:00
 hardcodeado.
 
-**FCI sigue apagado en producción.** Encender los flags no alcanza: hace falta
-además `FCI_REQUEST_CONTRACT_VERIFIED=True`, hoy `False` porque los **nombres
-de campo** del request no están verificados en este repo y no se inventan (el
-armado falla cerrado con `fci_request_contract_unverified`). Ver
-`docs/IOL_FCI_CAPABILITY.md`.
+### `soloValidar` obligatorio, fresco y del mismo payload
+
+Validar es obligatorio antes de enviar, con TTL (`FCI_VALIDATION_TTL_SECONDS`,
+120 s) **y** hash del payload validado. Cambiar el monto invalida la
+validación (`fci_validation_payload_changed`); dejarla envejecer también
+(`fci_validation_expired`). Una validación nunca crea decisión, ni fija
+`broker_operation_id`, ni consume presupuesto.
+
+El **candado global tapa a FCI**: con `ORDER_EXECUTION_ENABLED=false` ni
+siquiera sale el `soloValidar=true`, porque es una llamada autenticada al
+broker hecha en preparación para ejecutar. Devuelve `423 execution_locked`.
+
+**FCI sigue apagado en producción**, ahora por decisión de flags:
+`FCI_SUBSCRIPTION_ENABLED` y `FCI_REDEMPTION_ENABLED` son **independientes**
+—poder poner plata en un fondo no dice nada sobre poder sacarla— y los límites
+`FCI_MAX_OPERATION_AMOUNT` / `FCI_MAX_DAILY_AMOUNT` están en 0, que significa
+*no configurado* = bloqueado. Ver `docs/IOL_FCI_CAPABILITY.md`.
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/funds/operations` | Prepara la operación (no llama al broker) |
+| POST | `/api/funds/operations/{id}/validate` | `soloValidar=true`, un solo POST |
+| GET | `/api/funds/operations/{id}/preview` | Preview firmado, read-only |
+| POST | `/api/funds/operations/{id}/submit` | `soloValidar=false`, un solo POST |
+| GET | `/api/funds/operations/{id}` | Estado, sin secretos |
+| POST | `/api/funds/operations/{id}/reconcile` | Conciliación humana |
+| POST | `/api/funds/catalog/refresh` | Refresca el catálogo de fondos |
 
 ## Cancelación real de órdenes
 

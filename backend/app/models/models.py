@@ -489,6 +489,12 @@ class FundOperation(Base):
     broker_operation_id: Mapped[str] = mapped_column(String(100), default="")
     # Result of the soloValidar pre-check, when the contract offers it.
     validation_result: Mapped[dict] = mapped_column(JSON, default=dict)
+    # WHEN the validation succeeded, and a hash of exactly WHAT was validated
+    # (symbol, amount, operation, currency). Both are required before a
+    # submission: a validation is evidence about a specific request, so
+    # changing the amount — or letting it go stale — voids it.
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    validated_payload_hash: Mapped[str] = mapped_column(String(64), default="")
     broker_response: Mapped[dict] = mapped_column(JSON, default=dict)
     error_message: Mapped[str] = mapped_column(Text, default="")
     blocked_reason: Mapped[str] = mapped_column(Text, default="")
