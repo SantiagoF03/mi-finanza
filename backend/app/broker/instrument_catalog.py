@@ -33,15 +33,27 @@ from app.models.models import ExecutionInstrument
 # Fields that make up the instrument's *identity*. A change in any of them
 # means the broker is describing a different thing under the same symbol, so
 # the entry must be re-verified rather than silently reused.
+#
+# `settlement` is deliberately ABSENT. It is a POLICY choice — which plazo we
+# choose to trade — not something the broker asserts about the instrument.
+# Including it meant that switching the class policy from t1 to t0 flagged
+# every instrument as `identity_changed`, freezing the whole catalog over a
+# configuration change. Settlement is still carried in the policy, the
+# preview, the preflight and the order request, and still validated against
+# the class policy — it just does not define WHAT the instrument is.
 IDENTITY_FIELDS = (
     "broker_symbol",
     "market",
-    "settlement",
     "asset_type",
     "instrument_type",
     "currency",
     "country",
 )
+
+# Bumped whenever IDENTITY_FIELDS changes. A hash computed under an older
+# version is not comparable with a current one, so a version change must not
+# masquerade as the broker changing an instrument's identity.
+IDENTITY_HASH_VERSION = 2
 
 # --- Verification lifecycle -------------------------------------------------
 STATUS_CANDIDATE = "candidate"
@@ -107,13 +119,48 @@ def _utcnow_naive() -> datetime:
 
 
 def compute_identity_hash(identity: dict) -> str:
-    """Stable hash over the identity fields only."""
+    """Stable hash over the identity fields only.
+
+    The version is part of the hashed payload so two hashes computed under
+    different field sets can never accidentally collide, and so a stored hash
+    can be recognised as belonging to an older definition.
+    """
     canonical = json.dumps(
-        {field: str(identity.get(field) or "") for field in IDENTITY_FIELDS},
+        {
+            "_v": IDENTITY_HASH_VERSION,
+            **{field: str(identity.get(field) or "") for field in IDENTITY_FIELDS},
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _identity_hash_version_of(entry: ExecutionInstrument) -> int:
+    """Which identity definition an entry's stored hash was built with.
+
+    Rows written before versioning carry no marker; they are version 1 (the
+    definition that still included `settlement`).
+    """
+    stored = entry.raw_identity or {}
+    if isinstance(stored, dict) and "_identity_hash_version" in stored:
+        try:
+            return int(stored["_identity_hash_version"])
+        except (TypeError, ValueError):
+            return 1
+    return 1
+
+
+def _identity_differs(stored: dict, proposed: dict) -> bool:
+    """Compare identities by FIELD, independent of any hash version.
+
+    Used when the stored hash predates the current definition: the fields
+    themselves are the durable truth, the hash is only an index over them.
+    """
+    for field in IDENTITY_FIELDS:
+        if str(stored.get(field) or "") != str(proposed.get(field) or ""):
+            return True
+    return False
 
 
 def _as_positive_float(value) -> float | None:
@@ -340,11 +387,15 @@ def upsert_instrument(
     identity = {
         "broker_symbol": key,
         "market": str(market or "").strip(),
-        "settlement": str(settlement or "").strip(),
         "asset_type": str(asset_type or "").strip(),
         "instrument_type": str(instrument_type or "").strip(),
         "currency": str(currency or "").strip(),
         "country": str(country or "").strip(),
+        # Recorded for audit and for the preflight, but NOT part of identity:
+        # switching the class policy from t1 to t0 is a configuration change,
+        # not the broker describing a different instrument.
+        "settlement": str(settlement or "").strip(),
+        "_identity_hash_version": IDENTITY_HASH_VERSION,
     }
     identity_hash = compute_identity_hash(identity)
 
@@ -363,9 +414,18 @@ def upsert_instrument(
     else:
         # An entry that has never been given an identity hash (a fresh row,
         # or a PR #138 row) is not "changed" — it is simply being populated.
-        identity_changed = bool(entry.raw_identity_hash) and (
-            entry.raw_identity_hash != identity_hash
-        )
+        stored_hash = entry.raw_identity_hash or ""
+        if not stored_hash:
+            identity_changed = False
+        elif _identity_hash_version_of(entry) != IDENTITY_HASH_VERSION:
+            # The hash was computed under a DIFFERENT field set (it used to
+            # include settlement). Comparing across versions would mark every
+            # instrument as changed for a reason that has nothing to do with
+            # the broker. Re-derive the comparison from the stored identity
+            # fields themselves, which are version-independent.
+            identity_changed = _identity_differs(entry.raw_identity or {}, identity)
+        else:
+            identity_changed = stored_hash != identity_hash
 
     if identity_changed:
         # DO NOT overwrite and re-verify. The broker is now describing a

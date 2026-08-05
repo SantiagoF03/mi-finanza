@@ -312,7 +312,7 @@ def test_currency_change_ars_to_usd_blocks_immediately(db):
 @pytest.mark.parametrize("mutation", [
     {"currency": "USD"},
     {"asset_type": "CEDEAR", "instrument_type": "CEDEAR"},
-    {"market": "bCBA", "settlement": "t2"},
+    {"instrument_type": "ETF"},
 ])
 def test_any_identity_field_change_freezes_the_instrument(db, mutation):
     _verified_byma(db)
@@ -430,7 +430,13 @@ def test_a_brand_new_entry_is_not_an_identity_change(db):
 
 
 def _resolver_broker(*, tipo="acciones", moneda="peso_Argentino", mercado="bCBA",
-                     quote_available=True, extra_detail=None):
+                     quote_available=True, extra_detail=None,
+                     bid=True, ask=True):
+    """A resolver broker whose two sides of the book are set independently.
+
+    `bid` backs a SELL quote, `ask` backs a BUY quote. They are separate on
+    purpose: an instrument can legitimately have one and not the other.
+    """
     broker = mock.MagicMock()
     detail = {"simbolo": "GGAL", "tipo": tipo, "moneda": moneda,
               "mercado": mercado, "descripcion": "Grupo Galicia"}
@@ -438,10 +444,21 @@ def _resolver_broker(*, tipo="acciones", moneda="peso_Argentino", mercado="bCBA"
     response = mock.MagicMock()
     response.json.return_value = detail
     broker._authorized_get.return_value = response
-    broker.get_execution_quote.return_value = {
-        "available": quote_available, "price": 100.0 if quote_available else None,
-        "source": "bid" if quote_available else "none",
-    }
+
+    if not quote_available:
+        bid = ask = False
+
+    def _quote(symbol, side, market, settlement):
+        has_side = bid if side == "sell" else ask
+        if not has_side:
+            return {"available": False, "price": None, "source": "none"}
+        return {
+            "available": True,
+            "price": 100.0,
+            "source": "bid" if side == "sell" else "ask",
+        }
+
+    broker.get_execution_quote.side_effect = _quote
     return broker
 
 

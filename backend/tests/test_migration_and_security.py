@@ -21,6 +21,7 @@ import ast
 import json
 from contextlib import contextmanager
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -344,24 +345,72 @@ def test_fci_never_uses_the_securities_execution_path():
     assert fci.FCI_CATALOG_ENDPOINT == "/api/v2/Titulos/FCI"
 
 
-def test_fci_request_fields_are_never_invented():
-    """The endpoint PATHS are documented; the request FIELD NAMES are not
-    recorded here. Guessing them would produce a malformed real subscription,
-    so the builder fails closed until an operator verifies the mapping."""
+def test_fci_request_contract_is_exactly_the_documented_fields():
+    """Simbolo / Monto / soloValidar, form-urlencoded. Nothing else — an
+    undocumented extra field is how a real redemption gets misread."""
     from app.models.models import FundOperation
     from app.services import fci
 
-    assert fci.FCI_REQUEST_CONTRACT_VERIFIED is False
-    assert fci.FCI_REQUEST_FIELDS == {}
+    assert fci.FCI_REQUEST_CONTRACT_VERIFIED is True
+    assert fci.FCI_CONTENT_TYPE == "application/x-www-form-urlencoded"
+
+    for operation_kind in (fci.OPERATION_SUBSCRIBE, fci.OPERATION_REDEEM):
+        operation = FundOperation(
+            fund_symbol="ADBAICA", operation=operation_kind,
+            currency="ARS", amount=145.54, status=fci.STATE_PREPARED,
+        )
+        request, error = fci.build_fund_request(operation, solo_validar=True)
+        assert error is None
+        assert set(request["form_data"]) == {"Simbolo", "Monto", "soloValidar"}
+        assert request["form_data"]["Simbolo"] == "ADBAICA"
+        assert request["form_data"]["Monto"] == "145.54"
+        assert request["form_data"]["soloValidar"] == "true"
+        assert request["content_type"] == "application/x-www-form-urlencoded"
+
+
+def test_quotaparts_are_never_sent_on_the_wire():
+    """The documented Mi Cuenta contract redeems by Monto. There is no
+    official field for cuotapartes, so none is invented."""
+    from app.models.models import FundOperation
+    from app.services import fci
 
     operation = FundOperation(
-        fund_symbol="FCIX", operation=fci.OPERATION_SUBSCRIBE,
-        currency="ARS", amount=10_000.0, status=fci.STATE_PREPARED,
+        fund_symbol="ADBAICA", operation=fci.OPERATION_REDEEM,
+        currency="ARS", amount=1000.0, quotaparts=42.5,
+        status=fci.STATE_PREPARED,
     )
-    for solo_validar in (True, False):
-        request, error = fci.build_fund_request(operation, solo_validar=solo_validar)
-        assert request is None
-        assert error == fci.FCI_CONTRACT_UNVERIFIED_CODE
+    request, error = fci.build_fund_request(operation, solo_validar=False)
+    assert error is None
+    serialized = str(request["form_data"])
+    assert "42.5" not in serialized
+    assert "uotaparts" not in serialized
+    assert "antidad" not in serialized
+
+
+def test_monto_serialization_is_deterministic():
+    """str(float) renders 145.54000000000002 or 1e+05 depending on the value.
+    An amount is money: the same amount must always produce the same string,
+    which is also what keeps the signed preview hash stable."""
+    from app.services import fci
+
+    assert fci.serialize_monto(145.54) == "145.54"
+    assert fci.serialize_monto("145.540") == "145.54"
+    assert fci.serialize_monto(100000) == "100000"
+    assert fci.serialize_monto(Decimal("0.10")) == "0.1"
+    for bad in (0, -1, None, float("nan"), float("inf"), "abc", True):
+        assert fci.serialize_monto(bad) is None
+
+
+def test_a_request_without_a_positive_amount_cannot_be_built():
+    from app.models.models import FundOperation
+    from app.services import fci
+
+    operation = FundOperation(
+        fund_symbol="ADBAICA", operation=fci.OPERATION_REDEEM,
+        currency="ARS", amount=None, quotaparts=42.5, status=fci.STATE_PREPARED,
+    )
+    request, error = fci.build_fund_request(operation, solo_validar=False)
+    assert request is None and error == "invalid_fund_amount"
 
 
 # ───────────────────────────────────────────────────────────────────

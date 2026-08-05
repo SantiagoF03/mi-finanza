@@ -96,6 +96,18 @@ class Settings(BaseSettings):
     # have (see app/services/fci.py and docs/IOL_FCI_CAPABILITY.md).
     fci_subscription_enabled: bool = False
     fci_redemption_enabled: bool = False
+    # How long a positive `soloValidar` result authorises a submission.
+    # Conservative on purpose: a fund's own cutoff and the account's balance
+    # can both move within minutes, and a stale validation is not evidence
+    # about the request we are about to send.
+    fci_validation_ttl_seconds: int = 120
+    # Per-operation and per-day caps for FCI, applied per CURRENCY.
+    # 0 = NOT CONFIGURED → blocked (never "no limit").
+    fci_max_operation_amount: float = 0.0
+    fci_max_daily_amount: float = 0.0
+    # Conservative over-estimate of costs, and the balance never to spend.
+    fci_fee_buffer_pct: float = 0.0
+    fci_min_cash_reserve: float = 0.0
 
     # Per-class execution policies (ACCIONES | CEDEARS | FCI), loaded from
     # JSON. Empty = no class may trade. This replaces the need for a full
@@ -310,6 +322,7 @@ class Settings(BaseSettings):
         "execution_max_recommendation_age_minutes",
         "iol_order_validity_minutes",
         "execution_max_quote_age_seconds",
+        "fci_validation_ttl_seconds",
         mode="before",
     )
     @classmethod
@@ -326,6 +339,10 @@ class Settings(BaseSettings):
         "execution_max_order_value",
         "execution_max_total_value",
         "execution_max_portfolio_pct",
+        "fci_max_operation_amount",
+        "fci_max_daily_amount",
+        "fci_fee_buffer_pct",
+        "fci_min_cash_reserve",
         mode="before",
     )
     @classmethod

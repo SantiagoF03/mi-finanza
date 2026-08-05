@@ -143,27 +143,47 @@ def parse_account_status(payload: dict) -> dict:
                     recognized_fields.add(committed_field)
                     entry["committed"] = (entry["committed"] or 0.0) + committed
 
+                # A bucket funds a purchase ONLY when its settlement label is
+                # explicitly present AND recognised as immediate. An empty or
+                # missing label is NOT immediate: it used to slip through the
+                # `label and ...` guard and be spent as if it were cash. An
+                # unrecognised label is not immediate either — we do not guess
+                # what "72hs" or a future label means.
+                is_immediate = bool(label) and label in IMMEDIATE_SETTLEMENTS
                 entry["buckets"].append({
                     "settlement": label or None,
-                    "immediate": bool(label) and label in IMMEDIATE_SETTLEMENTS,
+                    "immediate": is_immediate,
+                    "recognized": bool(label),
                     "available": value,
                     "field": used_field,
                 })
                 if used_field:
                     recognized_fields.add(used_field)
-                # Only an IMMEDIATE bucket funds a purchase today. A t1/t2
-                # bucket is real money that simply is not usable yet.
-                if value is None or (label and label not in IMMEDIATE_SETTLEMENTS):
+                if not is_immediate or value is None:
                     continue
                 account_available = (
                     value if account_available is None else min(account_available, value)
                 )
                 if used_field and used_field not in entry["fields_used"]:
                     entry["fields_used"].append(used_field)
+
+            if account_available is None:
+                # `saldos` was present but produced no verifiable immediate
+                # bucket. Falling back to the account-level `disponible` here
+                # would silently spend deferred or unlabelled money — the very
+                # thing the buckets exist to distinguish. Fail closed.
+                entry["available"] = None
+                entry["unreadable"] = True
+                entry["no_immediate_bucket"] = True
+                continue
         else:
             missing_fields.update(SETTLEMENT_BUCKET_FIELDS)
 
         if account_available is None:
+            # No `saldos` collection at all. The account-level field is the
+            # only thing on offer, and the documented contract presents it as
+            # what is available — so it is used, but ONLY in the absence of
+            # any (possibly contradicting) bucket data.
             used_field, value = _first_field(account, AVAILABLE_FIELDS)
             if used_field:
                 recognized_fields.add(used_field)
@@ -225,7 +245,9 @@ def diagnose_account_status(payload: dict) -> dict:
     if not parsed["currencies"]:
         blocking.append("no_currency_accounts_found")
     for currency, entry in parsed["currencies"].items():
-        if entry.get("available") is None:
+        if entry.get("no_immediate_bucket"):
+            blocking.append(f"no_immediate_settlement_bucket_{currency}")
+        elif entry.get("available") is None:
             blocking.append(f"unreadable_balance_{currency}")
     if parsed["missing_fields"]:
         blocking.append("unrecognized_account_contract")

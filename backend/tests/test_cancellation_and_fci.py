@@ -502,42 +502,299 @@ def test_fci_flags_default_to_false():
     assert settings.fci_redemption_enabled is False
 
 
+def _fci_broker(*, outcome="validated", operation_id="", raise_on_call=False):
+    broker = mock.MagicMock()
+    if raise_on_call:
+        broker.submit_fund_request.side_effect = RuntimeError("network down")
+    else:
+        broker.submit_fund_request.return_value = {
+            "outcome": outcome,
+            "operation_id": operation_id,
+            "endpoint_used": "/api/v2/operar/suscripcion/fci",
+            "raw_response": {"numeroOperacion": operation_id} if operation_id else {},
+            "http_requests_sent": 1,
+            "error": "" if outcome in ("validated", "submitted") else outcome,
+        }
+    broker.get_live_cash.return_value = {
+        "available": True, "cash": 1_000_000.0, "currency": "ARS",
+        "committed": 0.0, "source": "estadocuenta",
+    }
+    broker.get_portfolio_snapshot.return_value = {
+        "total_value": 1_000_000.0, "cash": 1_000_000.0,
+        "positions": [{"symbol": "FCIAR", "asset_type": "FondoComundeInversion",
+                       "instrument_type": "FondoComundeInversion",
+                       "currency": "ARS", "quantity": 100, "market_value": 500_000.0}],
+    }
+    return broker
+
+
+def _live_settings(**extra):
+    """Settings with the global lock OPEN — used only to prove the inner
+    gates work. Production keeps ORDER_EXECUTION_ENABLED=false."""
+    base = dict(
+        execution_admin_key=TEST_ADMIN_KEY,
+        execution_preview_secret=TEST_PREVIEW_SECRET,
+        execution_preview_ttl_seconds=300,
+        order_execution_enabled=True,
+        fci_subscription_enabled=True, fci_redemption_enabled=True,
+        fci_validation_ttl_seconds=120,
+        fci_max_operation_amount=100_000.0, fci_max_daily_amount=500_000.0,
+        fci_fee_buffer_pct=0.0, fci_min_cash_reserve=0.0,
+        scheduler_timezone="America/Argentina/Buenos_Aires",
+        scheduler_market_open_time="10:30", scheduler_market_close_time="17:00",
+        market_holidays=[],
+    )
+    base.update(extra)
+    return base
+
+
+def _validate(db, op, broker, **overrides):
+    with exec_settings(**_live_settings(**overrides)):
+        return fci_service.validate_fund_operation(db, op.id, broker)
+
+
 def test_solo_validar_is_never_recorded_as_an_execution(db):
     """A validation must not set an operation id, must not move the operation
     into a submitted state, and must not consume at-most-once budget."""
     _fund(db)
     op = _operation(db)
-    broker = mock.MagicMock()
+    broker = _fci_broker(outcome="validated", operation_id="SHOULD-BE-IGNORED")
 
-    result = fci_service.validate_fund_operation(db, op.id, broker)
+    result = _validate(db, op, broker)
 
-    # The field mapping is unverified, so nothing is sent at all.
-    assert result["code"] == fci_service.FCI_CONTRACT_UNVERIFIED_CODE
-    broker.submit_fund_request.assert_not_called()
+    assert result["is_execution"] is False
+    assert result["solo_validar"] is True
+    sent = broker.submit_fund_request.call_args[0][0]
+    assert sent["form_data"]["soloValidar"] == "true"
     db.refresh(op)
+    # Even though the broker echoed an id, a validation NEVER creates one.
     assert op.broker_operation_id == ""
+    assert op.status == fci_service.STATE_VALIDATED
     assert op.status not in fci_service.NO_RESUBMIT_STATES
     assert db.query(OrderExecution).count() == 0
 
 
-def test_submitting_fci_without_a_verified_field_mapping_fails_closed(db):
-    """The endpoint PATHS are official; the request FIELD NAMES are not
-    recorded here and are never invented."""
+def test_a_prepared_operation_cannot_be_submitted(db):
     _fund(db)
     op = _operation(db)
-    with exec_settings(execution_admin_key=TEST_ADMIN_KEY,
-                       execution_preview_secret=TEST_PREVIEW_SECRET,
-                       fci_subscription_enabled=True):
+    broker = _fci_broker()
+    with exec_settings(**_live_settings()):
         result = fci_service.submit_fund_operation(
             db, op.id, execution_key=TEST_ADMIN_KEY, preview_hash="x",
             preview_generated_at=datetime.now(timezone.utc).isoformat(),
             confirmation_text=fci_service.fund_confirmation_phrase(op.id),
         )
-    assert result["code"] == fci_service.FCI_CONTRACT_UNVERIFIED_CODE
-    assert result["status_code"] == 501
+    assert result["code"] == "fci_validation_required"
+    broker.submit_fund_request.assert_not_called()
     db.refresh(op)
     assert op.status == fci_service.STATE_PREPARED
+
+
+def test_an_expired_validation_cannot_be_submitted(db):
+    _fund(db)
+    op = _operation(db)
+    _validate(db, op, _fci_broker())
+    db.refresh(op)
+    # Age the validation past its TTL.
+    op.validated_at = datetime.utcnow() - timedelta(hours=2)
+    db.commit()
+
+    broker = _fci_broker()
+    with exec_settings(**_live_settings()):
+        state = fci_service.validation_state(op, settings=get_settings())
+        result = fci_service.submit_fund_operation(
+            db, op.id, execution_key=TEST_ADMIN_KEY, preview_hash="x",
+            preview_generated_at=datetime.now(timezone.utc).isoformat(),
+            confirmation_text=fci_service.fund_confirmation_phrase(op.id),
+        )
+    assert state["code"] == "fci_validation_expired"
+    assert result["code"] == "fci_validation_expired"
+    broker.submit_fund_request.assert_not_called()
+
+
+def test_changing_the_amount_invalidates_the_validation(db):
+    """A soloValidar result is evidence about ONE specific request."""
+    _fund(db)
+    op = _operation(db, amount=10_000.0)
+    _validate(db, op, _fci_broker())
+    db.refresh(op)
+    with exec_settings(**_live_settings()):
+        assert fci_service.validation_state(op, settings=get_settings())["valid"] is True
+
+        op.amount = 90_000.0
+        db.commit()
+        state = fci_service.validation_state(op, settings=get_settings())
+    assert state["valid"] is False
+    assert state["code"] == "fci_validation_stale_payload"
+
+
+def test_changing_the_fund_invalidates_the_validation(db):
+    _fund(db)
+    _fund(db, symbol="OTHER")
+    op = _operation(db)
+    _validate(db, op, _fci_broker())
+    db.refresh(op)
+    with exec_settings(**_live_settings()):
+        op.fund_symbol = "OTHER"
+        db.commit()
+        state = fci_service.validation_state(op, settings=get_settings())
+    assert state["code"] == "fci_validation_stale_payload"
+
+
+def test_a_failed_validation_does_not_mark_the_operation_validated(db):
+    _fund(db)
+    op = _operation(db)
+    _validate(db, op, _fci_broker(outcome="rejected"))
+    db.refresh(op)
+    assert op.status == fci_service.STATE_PREPARED
+    assert op.validated_at is None
+    assert op.validated_payload_hash == ""
+
+
+@pytest.mark.parametrize("operation_kind,endpoint", [
+    ("subscribe", "/api/v2/operar/suscripcion/fci"),
+    ("redeem", "/api/v2/operar/rescate/fci"),
+])
+def test_submission_uses_the_documented_form_contract(db, operation_kind, endpoint):
+    # A low minimum so the documented example amount (145.54) is admissible.
+    _fund(db, minimum=100.0)
+    op = _operation(db, operation=operation_kind, amount=145.54)
+    broker = _fci_broker()
+    _validate(db, op, broker)
+    db.refresh(op)
+
+    with exec_settings(**_live_settings()):
+        preview = fci_service.build_fund_operation_preview(db, op.id)
+        assert preview["can_submit"] is True, preview["blocking_reasons"]
+        broker.submit_fund_request.return_value = {
+            "outcome": "submitted", "operation_id": "FCI-1",
+            "endpoint_used": endpoint,
+            "raw_response": {"numeroOperacion": "FCI-1"},
+            "http_requests_sent": 1, "error": "",
+        }
+        with mock.patch("app.services.execution._get_execution_broker",
+                        return_value=broker):
+            result = fci_service.submit_fund_operation(
+                db, op.id, execution_key=TEST_ADMIN_KEY,
+                preview_hash=preview["preview_hash"],
+                preview_generated_at=preview["generated_at"],
+                confirmation_text=fci_service.fund_confirmation_phrase(op.id),
+            )
+
+    assert result["status"] == fci_service.STATE_PENDING_CONFIRMATION
+    sent = broker.submit_fund_request.call_args[0][0]
+    assert sent["endpoint"] == endpoint
+    assert sent["content_type"] == "application/x-www-form-urlencoded"
+    assert sent["form_data"] == {
+        "Simbolo": "FCIAR", "Monto": "145.54", "soloValidar": "false",
+    }
+    assert result["submissions_sent"] == 1
+    assert db.query(OrderExecution).count() == 0
+
+
+def test_a_post_timeout_produces_submission_unknown_and_one_post(db):
+    _fund(db)
+    op = _operation(db)
+    broker = _fci_broker()
+    _validate(db, op, broker)
+    db.refresh(op)
+
+    with exec_settings(**_live_settings()):
+        preview = fci_service.build_fund_operation_preview(db, op.id)
+        broker.submit_fund_request.reset_mock()
+        broker.submit_fund_request.return_value = {
+            "outcome": "submission_unknown", "operation_id": "",
+            "endpoint_used": "/api/v2/operar/suscripcion/fci",
+            "raw_response": {}, "http_requests_sent": 1, "error": "timeout",
+        }
+        with mock.patch("app.services.execution._get_execution_broker",
+                        return_value=broker):
+            result = fci_service.submit_fund_operation(
+                db, op.id, execution_key=TEST_ADMIN_KEY,
+                preview_hash=preview["preview_hash"],
+                preview_generated_at=preview["generated_at"],
+                confirmation_text=fci_service.fund_confirmation_phrase(op.id),
+            )
+
+    assert result["status"] == fci_service.STATE_SUBMISSION_UNKNOWN
+    assert result["requires_reconciliation"] is True
+    assert broker.submit_fund_request.call_count == 1
+
+
+def test_a_human_retry_against_submission_unknown_does_not_resend(db):
+    """A duplicate subscription is real money. There is no path back."""
+    _fund(db)
+    op = _operation(db)
+    broker = _fci_broker()
+    _validate(db, op, broker)
+    db.refresh(op)
+
+    with exec_settings(**_live_settings()):
+        preview = fci_service.build_fund_operation_preview(db, op.id)
+        broker.submit_fund_request.reset_mock()
+        broker.submit_fund_request.return_value = {
+            "outcome": "submission_unknown", "operation_id": "",
+            "endpoint_used": "/api/v2/operar/suscripcion/fci",
+            "raw_response": {}, "http_requests_sent": 1, "error": "timeout",
+        }
+        with mock.patch("app.services.execution._get_execution_broker",
+                        return_value=broker):
+            fci_service.submit_fund_operation(
+                db, op.id, execution_key=TEST_ADMIN_KEY,
+                preview_hash=preview["preview_hash"],
+                preview_generated_at=preview["generated_at"],
+                confirmation_text=fci_service.fund_confirmation_phrase(op.id),
+            )
+            again = fci_service.submit_fund_operation(
+                db, op.id, execution_key=TEST_ADMIN_KEY,
+                preview_hash=preview["preview_hash"],
+                preview_generated_at=preview["generated_at"],
+                confirmation_text=fci_service.fund_confirmation_phrase(op.id),
+            )
+
+    assert again["code"] == "fund_operation_already_submitted"
+    assert broker.submit_fund_request.call_count == 1
+
+
+def test_the_global_lock_blocks_every_fci_path(db):
+    """A per-capability flag is a second key, never a replacement for the
+    master one."""
+    _fund(db)
+    op = _operation(db)
+    broker = _fci_broker()
+
+    locked = _live_settings(order_execution_enabled=False)
+    with exec_settings(**locked):
+        validation = fci_service.validate_fund_operation(db, op.id, broker)
+        preview = fci_service.build_fund_operation_preview(db, op.id)
+        submission = fci_service.submit_fund_operation(
+            db, op.id, execution_key=TEST_ADMIN_KEY, preview_hash="x",
+            preview_generated_at=datetime.now(timezone.utc).isoformat(),
+            confirmation_text=fci_service.fund_confirmation_phrase(op.id),
+        )
+
+    assert validation["code"] == "execution_locked"
+    assert "execution_locked" in preview["blocking_reasons"]
+    assert preview["can_submit"] is False
+    assert submission["code"] == "execution_locked"
+    broker.submit_fund_request.assert_not_called()
     assert db.query(FundOperationDecision).count() == 0
+
+
+def test_readiness_requires_the_global_lock_open(db):
+    from app.services.execution import get_execution_readiness
+
+    with exec_settings(**_live_settings(order_execution_enabled=False)):
+        locked = get_execution_readiness()
+    with exec_settings(**_live_settings(order_execution_enabled=True)):
+        open_lock = get_execution_readiness()
+
+    assert locked["ready_for_real_fci_subscription"] is False
+    assert locked["fci_capability"]["execution_locked"] is True
+    assert open_lock["ready_for_real_fci_subscription"] is True
+    assert open_lock["fci_capability"]["request_fields"] == [
+        "Simbolo", "Monto", "soloValidar"
+    ]
 
 
 def test_fci_state_machine_covers_the_asynchronous_reality():
@@ -554,7 +811,7 @@ def test_fci_state_machine_covers_the_asynchronous_reality():
     assert fci_service.STATE_PENDING_CONFIRMATION in fci_service.NO_RESUBMIT_STATES
 
 
-def test_fci_readiness_requires_both_flag_and_verified_contract():
+def _obsolete_readiness_check():
     from app.services.execution import get_execution_readiness
 
     with exec_settings(fci_subscription_enabled=True, fci_redemption_enabled=True):

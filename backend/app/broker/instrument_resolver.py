@@ -220,20 +220,18 @@ def resolve_instrument(
         "settlement": PROV_CLASS_DEFAULT,
     }
 
-    # --- Quote: evidence the instrument is actually quotable ---
-    quote_supported = False
+    # --- Quotes: BOTH sides, independently ---
+    # Selling needs a bid, buying needs an ask, and one says nothing about
+    # the other: an instrument can have a bid and no ask (nobody is offering)
+    # or an ask and no bid (nobody is buying). Deriving both capabilities from
+    # a single sell quote claimed a buy was possible on the strength of a bid.
+    sell_quote_ok = buy_quote_ok = False
     if family == FAMILY_SECURITIES:
-        try:
-            quote = broker.get_execution_quote(key, "sell", detail_market, settlement)
-        except Exception:
-            quote = None
-        if quote and quote.get("available"):
-            quote_supported = True
-            provenance["quote_supported"] = PROV_IOL_QUOTE
-        else:
-            provenance["quote_supported"] = PROV_CLASS_DEFAULT
-    else:
-        provenance["quote_supported"] = PROV_CLASS_DEFAULT
+        sell_quote_ok = _side_quotable(broker, key, "sell", detail_market, settlement)
+        buy_quote_ok = _side_quotable(broker, key, "buy", detail_market, settlement)
+
+    quote_supported = sell_quote_ok or buy_quote_ok
+    provenance["quote_supported"] = PROV_IOL_QUOTE if quote_supported else PROV_CLASS_DEFAULT
 
     # --- Tick / step: official metadata, else admin override, else a guess ---
     tick = _first_present(detail, ("alteracionMinima", "minimaAlteracion", "tickSize"))
@@ -264,17 +262,11 @@ def resolve_instrument(
     else:
         minimum, provenance["minimum_quantity"] = step, PROV_CLASS_DEFAULT
 
-    # --- Capabilities: only what we have evidence for ---
-    # A quotable security on the right market with the right currency can be
-    # bought and sold through the contract this app implements. Without a
-    # quote there is no evidence, so both stay false.
-    buy_supported = sell_supported = quote_supported and family == FAMILY_SECURITIES
-    provenance["buy_supported"] = (
-        PROV_IOL_QUOTE if buy_supported else PROV_CLASS_DEFAULT
-    )
-    provenance["sell_supported"] = (
-        PROV_IOL_QUOTE if sell_supported else PROV_CLASS_DEFAULT
-    )
+    # --- Capabilities: strictly per side, from that side's own evidence ---
+    buy_supported = buy_quote_ok
+    sell_supported = sell_quote_ok
+    provenance["buy_supported"] = PROV_IOL_QUOTE if buy_supported else PROV_CLASS_DEFAULT
+    provenance["sell_supported"] = PROV_IOL_QUOTE if sell_supported else PROV_CLASS_DEFAULT
 
     entry, identity_changed = upsert_instrument(
         db,
@@ -311,6 +303,31 @@ def resolve_instrument(
         "unverified_fields": unverified_fields(entry),
         "field_provenance": dict(entry.field_provenance or {}),
     }
+
+
+def _side_quotable(broker, symbol: str, side: str, market: str, settlement: str) -> bool:
+    """Is THIS side of the book actually available?
+
+    `sell` requires a bid (someone is buying), `buy` requires an ask (someone
+    is selling). The quote's own `source` is checked: a provider that answered
+    with the wrong side is not evidence for this one.
+    """
+    expected = "bid" if side == "sell" else "ask"
+    try:
+        quote = broker.get_execution_quote(symbol, side, market, settlement)
+    except Exception:
+        return False
+    if not quote or not quote.get("available"):
+        return False
+    if quote.get("source") != expected:
+        return False
+    price = quote.get("price")
+    if price is None or isinstance(price, bool):
+        return False
+    try:
+        return float(price) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _first_present(payload: dict, keys: tuple[str, ...]):

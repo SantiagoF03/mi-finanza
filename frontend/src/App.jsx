@@ -193,6 +193,11 @@ export default function App() {
   const [currentInfo, setCurrentInfo] = useState('')
   const [executionPreview, setExecutionPreview] = useState(null)
   const [previewError, setPreviewError] = useState('')
+  // FCI operations live in their OWN flow — prepare → validate → preview →
+  // submit → reconcile — never in the securities approve path.
+  const [fundBusy, setFundBusy] = useState(false)
+  const [fundOperation, setFundOperation] = useState(null)
+  const [fundError, setFundError] = useState('')
   const [showConfirm, setShowConfirm] = useState(false)
   const [confirmText, setConfirmText] = useState('')
   // Execution credential: React state only. Never localStorage/sessionStorage,
@@ -457,6 +462,76 @@ export default function App() {
     setShowConfirm(true)
   }
 
+  // --- FCI flow -----------------------------------------------------------
+  // prepare → validate (soloValidar=true) → preview (signed) → submit.
+  // Deliberately separate from the securities approve path: a fund has no
+  // limit price, confirms after its own cutoff, and never becomes an
+  // OrderExecution.
+  const startFundOperation = async (order) => {
+    setFundError('')
+    setFundBusy(true)
+    try {
+      const symbol = order.instrument_identity?.symbol || order.symbol
+      const operation = order.side === 'buy' ? 'subscribe' : 'redeem'
+      const amount = Number(order.estimated_notional || 0)
+      if (!(amount > 0)) {
+        setFundError('El monto debe ser mayor a 0. El contrato de IOL expresa suscripción y rescate por Monto.')
+        return
+      }
+
+      const created = await fetch(`${API}/funds/operations`, {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ fund_symbol: symbol, operation, amount }),
+      })
+      const createdBody = await created.json()
+      if (!created.ok) {
+        setFundError(createdBody.detail || 'No se pudo preparar la operación de FCI.')
+        return
+      }
+
+      // Only the preview is fetched here. Validation and submission are
+      // separate, explicitly authorised steps that need the execution key.
+      const previewResp = await fetch(
+        `${API}/funds/operations/${createdBody.fund_operation_id}/preview`,
+        { headers: authHeaders() },
+      )
+      const preview = await previewResp.json()
+      setFundOperation({ ...createdBody, preview: previewResp.ok ? preview : null })
+    } catch (err) {
+      setFundError(`Error preparando la operación de FCI: ${err.message}`)
+    } finally {
+      setFundBusy(false)
+    }
+  }
+
+  const validateFundOperation = async (operationId, executionKey) => {
+    setFundError('')
+    setFundBusy(true)
+    try {
+      const resp = await fetch(`${API}/funds/operations/${operationId}/validate`, {
+        method: 'POST',
+        headers: authHeaders({ 'X-Execution-Key': executionKey }),
+      })
+      const body = await resp.json()
+      if (!resp.ok) {
+        setFundError(body.detail || 'La validación falló.')
+        return
+      }
+      const previewResp = await fetch(`${API}/funds/operations/${operationId}/preview`, {
+        headers: authHeaders(),
+      })
+      const preview = await previewResp.json()
+      setFundOperation((prev) => ({
+        ...(prev || {}), ...body, preview: previewResp.ok ? preview : null,
+      }))
+    } catch (err) {
+      setFundError(`Error validando: ${err.message}`)
+    } finally {
+      setFundBusy(false)
+    }
+  }
+
   const approveRecommendation = async () => {
     if (!current?.id) return
 
@@ -487,8 +562,9 @@ export default function App() {
     // never happen.
     if (orders.some(isFundOperation)) {
       setError(
-        'Hay operaciones de FCI en el plan. La suscripción y el rescate de FCI ' +
-        'deben realizarse manualmente en IOL: la app no puede enviarlas.',
+        'Hay operaciones de FCI en el plan. Un FCI no se aprueba por esta vía: ' +
+        'tiene su propio flujo (preparar → validar → preview → enviar), porque ' +
+        'no tiene precio límite y confirma después de su cutoff.',
       )
       return
     }
@@ -790,11 +866,78 @@ export default function App() {
                             Cutoff del fondo: {o.catalog?.fund_cutoff_local_time || o.instrument_identity?.fund_cutoff_local_time || '—'}
                             {' · '}plazo estimado de liquidación: {o.catalog?.settlement_delay_days != null ? `${o.catalog.settlement_delay_days} día(s)` : '—'}
                           </div>
-                          <div className="info-box info-blocked">
-                            Operación <strong>no inmediata</strong> y <strong>no ejecutable desde la app</strong>:
-                            la API oficial de IOL no expone un contrato verificado de suscripción/rescate.
-                            Realizala manualmente en IOL.
+                          <div className="info-box">
+                            Operación <strong>no inmediata</strong>: el fondo confirma
+                            después de su cutoff, a un valor de cuotaparte que hoy
+                            todavía no existe.
                           </div>
+                          <button
+                            type="button"
+                            className="secondary-btn"
+                            onClick={() => startFundOperation(o)}
+                            disabled={fundBusy}
+                          >
+                            {fundBusy ? 'Preparando…' : `Preparar ${operationLabel(o)}`}
+                          </button>
+
+                          {fundError && <div className="info-box info-blocked">{fundError}</div>}
+
+                          {fundOperation && (
+                            <div className="detail-panel" style={{ marginTop: 8 }}>
+                              <div style={{ fontSize: '0.85em' }}>
+                                Operación FCI #{fundOperation.fund_operation_id}
+                                {' · '}estado <strong>{fundOperation.preview?.status || fundOperation.status}</strong>
+                                {' · '}{fundOperation.operation === 'subscribe' ? 'suscripción' : 'rescate'}
+                              </div>
+                              <div style={{ fontSize: '0.85em' }}>
+                                Monto: {Number(fundOperation.amount || 0).toLocaleString()} {fundOperation.currency}
+                                {' · '}cutoff {fundOperation.preview?.cutoff_local_time || '—'}
+                                {' · '}plazo {fundOperation.preview?.settlement_delay_days != null
+                                  ? `${fundOperation.preview.settlement_delay_days} día(s)` : '—'}
+                              </div>
+                              {/* A fund has no limit price and no book — the
+                                  preview deliberately carries none. */}
+                              <div style={{ fontSize: '0.85em', color: '#888' }}>
+                                Sin precio límite ni punta: el valor de cuotaparte se
+                                conoce después del cutoff.
+                              </div>
+
+                              {(fundOperation.preview?.blocking_reasons || []).length > 0 && (
+                                <div className="info-box info-blocked">
+                                  No se puede enviar todavía:
+                                  <ul style={{ margin: '4px 0 0 16px' }}>
+                                    {fundOperation.preview.blocking_reasons.map((code) => (
+                                      <li key={code}><code>{code}</code></li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+
+                              <div style={{ marginTop: 6 }}>
+                                <input
+                                  type="password"
+                                  placeholder="X-Execution-Key"
+                                  value={executionKeyInput}
+                                  onChange={(e) => setExecutionKeyInput(e.target.value)}
+                                  style={{ marginRight: 6 }}
+                                />
+                                <button
+                                  type="button"
+                                  className="secondary-btn"
+                                  disabled={fundBusy || !executionKeyInput}
+                                  onClick={() => validateFundOperation(
+                                    fundOperation.fund_operation_id, executionKeyInput,
+                                  )}
+                                >
+                                  {fundBusy ? 'Validando…' : 'Validar (soloValidar=true)'}
+                                </button>
+                              </div>
+                              <div style={{ fontSize: '0.8em', color: '#888', marginTop: 4 }}>
+                                La validación no crea ninguna operación. El envío real es un
+                                paso posterior, con preview firmado y frase exacta.
+                              </div>
+                            </div>
+                          )}
                         </>
                       ) : (
                         <>

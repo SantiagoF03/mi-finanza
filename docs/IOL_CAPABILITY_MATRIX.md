@@ -24,14 +24,17 @@ habilita**.
 >
 > En consecuencia:
 >
-> - las **rutas y métodos** marcados DOCUMENTADO provienen de la lista
->   provista explícitamente por el responsable del repositorio, que sí tiene
->   acceso a la documentación;
-> - los **nombres de campo** que no estaban ya verificados en el repo **no se
->   inventan**. Donde faltan (FCI), el armado de la request falla cerrado;
+> - las **rutas, métodos y nombres de campo** marcados DOCUMENTADO provienen de
+>   la lista provista explícitamente por el responsable del repositorio, que sí
+>   tiene acceso a la documentación. Eso incluye el contrato de FCI
+>   (`Simbolo` / `Monto` / `soloValidar`, form-urlencoded);
+> - **nada se infiere ni se completa por analogía.** Un campo que no está en
+>   esa lista y no está verificado en el repo no se envía;
 > - todo lo marcado VERIFICADO proviene de evidencia de primera mano ya
 >   presente en el repositorio (tests de contrato contra la API real y la
->   operación productiva 183382167).
+>   operación productiva 183382167);
+> - lo marcado DOCUMENTADO **no fue ejercitado contra la API real desde este
+>   entorno** y por eso queda apagado hasta pasar por sandbox.
 
 ---
 
@@ -45,7 +48,7 @@ habilita**.
 | Consulta de operación | **VERIFICADO-REAL** | `/api/v2/operaciones/{numeroOperacion}` | GET | Devuelve `estadoActual` (p. ej. `iniciada`, `cancelada`). Usado por `refresh_broker_status`, read-only. |
 | Consulta de posición | **VERIFICADO-REAL** | `/api/v2/portafolio/{pais}` | GET | Estructura `activos[].titulo{simbolo,tipo,moneda}` + `cantidad`, `valorizado`, `ppc`. |
 | Consulta de saldo | **VERIFICADO-REAL** | `/api/v2/estadocuenta` | GET | Estructura `cuentas[]` con `moneda`, `disponible`, `saldos[].disponibleOperar`, `comprometido`. |
-| **Cancelación** | **NO VERIFICADO** | — | — | No hay contrato de cancelación comprobado. Ver §5. |
+| Cancelación | **DOCUMENTADO** | `/api/v2/operaciones/{numeroOperacion}` | DELETE | Ruta oficial provista por el responsable del repositorio. Implementada con **exactamente un DELETE** y sin reintento automático. Ver §5. |
 
 ### Contrato de orden (verificado)
 
@@ -130,14 +133,22 @@ incorrecta.** La documentación oficial publica:
 Implementado como **familia separada** (`FundInstrument`, `FundOperation`,
 `FundOperationDecision`), nunca sobre `OrderExecution`.
 
-**Lo que sigue sin verificar son los nombres exactos de los campos del
-request.** El entorno de build bloquea `invertironline.com`, así que no fue
-posible transcribirlos, y **no se inventan**:
-`FCI_REQUEST_CONTRACT_VERIFIED = False` hace fallar cerrado el armado de la
-request con `fci_request_contract_unverified`.
+**CORRECCIÓN respecto del PR #139.** Ese PR dejó
+`FCI_REQUEST_CONTRACT_VERIFIED = False` y `FCI_REQUEST_FIELDS = {}`, con lo
+cual la familia quedaba completa pero **imposible de enviar**. El contrato del
+request está ahora completo y verificado contra la documentación oficial de
+"Mi Cuenta" — tres campos form-urlencoded en **ambos** endpoints:
 
-FCI permanece **apagado en producción**. Detalle completo en
-**`docs/IOL_FCI_CAPABILITY.md`**.
+```
+Content-Type: application/x-www-form-urlencoded
+Simbolo=ADBAICA&Monto=145.54&soloValidar=true
+```
+
+El **rescate también se expresa por `Monto`**. No hay campo oficial para
+cuotapartes y por lo tanto no se envía ninguno.
+
+FCI permanece **apagado en producción** — ahora por decisión de flags, no por
+contrato faltante. Detalle completo en **`docs/IOL_FCI_CAPABILITY.md`**.
 
 ---
 
@@ -188,7 +199,7 @@ producción. Ver `docs/IOL_SANDBOX_GUIDE.md`.
 |---|---|---|---|---|---|
 | `securities` | `ACCIONES` | ✅ tras `SECURITIES_BUY_ENABLED` | ✅ tras `SECURITIES_SELL_ENABLED` | ✅ | ✅ tras `ORDER_CANCELLATION_ENABLED` |
 | `securities` | `CEDEARS` | ✅ tras `SECURITIES_BUY_ENABLED` | ✅ tras `SECURITIES_SELL_ENABLED` | ✅ | ✅ tras `ORDER_CANCELLATION_ENABLED` |
-| `fund` | `FCI` | ⏸ contrato oficial, campos sin verificar | ⏸ ídem | n/a | ⏸ |
+| `fund` | `FCI` | ✅ suscripción tras `FCI_SUBSCRIPTION_ENABLED` | ✅ rescate tras `FCI_REDEMPTION_ENABLED` | n/a | n/a (no aplica el DELETE de títulos) |
 | — | BONO / ON / TitulosPublicos / ETF | ❌ sin clase de ejecución | ❌ | — | ❌ |
 
 Todas las capacidades arrancan **apagadas**. El candado global
