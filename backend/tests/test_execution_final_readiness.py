@@ -197,6 +197,13 @@ def _operation(db, *, operation="subscribe", amount=10_000.0, symbol="FCIAR",
         record.status = fci_service.STATE_VALIDATED
         record.validated_at = datetime.now(timezone.utc).replace(tzinfo=None)
         record.validated_payload_hash = fci_service.validation_payload_hash(record)
+        # The fund's verified state is part of what a validation attests to,
+        # so a hand-built "validated" operation has to record it too.
+        fund = fci_service.get_fund(db, symbol)
+        if fund is not None:
+            record.validated_fund_hash = fci_service.fund_verification_hash(
+                fund, operation
+            )
         db.commit()
     return record
 
@@ -1056,10 +1063,17 @@ def _instrument(db, symbol="BYMA", *, execution_class="ACCIONES",
     return entry
 
 
-def _quote_broker(*, bid=297.0, ask=299.0):
+def _quote_broker(*, bid=297.0, ask=299.0, held=10, cash=1_000_000.0,
+                  symbol="BYMA", currency="ARS"):
+    """A securities broker double with a book AND a live account.
+
+    Both halves matter now: readiness for an exact quantity checks the live
+    balance for a buy and the live holding for a sell, so a double with only
+    quotes would make every pilot look unfundable.
+    """
     broker = mock.MagicMock()
 
-    def _quote(symbol, side, market, settlement):
+    def _quote(symbol_arg, side, market, settlement):
         price = bid if side == "sell" else ask
         if price is None:
             return {"available": False, "source": None, "price": None,
@@ -1069,6 +1083,17 @@ def _quote_broker(*, bid=297.0, ask=299.0):
                 "retrieved_at": datetime.now(timezone.utc).isoformat()}
 
     broker.get_execution_quote.side_effect = _quote
+    broker.get_live_cash.return_value = {
+        "available": True, "cash": cash, "currency": currency,
+        "committed": 0.0, "source": "estadocuenta",
+    }
+    broker.get_portfolio_snapshot.return_value = {
+        "total_value": 1_000_000.0, "cash": cash,
+        "positions": [{"symbol": symbol, "asset_type": "ACCIONES",
+                       "instrument_type": "ACCIONES", "currency": currency,
+                       "quantity": held, "committed": 0,
+                       "market_value": (held or 0) * (bid or 0)}],
+    }
     return broker
 
 
@@ -1083,11 +1108,11 @@ def test_buy_readiness_requires_an_ask(db):
                                securities_sell_enabled=True,
                                execution_sell_only=False)) as settings:
         report = evaluate_pilot_readiness(db, symbols=["BYMA"], broker=broker,
-                                          settings=settings)
+                                          live=True, settings=settings)
 
     entry = report["symbols"][0]
     assert entry["buy"]["technically_ready"] is False
-    assert "quote_unavailable" in entry["buy"]["blocking_reasons"]
+    assert "quote_unavailable" in entry["buy"]["technical_blocking_reasons"]
     # The other side is unaffected: they are independent capabilities.
     assert entry["sell"]["technically_ready"] is True
 
@@ -1103,11 +1128,11 @@ def test_sell_readiness_requires_a_bid(db):
                                securities_sell_enabled=True,
                                execution_sell_only=False)) as settings:
         report = evaluate_pilot_readiness(db, symbols=["BYMA"], broker=broker,
-                                          settings=settings)
+                                          live=True, settings=settings)
 
     entry = report["symbols"][0]
     assert entry["sell"]["technically_ready"] is False
-    assert "quote_unavailable" in entry["sell"]["blocking_reasons"]
+    assert "quote_unavailable" in entry["sell"]["technical_blocking_reasons"]
     assert entry["buy"]["technically_ready"] is True
 
 
@@ -1125,11 +1150,11 @@ def test_a_quote_from_the_wrong_side_is_not_evidence(db):
                                securities_buy_enabled=True,
                                execution_sell_only=False)) as settings:
         report = evaluate_pilot_readiness(db, symbols=["BYMA"], broker=broker,
-                                          settings=settings)
+                                          live=True, settings=settings)
 
     entry = report["symbols"][0]
     assert entry["buy"]["technically_ready"] is False
-    assert "quote_wrong_side" in entry["buy"]["blocking_reasons"]
+    assert "quote_wrong_side" in entry["buy"]["technical_blocking_reasons"]
 
 
 def test_readiness_without_a_broker_reports_unavailable_not_ready(db):
@@ -1138,12 +1163,15 @@ def test_readiness_without_a_broker_reports_unavailable_not_ready(db):
     _instrument(db)
     with exec_settings(**_live(execution_class_policies=ACCIONES_POLICY)) as settings:
         report = evaluate_pilot_readiness(db, symbols=["BYMA"], broker=None,
-                                          settings=settings)
+                                          live=False, settings=settings)
 
     entry = report["symbols"][0]
     assert entry["buy"]["technically_ready"] is False
     assert entry["sell"]["technically_ready"] is False
-    assert entry["buy"]["quote"]["error"] == "broker_unavailable"
+    assert entry["buy"]["quote"]["error"] == "quote_not_probed"
+    assert entry["buy"]["quote"]["probed"] is False
+    # "we did not look" is reported as such, never as "there is no book".
+    assert "live_check_not_performed" in entry["buy"]["technical_blocking_reasons"]
 
 
 def test_the_policy_template_never_invents_a_tick_or_a_step(db):
@@ -1155,9 +1183,13 @@ def test_the_policy_template_never_invents_a_tick_or_a_step(db):
     with exec_settings(**_live()) as settings:
         template = build_pilot_policy_template(db, symbols=["NOTICK"], settings=settings)
 
-    override = template["EXECUTION_INSTRUMENT_OVERRIDES"]["NOTICK"]
-    assert override["price_tick"] is None
-    assert override["quantity_step"] is None
+    # tick/step are NOT overridable fields, so they must not appear there.
+    for override in template["EXECUTION_INSTRUMENT_OVERRIDES"].values():
+        assert "price_tick" not in override
+        assert "quantity_step" not in override
+    payload = template["INSTRUMENT_FIELD_VERIFICATION_PAYLOADS"]["NOTICK"]
+    assert payload["price_tick"] is None
+    assert payload["quantity_step"] is None
     block = template["EXECUTION_CLASS_POLICIES"]["ACCIONES"]
     assert block["default_price_tick"] is None
     assert block["default_quantity_step"] is None
@@ -1420,7 +1452,7 @@ def test_one_ready_symbol_does_not_make_a_class_ready(db):
     with exec_settings(**_live(execution_class_policies=ACCIONES_POLICY,
                                securities_sell_enabled=True,
                                execution_sell_only=False)) as settings:
-        report = evaluate_pilot_readiness(db, broker=broker, settings=settings)
+        report = evaluate_pilot_readiness(db, broker=broker, live=True, settings=settings)
 
     acciones = report["classes"]["acciones"]
     assert "BYMA" in acciones["sell_ready_symbols"]

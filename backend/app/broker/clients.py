@@ -792,6 +792,14 @@ class IolBrokerClient(BrokerClient):
 
         # --- Everything here is BEFORE the point of no return. A failure is
         #     provably "not sent", so it is a local error, never ambiguity.
+        #
+        #     The request OBJECT is built here too, deliberately. Building and
+        #     sending used to be one call, so a serialization bug — bad form
+        #     data, an unencodable header — was indistinguishable from a
+        #     network failure and became `submission_unknown`, stranding the
+        #     operation until a human checked IOL for a request that was never
+        #     assembled, let alone sent. Now `build_request` failing is a
+        #     local error, and only `send` can be ambiguous.
         try:
             endpoint = request["endpoint"]
             form_data = request["form_data"]
@@ -799,10 +807,15 @@ class IolBrokerClient(BrokerClient):
             content_type = request.get("content_type", IOL_FORM_CONTENT_TYPE)
             url = f"{self.api_base}{endpoint}"
             self._ensure_auth()
-            headers = {
-                "Authorization": f"Bearer {self._access_token}",
-                "Content-Type": content_type,
-            }
+            request_obj = self._client.build_request(
+                "POST",
+                url,
+                data=form_data,
+                headers={
+                    "Authorization": f"Bearer {self._access_token}",
+                    "Content-Type": content_type,
+                },
+            )
         except Exception as exc:
             logger.exception("submit_fund_request failed before sending anything")
             return _envelope(
@@ -813,11 +826,12 @@ class IolBrokerClient(BrokerClient):
             )
 
         # --- POINT OF NO RETURN: exactly ONE request. No refresh-and-retry.
-        #     Anything raised from here on is ambiguous by construction — once
-        #     the call begins we cannot prove the bytes did not leave.
+        #     The request is fully built; the only thing left is to put it on
+        #     the wire, so anything raised from here on is ambiguous by
+        #     construction.
         marks["request_started"] = True
         try:
-            resp = self._client.post(url, data=form_data, headers=headers)
+            resp = self._client.send(request_obj)
             marks["response_received"] = True
         except Exception as exc:
             return _envelope(
@@ -829,9 +843,13 @@ class IolBrokerClient(BrokerClient):
 
         try:
             data = resp.json()
+            marks["response_parsed"] = True
         except Exception:
+            # A response arrived but its body is not JSON. `response_received`
+            # stays true and `response_parsed` stays false, so the caller can
+            # tell "IOL answered something we could not read" from "IOL never
+            # answered" — the status code below still classifies the outcome.
             data = None
-        marks["response_parsed"] = True
 
         base = _envelope(
             endpoint_used=endpoint,

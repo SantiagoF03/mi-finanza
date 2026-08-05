@@ -223,13 +223,27 @@ def release_daily_budget(
     notional: Decimal,
     reason: str,
 ) -> dict:
-    """Give budget back. Deliberately NOT called automatically anywhere.
+    """Give budget back for a request that provably never left.
 
-    A cancelled or rejected order does NOT free its daily allowance on its
-    own: at the moment we learn about it we usually cannot prove the order
-    never consumed anything at the broker, and quietly restoring budget would
-    let a bad day's worth of orders be re-attempted. Releasing is an explicit
-    administrative act with a stated reason, recorded in the audit.
+    Two callers, and the difference matters:
+
+    - **administrative**, for securities: a cancelled or rejected order does
+      NOT free its allowance on its own, because at the moment we learn about
+      it we usually cannot prove the order never consumed anything at the
+      broker. Releasing there is an explicit human act with a stated reason.
+
+    - **automatic**, for FCI, and ONLY from `fci.release_fund_budget()` when
+      the client reports `http_requests_sent=0`. That is safe precisely
+      because no request exists at IOL to reconcile against — the request was
+      never built or never sent. Every ambiguous outcome keeps its budget.
+
+    This function is the mechanism, not the policy: it does not decide whether
+    releasing is allowed. Idempotency lives in the caller, which owns the
+    reservation record; calling this twice would decrement twice.
+
+    `order_count` is decremented too, floored at zero. Leaving it inflated
+    would misreport how many orders a day actually carried, which is the
+    number an operator uses to sanity-check the ledger against IOL.
     """
     amount = non_negative_decimal(notional)
     if amount is None:
@@ -238,6 +252,7 @@ def release_daily_budget(
         text(
             "UPDATE execution_daily_notional "
             "SET submitted_notional = MAX(submitted_notional - :amt, 0), "
+            "    order_count = MAX(order_count - 1, 0), "
             "    updated_at = :now "
             "WHERE trade_date = :trade_date "
             "  AND execution_class = :execution_class "

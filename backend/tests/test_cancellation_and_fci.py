@@ -338,12 +338,26 @@ def test_broker_cancel_order_classifies_outcomes():
 
 
 def _fund(db, symbol="FCIAR", cutoff="15:00", minimum=1000.0, status="verified"):
+    """A fund an operator has administratively verified.
+
+    The provenance map is not decoration: `verified` now means every
+    operational field has a trustworthy source, so a status string alone no
+    longer makes a fund operable. A fund flagged verified with no provenance
+    was exactly the inconsistency that let a `candidate`'s observed cutoff
+    time real money.
+    """
     fund = FundInstrument(
         symbol=symbol, name="Fondo Test", manager="IOL Asset Management",
         currency="ARS", cutoff_local_time=cutoff, settlement_delay_days=1,
         minimum_amount=minimum, subscription_supported=True, redemption_supported=True,
         active=True, verification_status=status, source="iol_fci_catalog",
         verified_at=datetime.utcnow(),
+        field_provenance={
+            "symbol": "iol_fci_catalog",
+            "currency": "admin_verified_override",
+            "cutoff_local_time": "admin_verified_override",
+            "minimum_amount": "admin_verified_override",
+        } if status == "verified" else {"symbol": "iol_fci_catalog"},
     )
     db.add(fund)
     db.commit()

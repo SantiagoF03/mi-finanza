@@ -400,20 +400,47 @@ def _build_order_previews(
                 qty = int(override_dec)
                 position = _find_position(snapshot, action.symbol) if snapshot else None
                 held = non_negative_decimal(getattr(position, "quantity", None)) if position else None
-                if plan["side"] != "sell":
-                    valid = False
-                    blocked_reason = "quantity_override is only supported for sell orders."
-                elif held is None or held < override_dec:
+                declared_side = str((rec.metadata_json or {}).get("side") or "").lower()
+
+                if declared_side and declared_side != plan["side"]:
+                    # The pilot says one thing and the percentage implies the
+                    # other. Trusting either one silently would execute a side
+                    # nobody authorised.
                     valid = False
                     blocked_reason = (
-                        f"quantity_override {qty} exceeds the snapshot position for "
-                        f"{action.symbol} ({held if held is not None else 'no position'})."
+                        f"El piloto declara side={declared_side} pero el plan calculado "
+                        f"es {plan['side']}. No se ejecuta un lado no autorizado."
                     )
-                elif not valid and "rounds to 0" in (plan["blocked_reason"] or ""):
-                    # The percentage rounded to zero, but the pilot states the
-                    # quantity explicitly: the plan is valid again.
-                    valid = True
-                    blocked_reason = ""
+                elif plan["side"] == "sell":
+                    # Selling more than we hold is short selling, which this
+                    # system does not do. The snapshot is the cheap guard; the
+                    # authoritative one is the live position at preflight.
+                    if held is None or held < override_dec:
+                        valid = False
+                        blocked_reason = (
+                            f"quantity_override {qty} exceeds the snapshot position for "
+                            f"{action.symbol} ({held if held is not None else 'no position'})."
+                        )
+                    elif not valid and "rounds to 0" in (plan["blocked_reason"] or ""):
+                        # The percentage rounded to zero, but the pilot states
+                        # the quantity explicitly: the plan is valid again.
+                        valid = True
+                        blocked_reason = ""
+                else:
+                    # BUY. A prior position is deliberately NOT required: the
+                    # whole point of a buy pilot is an instrument we do not hold
+                    # yet, so "no position" can never be the blocker. What we do
+                    # need is a price REFERENCE to size the preview — and that
+                    # reference is never what gets sent: the submitted limit
+                    # price is the fresh best ask resolved at preflight, and the
+                    # money is authorised by the live balance, never by
+                    # snapshot.cash.
+                    if not valid and (
+                        "rounds to 0" in (plan["blocked_reason"] or "")
+                        or "Target buy value" in (plan["blocked_reason"] or "")
+                    ):
+                        valid = True
+                        blocked_reason = ""
 
         if valid:
             if not price or price <= 0:
@@ -739,7 +766,7 @@ def get_execution_readiness(db: Session | None = None) -> dict:
         sell_capability_enabled,
     )
     from app.services.fci import get_fci_capability
-    from app.services.pilot_readiness import next_safe_action
+    from app.services.pilot_readiness import next_safe_action, next_safe_actions
 
     settings = get_settings()
     env = resolve_execution_environment(settings)
@@ -930,8 +957,11 @@ def get_execution_readiness(db: Session | None = None) -> dict:
         },
     }
 
-    # `next_safe_action` is derived from the report, so it can never disagree
-    # with the blockers printed next to it.
+    # Derived from the report, so they can never disagree with the blockers
+    # printed next to them. Per CAPABILITY: the capabilities do not depend on
+    # each other, so a missing FCI limit must not tell an operator working on
+    # ACCIONES to go configure FCI.
+    report["next_safe_actions"] = next_safe_actions(report)
     report["next_safe_action"] = next_safe_action(report)
     # "Everything technical is done" and "we are allowed to send" are two
     # different statements, and collapsing them is how a locked system reads

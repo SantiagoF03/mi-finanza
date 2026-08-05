@@ -316,17 +316,27 @@ def create_securities_pilot_recommendation(
     confirmation_text: str | None,
     note: str = "",
     broker=None,
+    broker_factory=None,
 ) -> dict:
     """Create ONE controlled securities pilot. Never sends an order.
 
     Everything is validated before any write, so a refusal leaves nothing
-    behind. Ordered credential → flag → phrase → payload → technical
-    readiness, so a caller without the credential learns nothing about the
-    catalog.
+    behind. Order matters and is deliberate:
+
+        credential → creation flag → payload → catalog → static checks
+        → ONLY THEN a broker, for the live readiness probe
+
+    so a caller with a bad key or a malformed payload never causes a single
+    broker instantiation, let alone an HTTP call.
+
+    Note what is NOT required: `ORDER_EXECUTION_ENABLED`. Preparing a pilot
+    with every lock shut is the whole point — the lock is what stops the
+    *approval*, later, and requiring it here would make the system
+    unpreparable.
     """
     from app.broker.execution_class import CLASS_ACCIONES, CLASS_CEDEARS
     from app.broker.instrument_catalog import get_instrument
-    from app.services.pilot_readiness import evaluate_pilot_readiness
+    from app.services.pilot_readiness import evaluate_symbol_side
 
     settings = get_settings()
 
@@ -379,26 +389,9 @@ def create_securities_pilot_recommendation(
             "instrument_class_unsupported", 409,
         )
 
-    # --- Technical readiness for THIS side. The same evaluator the readiness
-    #     endpoint uses, so a pilot can never be created for a symbol the
-    #     report calls blocked.
-    readiness = evaluate_pilot_readiness(
-        db, symbols=[clean_symbol], broker=broker, settings=settings
-    )
-    report = next((r for r in readiness["symbols"] if r["symbol"] == clean_symbol), None)
-    if report is None:
-        return _err("No se pudo evaluar la aptitud técnica del símbolo.",
-                    "pilot_readiness_unavailable", 409)
-    side_report = report[clean_side]
-    if not side_report["technically_ready"]:
-        reasons = side_report["blocking_reasons"]
-        return _err(
-            f"{clean_symbol} no está técnicamente listo para {clean_side}: "
-            f"{', '.join(reasons)}.",
-            reasons[0] if reasons else "pilot_not_technically_ready", 409,
-        )
-
-    # --- Quantity must fit the instrument's own step and the class limit.
+    # --- Quantity must fit the instrument's own step. Checked BEFORE the
+    #     broker: a quantity that can never be valid is not worth a network
+    #     call.
     step = entry.quantity_step
     if step is None:
         return _err(
@@ -410,21 +403,40 @@ def create_securities_pilot_recommendation(
         return _err(f"La cantidad {qty} no respeta el quantity_step {step_f}.",
                     "quantity_step_mismatch", 422)
 
-    max_notional = report.get("suggested_pilot_max_notional")
-    reference_price = (
-        side_report["quote"].get("price") if side_report["quote"].get("available") else None
-    )
-    if reference_price is not None and max_notional is not None:
+    # --- ONLY NOW a broker. Every refusal above cost zero instantiations.
+    live_broker = broker
+    if live_broker is None and callable(broker_factory):
         try:
-            projected = float(qty) * float(reference_price)
-        except (TypeError, ValueError):
-            projected = None
-        if projected is not None and projected > float(max_notional) + 1e-9:
-            return _err(
-                f"El monto proyectado ({projected:.2f}) supera el tope técnico del "
-                f"piloto ({float(max_notional):.2f}).",
-                "pilot_notional_limit_exceeded", 422,
-            )
+            live_broker = broker_factory()
+        except Exception as exc:
+            return _err(f"Broker no disponible: {str(exc)[:200]}", "broker_unavailable", 502)
+    if live_broker is None:
+        return _err(
+            "No hay broker disponible para evaluar saldo o posición en vivo. "
+            "Un piloto no se crea sin comprobar la cantidad exacta.",
+            "broker_unavailable", 502,
+        )
+
+    # --- LIVE readiness for THIS side and THIS exact quantity. The same
+    #     evaluator the readiness endpoint uses, so a pilot can never be
+    #     created for something the report calls blocked — and never for a
+    #     quantity we already know cannot be paid for or is not held.
+    evaluation = evaluate_symbol_side(
+        db, symbol=clean_symbol, side=clean_side, quantity=float(qty),
+        broker=live_broker, settings=settings,
+    )
+    if "error" in evaluation:
+        return evaluation
+    report = evaluation["symbol_report"]
+    side_report = evaluation["side_report"]
+
+    if not side_report["technically_ready"]:
+        reasons = side_report["technical_blocking_reasons"]
+        return _err(
+            f"{clean_symbol} no está técnicamente listo para {clean_side}: "
+            f"{', '.join(reasons)}.",
+            reasons[0] if reasons else "pilot_not_technically_ready", 409,
+        )
 
     # --- Same lease and same gate as the analysis cycle: a pilot must not be
     #     able to open a second recommendation behind its back, and it never
@@ -449,6 +461,8 @@ def create_securities_pilot_recommendation(
             quantity=float(qty),
             note=note,
             phrase=expected_phrase,
+            exact_notional=side_report.get("exact_notional"),
+            live_check=side_report.get("live_check") or {},
         )
     finally:
         release_analysis_lease(db, lease_owner)
@@ -456,7 +470,7 @@ def create_securities_pilot_recommendation(
 
 def _create_securities_pilot_locked(
     db: Session, *, entry, symbol: str, side: str, quantity: float,
-    note: str, phrase: str,
+    note: str, phrase: str, exact_notional=None, live_check: dict | None = None,
 ) -> dict:
     """Persist ONE new pilot recommendation. No broker, no quote, no order."""
     settings = get_settings()
@@ -491,6 +505,12 @@ def _create_securities_pilot_locked(
             "created_manually": True,
             "confirmation_phrase": phrase,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            # What the live check saw at creation time. Recorded, never
+            # trusted later: approval re-reads the world for itself.
+            "exact_notional_at_creation": exact_notional,
+            "live_check_at_creation": {
+                k: v for k, v in (live_check or {}).items() if k != "detail"
+            },
             "note": (note or "").strip(),
         },
     )

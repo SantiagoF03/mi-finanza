@@ -75,16 +75,25 @@ _POSITIVE_FIELDS = (
     "max_price_deviation_pct",
     "catalog_max_age_seconds",
     "validity_minutes",
-    "default_quantity_step",
-    "default_price_tick",
 )
 # Zero is meaningful for these (no reserve / no buffer is a real choice), so
 # they are validated as >= 0 instead of > 0.
 _NON_NEGATIVE_FIELDS = ("min_cash_reserve", "fee_buffer_pct")
 _STRING_FIELDS = ("order_type",)
 
+# Class-wide fallbacks for tick and step. NULL is a legitimate value and means
+# "this class asserts nothing about tick/step" — which is the honest answer,
+# because a class-wide tick is a claim about every one of its instruments.
+#
+# A null here is not a loophole: the fallback is recorded with the
+# `class_policy_default` provenance, which does NOT verify, so an instrument
+# whose tick comes from here stays unverified and cannot trade. The verified
+# catalog remains the authority; these only ever fill a gap that still blocks.
+_OPTIONAL_POSITIVE_FIELDS = ("default_quantity_step", "default_price_tick")
+
 REQUIRED_CLASS_POLICY_FIELDS = (
-    _BOOL_FIELDS + _LIST_FIELDS + _POSITIVE_FIELDS + _NON_NEGATIVE_FIELDS + _STRING_FIELDS
+    _BOOL_FIELDS + _LIST_FIELDS + _POSITIVE_FIELDS + _OPTIONAL_POSITIVE_FIELDS
+    + _NON_NEGATIVE_FIELDS + _STRING_FIELDS
 )
 
 # Overrides may address any of these. Booleans may only be turned OFF and
@@ -183,6 +192,19 @@ def validate_class_policy(class_name, policy) -> tuple[dict | None, str | None]:
 
     for field in _NON_NEGATIVE_FIELDS:
         num = _non_negative_finite(policy.get(field))
+        if num is None:
+            return None, "class_policy_invalid"
+        resolved[field] = num
+
+    for field in _OPTIONAL_POSITIVE_FIELDS:
+        raw_value = policy.get(field)
+        if raw_value is None:
+            # Explicitly "not asserted". Distinct from a bad value: a wrong
+            # number would be worse than no number, so 0 and negatives are
+            # still rejected.
+            resolved[field] = None
+            continue
+        num = _positive_finite(raw_value)
         if num is None:
             return None, "class_policy_invalid"
         resolved[field] = num
