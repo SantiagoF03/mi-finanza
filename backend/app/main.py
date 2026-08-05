@@ -119,6 +119,11 @@ def _patch_schema(engine_ref):
         for column, ddl in (
             ("validated_at", "DATETIME"),
             ("validated_payload_hash", "VARCHAR(64) DEFAULT ''"),
+            # Empty means "the fund's verified state was never recorded for
+            # this validation", which reads as changed and forces a new
+            # validation. Fail-closed, and correct: it genuinely was not
+            # checked.
+            ("validated_fund_hash", "VARCHAR(64) DEFAULT ''"),
         ):
             if column not in columns:
                 with engine_ref.begin() as conn:

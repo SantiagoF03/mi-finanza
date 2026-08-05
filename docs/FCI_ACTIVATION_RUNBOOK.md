@@ -108,6 +108,44 @@ para el fondo A no autoriza plata al fondo B. Mientras la identidad no cambia,
 un refresh **preserva** la verificación administrativa aunque el catálogo
 traiga otro `horarioCorte` observado.
 
+Un fondo congelado **no se puede degradar ni verificar** para salir del paso.
+Degradarlo lo movería a `candidate` descartando la identidad pendiente: el
+cambio quedaría *desestimado* en vez de *decidido*, y la próxima verificación
+se otorgaría sin que nadie hubiera mirado qué cambió. La única salida es:
+
+```
+POST /api/funds/catalog/{symbol}/identity-decision
+{
+  "decision": "accept",
+  "expected_pending_identity_hash": "<el que devuelve GET /api/funds/catalog/{symbol}>",
+  "note": "confirmado con la administradora"
+}
+```
+
+El hash se cita de vuelta a propósito: una decisión tomada mirando un cambio no
+puede aplicarse a otro que llegó en el medio.
+
+- **accept** → el fondo vuelve a `candidate`, con las dos capacidades apagadas
+  y la procedencia administrativa retirada. **Aceptar no es re-verificar**: hay
+  que volver a verificarlo, porque lo verificado describía otro fondo.
+- **reject** → queda `rejected` e inactivo. La identidad anterior no se
+  reutiliza para operar.
+
+### La verificación del fondo entra en la validación
+
+`validated_fund_hash` guarda el estado verificado del fondo —status, identidad,
+cutoff, mínimo, moneda y **la capacidad que esta operación necesita**— en el
+momento de validar. Si cualquiera de esos cambia después, la validación queda
+inválida con `fund_verification_changed`, aunque los bytes de la request sean
+idénticos.
+
+Sólo la capacidad relevante: apagar el rescate **no** invalida una suscripción
+pendiente.
+
+`fund_operability_blockers()` se ejecuta en **las cuatro etapas** —create,
+validate, preview y submit, esta última inmediatamente antes del claim— así
+que un fondo degradado entre el preview y el envío detiene el envío.
+
 ## 3. Límites
 
 ```
@@ -141,8 +179,14 @@ Headers: X-Execution-Key
 ```
 
 Envía `soloValidar=true` — **un solo POST**, sin reintento. Requiere el candado
-global abierto **y** el flag de la capacidad: validar un rescate que no podemos
-enviar es una llamada autenticada sobre una operación que no puede ocurrir.
+global abierto **y** el flag de la capacidad **y** un fondo operable: validar
+un rescate que no podemos enviar es una llamada autenticada sobre una operación
+que no puede ocurrir.
+
+Cuando algo de eso bloquea, **no se instancia ningún broker**. La ruta ya no lo
+construye por adelantado: antes lo hacía, así que una request que el candado
+estaba por rechazar igual se autenticaba contra IOL camino al rechazo. Ahora
+"bloqueado" significa cero instanciaciones y cero llamadas HTTP.
 
 Una validación **nunca** es una ejecución: no fija `numeroOperacion`, no mueve
 la operación a un estado enviado, no consume presupuesto y no crea decisión.
@@ -211,10 +255,43 @@ Resultados posibles:
 | Enviada | 1 | `pending_confirmation` | consumido |
 | Rechazada por IOL | 1 | `rejected` | consumido (liberar es administrativo) |
 | Ambiguo (timeout, 5xx, 2xx sin `numeroOperacion`) | 1 | `submission_unknown` | **se conserva** |
-| Falla local antes del POST | **0** | vuelve a `validated` | **se libera** |
+| Falla al **construir** la request | **0** | vuelve a `validated` | **se libera** |
 
-La última fila es la única liberación automática, y es segura precisamente
-porque no hay ninguna request en IOL contra la cual conciliar.
+**Construir y enviar son dos pasos distintos**, y por eso la última fila es
+demostrable en vez de adivinada:
+
+```python
+request_obj = client.build_request(...)   # falla acá → local_error, 0 requests
+lifecycle["request_started"] = True
+response = client.send(request_obj)       # falla acá → submission_unknown, 1
+```
+
+Antes eran una sola llamada, así que un bug de serialización era
+indistinguible de una falla de red y terminaba en `submission_unknown`,
+dejando la operación esperando que un humano revisara IOL por una request que
+nunca se había armado.
+
+Si llega una respuesta ilegible: `response_received=true`,
+`response_parsed=false`. "IOL contestó algo que no pudimos leer" y "IOL nunca
+contestó" son hechos distintos.
+
+Esa es la única liberación automática, y es segura precisamente porque no hay
+ninguna request en IOL contra la cual conciliar.
+
+### La reserva recuerda su propia clave
+
+`FundBudgetReservation` guarda `trade_date`, `ledger_class`, `currency` y monto
+en la **misma transacción** que el claim. La liberación usa esa fila, no
+`trade_date_for(ahora)`: una liberación después de medianoche decrementaba el
+día equivocado —el cupo de hoy se achicaba y el de ayer quedaba gastado.
+
+Y es **idempotente**: una segunda liberación devuelve `budget_already_released`
+y no toca el ledger. `submitted_notional` es autoridad de gasto; decrementarlo
+dos veces reparte cupo que nadie devolvió. `order_count` también se decrementa,
+con piso en cero.
+
+Una operación que llegó al broker nunca se libera automáticamente:
+`operation_reached_broker`.
 
 ## 8. `pending_confirmation`
 
@@ -244,6 +321,16 @@ POST /api/funds/operations/{id}/reconcile
 Esta es la **única** salida de `submission_unknown`. No hay reenvío y no debe
 haberlo: una operación de FCI no es idempotente y una suscripción duplicada es
 plata real. Un reintento humano sobre una operación ya enviada devuelve 409.
+
+**Sólo se puede conciliar lo que pudo llegar al broker**: `submitting`,
+`submitted`, `pending_confirmation`, `submission_unknown`,
+`reconciliation_required`. Una operación en `prepared`, `validation_requested`,
+`validated` o `approval_requested` devuelve `fund_operation_never_submitted`.
+
+Conciliar es **declarar qué hizo IOL**. Una operación que nunca salió de este
+proceso no tiene nada que declarar, así que marcarla `confirmed` inventaría una
+suscripción inexistente — y ese registro fabricado después reservaría capacidad
+y se leería como plata real en la cartera.
 
 Antes de conciliar, **mirá el panel de IOL**. Conciliar es declarar qué pasó,
 no adivinarlo.

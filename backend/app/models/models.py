@@ -502,6 +502,11 @@ class FundOperation(Base):
     # changing the amount — or letting it go stale — voids it.
     validated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     validated_payload_hash: Mapped[str] = mapped_column(String(64), default="")
+    # Hash of the FUND's verified state at validation time: status, identity,
+    # cutoff, minimum, currency and the capability this operation needs. A
+    # demotion, a withdrawn capability or an identity change moves this hash,
+    # which voids the validation even though the request bytes are unchanged.
+    validated_fund_hash: Mapped[str] = mapped_column(String(64), default="")
     broker_response: Mapped[dict] = mapped_column(JSON, default=dict)
     error_message: Mapped[str] = mapped_column(Text, default="")
     blocked_reason: Mapped[str] = mapped_column(Text, default="")
@@ -512,6 +517,39 @@ class FundOperation(Base):
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class FundBudgetReservation(Base):
+    """The daily budget ONE fund operation reserved, with its own identity.
+
+    Without this, releasing budget meant recomputing the key from
+    `trade_date_for(settings)` at release time — so a release that happened
+    after midnight, or after the timezone config changed, decremented a
+    DIFFERENT day's row: today's allowance shrank while yesterday's stayed
+    spent. The reservation now remembers exactly which row it incremented.
+
+    It also makes release idempotent. `submitted_notional` is real spending
+    authority; decrementing it twice would hand out allowance that was never
+    given back.
+    """
+
+    __tablename__ = "fund_budget_reservations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # One reservation per operation, enforced by the database: a second claim
+    # of the same operation cannot create a second reservation.
+    fund_operation_id: Mapped[int] = mapped_column(
+        ForeignKey("fund_operations.id"), unique=True, index=True
+    )
+    trade_date: Mapped[str] = mapped_column(String(10), index=True)
+    ledger_class: Mapped[str] = mapped_column(String(30))
+    currency: Mapped[str] = mapped_column(String(10), default="")
+    reserved_notional: Mapped[float] = mapped_column(Float, default=0.0)
+    # reserved | released
+    status: Mapped[str] = mapped_column(String(20), default="reserved", index=True)
+    reserved_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    release_reason: Mapped[str] = mapped_column(String(200), default="")
 
 
 class FundInstrumentVerification(Base):

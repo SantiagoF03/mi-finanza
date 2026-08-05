@@ -65,36 +65,82 @@ def broker_execution_readiness(db: Session = Depends(get_db), _auth=Depends(requ
 @router.get("/broker/pilot-readiness")
 def broker_pilot_readiness(
     symbols: str | None = None,
+    side: str | None = None,
+    quantity: float | None = None,
+    live: bool = False,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
     db: Session = Depends(get_db),
     _auth=Depends(require_api_key),
 ):
     """Technical aptitude for a controlled pilot, per symbol and per class.
 
-    READ-ONLY: no orders, no catalog writes, no flag changes. It may read a
-    quote to check that the side of the book it needs actually exists; without
-    a broker it reports that as unavailable rather than assuming it.
+    READ-ONLY in both modes: no orders, no catalog writes, no flag changes.
+
+    `live=false` (default) touches no broker at all. It answers everything
+    that depends only on stored state — catalog, identity, class, policy,
+    limits — and explicitly does NOT claim a balance or a position is
+    available, because it did not look.
+
+    `live=true` additionally probes the requested side of the book and checks
+    the live balance (buy) or the live holding (sell) for an EXACT quantity.
+    That costs a real broker call per symbol, so it requires the execution
+    credential, explicit symbols (at most 10), a side and a quantity. It never
+    walks the whole catalog.
+
+    Technical readiness and activation readiness are reported separately:
+    `technically_ready` can — and before a pilot SHOULD — be true while every
+    lock is shut.
 
     This is NOT investment advice. `suggested_pilot_max_*` are technical
-    ceilings (one lot, the tightest applicable limit), not targets.
-
-    `symbols=BYMA,SPY` restricts the report; omitted, every catalogued
-    securities instrument is evaluated.
+    ceilings, not targets.
     """
-    from app.services.pilot_readiness import evaluate_pilot_readiness
+    import secrets as _s
+
+    from app.services.pilot_readiness import MAX_LIVE_SYMBOLS, evaluate_pilot_readiness
 
     requested = [s.strip() for s in (symbols or "").split(",") if s.strip()]
+    settings = get_settings()
 
-    broker = None
+    if not live:
+        # No credential needed and no broker created: nothing here reaches
+        # outside the database.
+        return evaluate_pilot_readiness(
+            db, symbols=requested or None, side=side, quantity=quantity,
+            live=False, broker=None,
+        )
+
+    if not settings.execution_admin_key:
+        raise HTTPException(423, "Credencial de ejecución no configurada.")
+    if not x_execution_key or not _s.compare_digest(
+        str(x_execution_key), settings.execution_admin_key
+    ):
+        raise HTTPException(403, "Credencial de ejecución inválida o ausente.")
+    if not requested:
+        raise HTTPException(
+            422, "live=true requiere symbols explícitos. No se recorre el catálogo entero."
+        )
+    if len(requested) > MAX_LIVE_SYMBOLS:
+        raise HTTPException(
+            422,
+            f"live=true admite hasta {MAX_LIVE_SYMBOLS} símbolos "
+            f"(recibidos {len(requested)}).",
+        )
+    if not side or str(side).strip().lower() not in ("buy", "sell"):
+        raise HTTPException(422, "live=true requiere side=buy o side=sell.")
+    if quantity is None or quantity <= 0:
+        raise HTTPException(422, "live=true requiere una quantity positiva.")
+
+    # Only now — after every gate — is a broker created.
     try:
         from app.services.execution import _get_execution_broker
         broker = _get_execution_broker()
-    except Exception:
-        # A quote probe is a nice-to-have. The catalog and policy half of the
-        # report is still worth returning, with the quote half marked
-        # unavailable — which is honest, and blocks either way.
-        broker = None
+    except Exception as exc:
+        raise HTTPException(502, f"Broker no disponible: {str(exc)[:200]}")
 
-    return evaluate_pilot_readiness(db, symbols=requested or None, broker=broker)
+    return evaluate_pilot_readiness(
+        db, symbols=requested, side=str(side).strip().lower(),
+        quantity=quantity, live=True, broker=broker,
+    )
 
 
 @router.get("/broker/pilot-policy-template")
@@ -359,10 +405,14 @@ def validate_fund_operation_endpoint(
 
     A validation is never an execution: it creates no operation, records no
     approval decision, and cannot move the operation into a submitted state.
+
+    The broker is passed as a FACTORY, not as an instance. This route used to
+    build it up front, so a request the global lock was about to refuse still
+    authenticated against IOL on the way to being refused. Now a blocked
+    validation instantiates nothing and reaches the network zero times.
     """
     import secrets as _s
 
-    from app.services.execution import _get_execution_broker
     from app.services.fci import validate_fund_operation
 
     settings = get_settings()
@@ -373,12 +423,11 @@ def validate_fund_operation_endpoint(
     ):
         raise HTTPException(403, "Credencial de ejecución inválida o ausente.")
 
-    try:
-        broker = _get_execution_broker()
-    except Exception as exc:
-        raise HTTPException(502, f"Broker no disponible: {str(exc)[:200]}")
+    def _broker_factory():
+        from app.services.execution import _get_execution_broker
+        return _get_execution_broker()
 
-    result = validate_fund_operation(db, operation_id, broker)
+    result = validate_fund_operation(db, operation_id, _broker_factory)
     if "error" in result:
         raise HTTPException(result.get("status_code", 400), result["error"])
     return result
@@ -600,6 +649,44 @@ def demote_fund_endpoint(
     return result
 
 
+class FundIdentityDecisionIn(BaseModel):
+    decision: str  # accept | reject
+    expected_pending_identity_hash: str
+    note: str
+
+
+@router.post("/funds/catalog/{symbol}/identity-decision")
+def fund_identity_decision_endpoint(
+    symbol: str,
+    payload: FundIdentityDecisionIn,
+    x_execution_key: str | None = Header(default=None, alias="X-Execution-Key"),
+    db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
+):
+    """Resolve the identity change that froze a fund. The ONLY way out.
+
+    `demote` deliberately refuses frozen funds: it would move one to
+    `candidate` and discard the pending identity, dismissing the change
+    instead of deciding it.
+
+    Accepting returns the fund to `candidate` with both capabilities off — the
+    previous verification described a different fund, so it must be verified
+    again. The expected hash must match what is currently pending, so a
+    decision cannot land on a change the operator never saw.
+    """
+    from app.services.fci import decide_fund_identity_change
+    result = decide_fund_identity_change(
+        db, symbol,
+        execution_key=x_execution_key,
+        decision=payload.decision,
+        expected_pending_identity_hash=payload.expected_pending_identity_hash,
+        note=payload.note,
+    )
+    if "error" in result:
+        raise HTTPException(result.get("status_code", 400), result["error"])
+    return result
+
+
 @router.get("/funds/catalog/{symbol}")
 def get_fund_catalog_entry(
     symbol: str,
@@ -612,17 +699,23 @@ def get_fund_catalog_entry(
     exactly what tells an operator what to verify.
     """
     from app.services.fci import (
+        FUND_STATUS_IDENTITY_CHANGED,
         OPERATION_REDEEM,
         OPERATION_SUBSCRIBE,
         fund_operability_blockers,
         get_fund,
         list_fund_verifications,
+        pending_identity_hash,
     )
 
     fund = get_fund(db, symbol)
     if fund is None:
         raise HTTPException(404, "El fondo no está en el catálogo de FCI.")
     return {
+        "pending_identity_hash": (
+            pending_identity_hash(fund)
+            if fund.verification_status == FUND_STATUS_IDENTITY_CHANGED else None
+        ),
         "symbol": fund.symbol,
         "name": fund.name,
         "manager": fund.manager,
@@ -1175,15 +1268,9 @@ def create_securities_pilot(
     """
     from app.services.execution_pilot import create_securities_pilot_recommendation
 
-    broker = None
-    try:
+    def _broker_factory():
         from app.services.execution import _get_execution_broker
-        broker = _get_execution_broker()
-    except Exception:
-        # No broker ⇒ no quote ⇒ the side is not technically ready ⇒ refused.
-        # That is the correct outcome: a pilot must not be created for a side
-        # we could not price.
-        broker = None
+        return _get_execution_broker()
 
     result = create_securities_pilot_recommendation(
         db,
@@ -1193,7 +1280,7 @@ def create_securities_pilot(
         quantity=payload.quantity,
         confirmation_text=payload.confirmation_text,
         note=payload.note,
-        broker=broker,
+        broker_factory=_broker_factory,
     )
     if "error" in result:
         raise HTTPException(result.get("status_code", 400), result["error"])

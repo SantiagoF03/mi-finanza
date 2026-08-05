@@ -41,26 +41,46 @@ campo lo hace visible, no confiable.
 
 ```
 GET /api/broker/instrument-capabilities
-GET /api/broker/pilot-readiness?symbols=BYMA
+GET /api/broker/pilot-readiness?symbols=GGAL
 ```
 
-`pilot-readiness` responde la única pregunta que importa acá: **¿podría** esta
-app mandar una orden de este lado, sin chocar con un bloqueo? Mirá:
+> **No uses BYMA como candidato del piloto nuevo.** BYMA tiene una política
+> legacy por símbolo que atajea el camino por clase, así que un piloto verde
+> en BYMA demuestra que el puente legacy funciona, no que ACCIONES funciona.
+> El candidato sale de la readiness técnica, no de una lista fija.
 
-- `buy.blocking_reasons` y `sell.blocking_reasons` — son listas separadas
-  porque son capacidades separadas;
-- `manual_configuration_required` — lo que falta que decida un humano;
-- `suggested_pilot_max_quantity` / `_notional` — **topes técnicos**, no
-  objetivos de inversión.
+`pilot-readiness` separa **dos preguntas distintas**:
 
-Los bloqueos típicos en este punto:
+| Campo | Qué responde |
+|---|---|
+| `technically_ready` / `technical_blocking_reasons` | ¿el instrumento está bien descripto, cotizado y dimensionado? |
+| `activation_ready` / `activation_blocking_reasons` | ¿tenemos permiso para enviar? |
+
+Con todos los candados cerrados —que es el estado correcto en este paso— lo
+esperado es:
+
+```json
+{"technically_ready": true, "activation_ready": false,
+ "activation_blocking_reasons": ["execution_locked", "sell_execution_disabled"]}
+```
+
+Si las dos preguntas fueran una sola, este estado diría "no listo" y no
+podrías distinguir un tick faltante de un candado cerrado.
+
+También mirá `manual_configuration_required` (lo que falta que decida un
+humano) y `suggested_pilot_max_quantity` / `minimum_valid_quantity` — **topes
+técnicos**, no objetivos de inversión.
+
+Bloqueos técnicos típicos en este punto:
 
 | Código | Qué falta |
 |---|---|
-| `instrument_not_verified` | tick y/o step sin verificación administrativa |
+| `instrument_identity_not_verified` | identidad o mecánica sin procedencia confiable |
+| `instrument_buy_not_verified` / `instrument_sell_not_verified` | esa capacidad, específicamente |
 | `class_policy_not_configured` | falta la política de la clase (paso 3) |
 | `quote_unavailable` | no hay punta de ese lado del libro |
 | `quote_wrong_side` | el proveedor contestó con la otra punta |
+| `live_check_not_performed` | pediste `live=false`: no se miró saldo ni tenencia |
 
 Para tick y step:
 
@@ -72,6 +92,26 @@ POST /api/broker/instruments/{symbol}/verify-fields
 razonable" es afirmarlo; una vez en la config, un número inventado es
 indistinguible de uno verificado.
 
+### Comprobación viva de la cantidad exacta
+
+```
+GET /api/broker/pilot-readiness?live=true&symbols=GGAL&side=buy&quantity=1
+Headers: X-Execution-Key
+```
+
+`live=true` es **otra cosa** que el modo por defecto: consulta el libro del
+lado pedido y comprueba **saldo vivo** (compra) o **tenencia viva** (venta)
+para esa cantidad exacta. Cuesta una llamada real por símbolo, así que exige
+la credencial, símbolos explícitos (máximo 10), `side` y `quantity`. Nunca
+recorre el catálogo entero.
+
+Devuelve `exact_notional` = `quantity × ask` (compra) o `× bid` (venta), más
+`live_cash_check` o `live_position_check`. Compra y venta se valúan cada una
+con **su** punta; nunca al revés.
+
+`live=false` **no afirma** que haya saldo o tenencia disponible, porque no
+miró. Eso se reporta como `live_check_not_performed`, no como "todo bien".
+
 ## 3. Plantilla de políticas
 
 ```
@@ -81,13 +121,33 @@ GET /api/broker/pilot-policy-template?symbols=BYMA,SPY
 Devuelve un JSON **para revisar**. No escribe nada — ni base, ni entorno, ni
 Railway.
 
+**La plantilla ahora carga sin errores.** La versión anterior emitía
+`default_price_tick: null` contra un esquema que exigía un número positivo, y
+`price_tick`/`quantity_step` dentro de un override que no admite esos campos —
+así que pegarla en producción daba `class_policy_invalid` y te enterabas
+después. Hay un test que la genera, la carga con `load_class_policies` y
+`load_instrument_overrides`, y exige cero errores.
+
 Reglas que ya vienen aplicadas:
 
 - `buy_enabled` y `sell_enabled` en **false**;
-- `default_price_tick` y `default_quantity_step` en **null** (un tick por
-  clase es una afirmación sobre todos sus instrumentos);
+- `default_price_tick` y `default_quantity_step` en **null** — ahora un valor
+  válido y explícito: la clase no afirma nada sobre tick ni step. No es una
+  puerta trasera: ese fallback lleva procedencia `class_policy_default`, que
+  **no verifica**, así que el instrumento sigue bloqueado. El catálogo
+  verificado sigue siendo la autoridad;
+- **tick y step NO van en overrides** — van en la sección aparte
+  `INSTRUMENT_FIELD_VERIFICATION_PAYLOADS`, que **no es una variable de
+  Railway**: es el payload para `verify-fields`;
+- `max_quantity` de la clase nunca queda por debajo del lote mínimo de sus
+  miembros (un límite de 1 sobre un instrumento que opera de a 100 rechaza
+  todas sus órdenes);
+- si el lote mínimo vale más que el límite del piloto, se reporta
+  `pilot_limit_below_minimum_lot` y **no se amplía el límite solo**;
+- los overrides sólo **endurecen**;
 - ACCIONES y CEDEARS en bloques **separados**, aunque los números coincidan;
-- moneda, mercado y plazo copiados de lo observado, nunca inventados.
+- moneda, mercado y plazo copiados de lo observado, con la grafía canónica que
+  el validador espera (`bCBA`, no `bcba`).
 
 **Todo `null` que completes a mano es una afirmación tuya.** Si no lo
 verificaste, dejalo en `null`: el instrumento queda bloqueado, que es el
@@ -137,7 +197,19 @@ Leé, en este orden:
 2. `technically_ready_but_locked` — `true` significa "todo lo técnico está
    hecho y el candado sigue cerrado", que es el estado deseado antes del
    piloto;
-3. `next_safe_action` — determinístico, derivado de los bloqueos;
+3. `next_safe_actions` — **una por capacidad**:
+
+   ```json
+   {"acciones": "ready_for_controlled_acciones_pilot",
+    "cedears": "configure_class_policy_cedears",
+    "fci_subscription": "configure_fci_limits",
+    "fci_redemption": "configure_fci_limits"}
+   ```
+
+   Las capacidades no dependen entre sí, así que sus instrucciones tampoco:
+   que falten los límites de FCI **no** bloquea el camino de ACCIONES. Antes
+   una sola cadena cubría todo y mandaba a configurar FCI a alguien que estaba
+   trabajando en acciones;
 4. `acciones` / `cedears` — por clase. **Una clase no está lista porque un
    símbolo lo esté**: `covered_symbols` y `*_ready` son datos distintos.
 
@@ -159,7 +231,28 @@ Headers: X-API-Key, X-Execution-Key
 ```
 
 Requiere `EXECUTION_PILOT_CREATION_ENABLED=true` y **`ORDER_EXECUTION_ENABLED`
-sigue en false**: el piloto se *prepara* mientras el envío está bloqueado.
+sigue en false**: el piloto se *prepara* mientras el envío está bloqueado. Eso
+es deliberado — exigir el candado abierto para preparar haría el sistema
+imposible de preparar.
+
+Lo que sí exige es `technically_ready=true` **para ese lado y esa cantidad
+exacta**, comprobado en vivo. No se crea un piloto que ya sabemos que no tiene
+saldo (compra) o no tiene tenencia (venta).
+
+El orden interno importa: credencial → flag de creación → payload → catálogo →
+chequeos estáticos → **recién entonces** un broker. Un payload inválido o una
+credencial equivocada no instancian broker ni tocan la red.
+
+### Antes del primer piloto: Recommendation 13
+
+El gate central impide dos recomendaciones abiertas a la vez, y **Recommendation
+13 sigue `pending`**. Mientras esté abierta, la creación de un piloto devuelve
+409 en vez de superponerse.
+
+**Esa decisión es tuya y hay que tomarla explícitamente** — aprobarla o
+rechazarla desde la UI. Este trabajo no la resuelve, y no debería: una
+recomendación pendiente es una decisión humana esperando, no un obstáculo
+técnico que el código deba apartar.
 
 La frase nombra símbolo, lado y cantidad, así que **la frase de un piloto no
 autoriza otro**. Cuatro pilotos independientes:

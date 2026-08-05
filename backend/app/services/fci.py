@@ -59,6 +59,7 @@ from app.broker.execution_class import CLASS_FCI, FAMILY_FUND
 from app.broker.numeric import positive_decimal
 from app.core.config import get_settings
 from app.models.models import (
+    FundBudgetReservation,
     FundInstrument,
     FundInstrumentVerification,
     FundOperation,
@@ -220,7 +221,59 @@ def validation_payload_hash(operation: FundOperation) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def validation_state(operation: FundOperation, *, settings, now: datetime | None = None) -> dict:
+def fund_verification_hash(fund: FundInstrument, operation: str) -> str:
+    """Hash of everything about the FUND that an authorisation depends on.
+
+    A validation is evidence about a request made against a fund in a
+    particular verified state. Demote the fund, withdraw a capability, change
+    the cutoff or the minimum, and that evidence no longer describes what we
+    are about to send — even though the request bytes are identical.
+
+    Includes the identity hash so a frozen-and-re-verified fund never inherits
+    an approval given for what it used to be.
+    """
+    canonical = json.dumps(
+        {
+            "symbol": str(fund.symbol or "").strip().upper(),
+            "identity_hash": fund.identity_hash or "",
+            "verification_status": str(fund.verification_status or ""),
+            "currency": str(fund.currency or "").strip().upper(),
+            "cutoff_local_time": fund.cutoff_local_time or "",
+            "minimum_amount": serialize_monto(fund.minimum_amount) or "",
+            "settlement_delay_days": fund.settlement_delay_days,
+            "active": bool(fund.active),
+            # Only the capability THIS operation needs: turning redemption off
+            # must not invalidate a pending subscription's validation.
+            "capability": (
+                bool(fund.subscription_supported) if operation == OPERATION_SUBSCRIBE
+                else bool(fund.redemption_supported)
+            ),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def fund_verification_changed(
+    operation: FundOperation, fund: FundInstrument | None
+) -> bool:
+    """Did the fund's verified state move since this operation was validated?"""
+    if fund is None:
+        return True
+    recorded = getattr(operation, "validated_fund_hash", "") or ""
+    if not recorded:
+        # Validated before this field existed, or never validated. Either way
+        # we cannot claim the fund state was checked.
+        return True
+    return not _secrets.compare_digest(
+        recorded, fund_verification_hash(fund, operation.operation)
+    )
+
+
+def validation_state(operation: FundOperation, *, settings, now: datetime | None = None,
+                     fund: FundInstrument | None = None) -> dict:
     """Is this operation backed by a FRESH, MATCHING validation?
 
     Returns {"valid": bool, "code": str|None, ...}. Fail-closed: anything we
@@ -256,6 +309,12 @@ def validation_state(operation: FundOperation, *, settings, now: datetime | None
         # The amount or the fund changed after validating.
         return {**detail, "valid": False, "code": "fci_validation_stale_payload"}
 
+    # The fund's own verified state is part of what was validated. Checked
+    # only when the caller supplies the fund, so callers that genuinely have
+    # no session (pure TTL checks) keep working.
+    if fund is not None and fund_verification_changed(operation, fund):
+        return {**detail, "valid": False, "code": "fund_verification_changed"}
+
     return {**detail, "valid": True, "code": None}
 
 
@@ -284,6 +343,23 @@ def fund_capability_blocker(operation: str, settings) -> str | None:
             return "fci_redemption_disabled"
         return None
     return "invalid_fund_operation"
+
+
+def _resolve_broker(broker_or_factory):
+    """Accept either a broker or a zero-arg factory that builds one.
+
+    Discriminated by the METHOD a broker must have, not by `callable()`: a
+    test double is callable too, so a callable-check would call the double and
+    use whatever it returned. What actually distinguishes them is that a
+    broker can submit a fund request and a factory cannot.
+    """
+    if broker_or_factory is None:
+        return None
+    if hasattr(broker_or_factory, "submit_fund_request"):
+        return broker_or_factory
+    if callable(broker_or_factory):
+        return broker_or_factory()
+    return broker_or_factory
 
 
 def _utcnow() -> datetime:
@@ -874,11 +950,160 @@ def reject_fund_instrument(db: Session, symbol: str, *, execution_key, note: str
 
 
 def demote_fund_instrument(db: Session, symbol: str, *, execution_key, note: str) -> dict:
-    """Withdraw a verification without refusing the fund outright."""
+    """Withdraw a verification without refusing the fund outright.
+
+    Refuses to touch a fund frozen by an identity change. Demoting one would
+    move it to `candidate` and quietly discard the pending identity — the
+    change would be *dismissed* rather than *decided*, and the next
+    verification would be granted without anyone having looked at what
+    actually changed. That decision has its own endpoint.
+    """
+    fund = get_fund(db, symbol)
+    if fund is not None and fund.verification_status == FUND_STATUS_IDENTITY_CHANGED:
+        return _err(
+            "El fondo está congelado por un cambio de identidad. Resolvelo con "
+            "POST /api/funds/catalog/{symbol}/identity-decision antes de degradarlo.",
+            "fund_identity_decision_required", 409,
+        )
     return _set_fund_status(
         db, symbol, execution_key=execution_key, note=note,
         action="demote", new_status=FUND_STATUS_CANDIDATE,
     )
+
+
+def pending_identity_hash(fund: FundInstrument) -> str:
+    """Hash of the identity a frozen fund is waiting for a decision on.
+
+    The operator quotes it back when deciding, so a decision made while
+    looking at one change cannot be applied to a different one that landed in
+    between.
+    """
+    payload = fund.pending_identity or {}
+    canonical = json.dumps(
+        {field: str(payload.get(field) or "").strip().upper()
+         for field in FUND_IDENTITY_FIELDS},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def decide_fund_identity_change(
+    db: Session,
+    symbol: str,
+    *,
+    execution_key: str | None,
+    decision: str,
+    expected_pending_identity_hash: str | None,
+    note: str,
+) -> dict:
+    """Accept or reject the identity change that froze this fund.
+
+    Accepting does NOT re-verify: it moves the fund to `candidate` with both
+    capabilities off, so the operational parameters must be asserted again.
+    The previous verification described a different fund; carrying it over is
+    exactly the failure this freeze exists to prevent.
+    """
+    settings = get_settings()
+
+    if not settings.execution_admin_key:
+        return _err("Credencial de ejecución no configurada.",
+                    "execution_admin_key_not_configured", 423)
+    if not execution_key or not _secrets.compare_digest(
+        str(execution_key), settings.execution_admin_key
+    ):
+        return _err("Credencial de ejecución inválida o ausente.",
+                    "invalid_execution_key", 403)
+    if decision not in ("accept", "reject"):
+        return _err(f"Decisión inválida: '{decision}'. Usá accept o reject.",
+                    "invalid_identity_decision", 422)
+    if not str(note or "").strip():
+        return _err("Se requiere una nota que explique la decisión.",
+                    "verification_note_required", 422)
+
+    fund = get_fund(db, symbol)
+    if fund is None:
+        return _err("El fondo no está en el catálogo de FCI.",
+                    "fund_not_in_catalog", 404)
+    if fund.verification_status != FUND_STATUS_IDENTITY_CHANGED:
+        return _err("El fondo no tiene un cambio de identidad pendiente.",
+                    "no_pending_identity_change", 409)
+
+    current_hash = pending_identity_hash(fund)
+    if not expected_pending_identity_hash or not _secrets.compare_digest(
+        str(expected_pending_identity_hash), current_hash
+    ):
+        # The operator is deciding about an identity that is no longer the one
+        # on the table.
+        return _err(
+            "El hash de identidad pendiente no coincide. Volvé a leer el fondo "
+            "antes de decidir.",
+            "pending_identity_hash_mismatch", 409,
+        )
+
+    from app.broker.instrument_catalog import PROV_ADMIN_OVERRIDE
+
+    previous_status = FUND_STATUS_IDENTITY_CHANGED
+    if decision == "accept":
+        fund.verification_status = FUND_STATUS_CANDIDATE
+        fund.previous_identity = None
+        fund.pending_identity = None
+        fund.identity_hash = fund_identity_hash(fund)
+        new_status = FUND_STATUS_CANDIDATE
+    else:
+        fund.verification_status = FUND_STATUS_REJECTED
+        fund.active = False
+        new_status = FUND_STATUS_REJECTED
+
+    # Either way both capabilities stay off and the administrative provenance
+    # is withdrawn: whatever was verified was verified about something else.
+    fund.subscription_supported = False
+    fund.redemption_supported = False
+    fund.field_provenance = {
+        field: source for field, source in (fund.field_provenance or {}).items()
+        if source != PROV_ADMIN_OVERRIDE
+    }
+
+    record = FundInstrumentVerification(
+        fund_symbol=fund.symbol,
+        action=f"identity_{decision}",
+        previous_status=previous_status,
+        new_status=new_status,
+        currency=str(fund.currency or ""),
+        cutoff_local_time=fund.cutoff_local_time,
+        minimum_amount=fund.minimum_amount,
+        settlement_delay_days=fund.settlement_delay_days,
+        note=str(note).strip()[:2000],
+        data_hash=current_hash,
+        identity_hash=fund.identity_hash or "",
+    )
+    db.add(record)
+    db.commit()
+
+    app_log(db, f"Cambio de identidad de FCI {decision}", context={
+        "fund_symbol": fund.symbol,
+        "decision": decision,
+        "new_status": new_status,
+        "verification_id": record.id,
+    })
+    db.commit()
+
+    return {
+        "fund_symbol": fund.symbol,
+        "decision": decision,
+        "previous_status": previous_status,
+        "verification_status": fund.verification_status,
+        "subscription_supported": False,
+        "redemption_supported": False,
+        "verification_id": record.id,
+        "requires_reverification": decision == "accept",
+        "message": (
+            "Identidad aceptada. El fondo vuelve a candidate y requiere una "
+            "verificación nueva: lo verificado antes describía otro fondo."
+            if decision == "accept"
+            else "Identidad rechazada. El fondo queda inactivo y no puede operar."
+        ),
+    }
 
 
 def list_fund_verifications(db: Session, symbol: str) -> list[dict]:
@@ -974,8 +1199,9 @@ def build_fund_operation_preview(
         settings, "fci_redemption_enabled", False
     ):
         blocking.append("fci_redemption_disabled")
-    # A validation must exist, be fresh, and describe THIS request.
-    validation = validation_state(operation, settings=settings)
+    # A validation must exist, be fresh, and describe THIS request AND the
+    # fund's verified state at the time it was made.
+    validation = validation_state(operation, settings=settings, fund=fund)
     if not validation["valid"]:
         blocking.append(validation["code"])
     # Per-operation cap, per currency. 0 = not configured = blocked.
@@ -991,10 +1217,11 @@ def build_fund_operation_preview(
         blocking.append("execution_admin_key_not_configured")
     if not settings.execution_preview_secret:
         blocking.append("preview_signing_not_configured")
-    if fund.verification_status != "verified":
-        blocking.append("fund_not_verified")
-    if not fund.active:
-        blocking.append("fund_inactive")
+    # The SAME operability rules as create/validate/submit. Duplicating a
+    # subset here is how a preview ends up approving what submit refuses.
+    for code in fund_operability_blockers(fund, operation.operation):
+        if code not in blocking:
+            blocking.append(code)
     if operation.status in NO_RESUBMIT_STATES:
         blocking.append("fund_operation_already_submitted")
     if operation.operation == OPERATION_SUBSCRIBE:
@@ -1160,8 +1387,17 @@ def build_fund_request(operation: FundOperation, *, solo_validar: bool) -> tuple
     }, None
 
 
-def validate_fund_operation(db: Session, operation_id: int, broker) -> dict:
+def validate_fund_operation(db: Session, operation_id: int, broker_factory) -> dict:
     """Pre-check via the official `soloValidar=true` mechanism.
+
+    `broker_factory` is a CALLABLE, not a broker. The route used to build the
+    broker before calling this function, so a request refused by the global
+    lock still authenticated against IOL on its way to being refused — the
+    lock stopped the operation but not the connection.
+
+    Now the broker is created only after every gate has passed, which makes
+    "blocked" mean zero broker instantiations and zero HTTP calls. A plain
+    broker object is still accepted for callers that already have one.
 
     A validation is NEVER an execution: it must not set broker_operation_id,
     must not move the operation into a submitted state, and must not consume
@@ -1199,12 +1435,33 @@ def validate_fund_operation(db: Session, operation_id: int, broker) -> dict:
             capability_error, 423,
         )
 
+    # The FUND itself must still be operable. A fund that was demoted,
+    # rejected or frozen after this operation was prepared must not be
+    # pre-checked as if the old verification still held.
+    fund = get_fund(db, operation.fund_symbol)
+    if fund is None:
+        return _err("El fondo no está en el catálogo de FCI.", "fund_not_in_catalog", 404)
+    fund_blockers = fund_operability_blockers(fund, operation.operation)
+    if fund_blockers:
+        operation.blocked_reason = fund_blockers[0]
+        db.commit()
+        return _err(f"El fondo no está habilitado para operar: {fund_blockers[0]}.",
+                    fund_blockers[0], 409)
+
     request, error = build_fund_request(operation, solo_validar=True)
     if error:
         operation.blocked_reason = error
         db.commit()
         return _err(f"No se pudo construir la request de validación: {error}.",
                     error, 422)
+
+    # --- Every gate has passed. ONLY NOW is a broker created. ---
+    try:
+        broker = _resolve_broker(broker_factory)
+    except Exception as exc:
+        return _err(f"Broker no disponible: {str(exc)[:200]}", "broker_unavailable", 502)
+    if broker is None:
+        return _err("Broker no disponible.", "broker_unavailable", 502)
 
     operation.status = STATE_VALIDATION_REQUESTED
     db.commit()
@@ -1222,11 +1479,15 @@ def validate_fund_operation(db: Session, operation_id: int, broker) -> dict:
     operation.status = STATE_VALIDATED if validated else STATE_PREPARED
     if validated:
         operation.validated_at = _utcnow().replace(tzinfo=None)
-        # Bind the validation to EXACTLY what was validated.
+        # Bind the validation to EXACTLY what was validated — including the
+        # fund's verification state, so a later demotion or identity change
+        # invalidates it instead of riding on an approval that no longer holds.
+        operation.validated_fund_hash = fund_verification_hash(fund, operation.operation)
         operation.validated_payload_hash = validation_payload_hash(operation)
     else:
         operation.validated_at = None
         operation.validated_payload_hash = ""
+        operation.validated_fund_hash = ""
         operation.error_message = (result.get("error") or "")[:500]
     # A soloValidar call NEVER produces an operation id, whatever came back.
     operation.broker_operation_id = ""
@@ -1295,8 +1556,12 @@ def submit_fund_operation(
             capability_error, 423,
         )
 
-    # A FRESH validation describing THIS request is mandatory.
-    validation = validation_state(operation, settings=settings)
+    # A FRESH validation describing THIS request — and the fund's verified
+    # state when it was made — is mandatory.
+    fund = get_fund(db, operation.fund_symbol)
+    if fund is None:
+        return _err("El fondo no está en el catálogo de FCI.", "fund_not_in_catalog", 404)
+    validation = validation_state(operation, settings=settings, fund=fund)
     if not validation["valid"]:
         return _err(
             f"La operación no tiene una validación vigente: {validation['code']}.",
@@ -1357,6 +1622,25 @@ def submit_fund_operation(
         db.commit()
         return _err(f"Preflight de FCI bloqueado: {preflight_error}.",
                     preflight_error, 409)
+
+    # --- LAST look at the fund, immediately before the claim. Everything
+    #     above took time; a demotion or an identity change that landed in
+    #     between must stop the send, not ride on a preview that predates it.
+    db.refresh(fund)
+    last_blockers = fund_operability_blockers(fund, operation.operation)
+    if last_blockers:
+        operation.blocked_reason = last_blockers[0]
+        db.commit()
+        return _err(f"El fondo dejó de estar habilitado: {last_blockers[0]}.",
+                    last_blockers[0], 409)
+    if fund_verification_changed(operation, fund):
+        operation.blocked_reason = "fund_verification_changed"
+        db.commit()
+        return _err(
+            "La verificación del fondo cambió después de validar. "
+            "Se requiere una validación nueva.",
+            "fund_verification_changed", 409,
+        )
 
     # --- Claim + reserve, together or not at all. Only now does anything
     #     become irreversible.
@@ -1751,30 +2035,89 @@ def claim_and_reserve_fund_operation(
         db.rollback()
         return reserve_error, {**audit, "reserved": False}
 
+    # Persist WHICH row was incremented, in the same transaction. Recomputing
+    # the key at release time is how a release after midnight decrements the
+    # wrong day.
+    db.add(FundBudgetReservation(
+        fund_operation_id=operation.id,
+        trade_date=trade_date,
+        ledger_class=ledger_class,
+        currency=currency,
+        reserved_notional=float(amount),
+        status=RESERVATION_RESERVED,
+    ))
     audit["reserved"] = True
     return None, audit
 
 
+RESERVATION_RESERVED = "reserved"
+RESERVATION_RELEASED = "released"
+
+# States that prove the operation reached — or may have reached — the broker.
+# Budget for any of these is NEVER released automatically: giving it back
+# would let a second operation spend allowance the first one may already have
+# committed at IOL.
+NON_RELEASABLE_STATES = frozenset({
+    STATE_SUBMITTED, STATE_PENDING_CONFIRMATION, STATE_CONFIRMED,
+    STATE_SUBMISSION_UNKNOWN, STATE_RECONCILIATION_REQUIRED,
+})
+
+
 def release_fund_budget(db: Session, operation: FundOperation, *, settings, reason: str) -> dict:
-    """Give back budget reserved for a submission that never left.
+    """Give back budget for a submission that provably never left.
 
-    Called ONLY when we can prove no request started. An ambiguous outcome
-    keeps its reservation: releasing budget for an operation that may be live
-    at IOL would let the day's allowance be spent twice on the same money.
+    Idempotent and self-identifying:
+
+    - the row to decrement comes from the stored reservation, not from
+      `trade_date_for(now)` — a release after midnight must not shrink today's
+      allowance for money spent yesterday;
+    - a second call returns `budget_already_released` and touches nothing.
+      `submitted_notional` is spending authority, and decrementing it twice
+      hands out allowance nobody gave back;
+    - an operation that reached the broker is refused outright.
+
+    `settings` is accepted for signature stability; the stored reservation is
+    what decides, precisely so that current configuration cannot change where
+    a past reservation is returned to.
     """
-    from app.services.execution_limits import release_daily_budget, trade_date_for
+    from app.services.execution_limits import release_daily_budget
 
-    amount = positive_decimal(operation.amount)
-    if amount is None:
-        return {"released": False, "reason": "invalid_notional"}
-    return release_daily_budget(
+    reservation = (
+        db.query(FundBudgetReservation)
+        .filter(FundBudgetReservation.fund_operation_id == operation.id)
+        .first()
+    )
+    if reservation is None:
+        return {"released": False, "reason": "no_reservation_found"}
+    if reservation.status == RESERVATION_RELEASED:
+        return {
+            "released": False,
+            "reason": "budget_already_released",
+            "released_at": reservation.released_at.isoformat()
+            if reservation.released_at else None,
+            "original_release_reason": reservation.release_reason,
+        }
+    if operation.status in NON_RELEASABLE_STATES:
+        return {"released": False, "reason": "operation_reached_broker",
+                "status": operation.status}
+
+    result = release_daily_budget(
         db,
-        trade_date=trade_date_for(settings),
-        execution_class=fci_ledger_class(operation.operation),
-        currency=str(operation.currency or "").strip().upper(),
-        notional=amount,
+        trade_date=reservation.trade_date,
+        execution_class=reservation.ledger_class,
+        currency=reservation.currency,
+        notional=Decimal(str(reservation.reserved_notional)),
         reason=reason,
     )
+    reservation.status = RESERVATION_RELEASED
+    reservation.released_at = _utcnow().replace(tzinfo=None)
+    reservation.release_reason = str(reason)[:200]
+    return {
+        **result,
+        "trade_date": reservation.trade_date,
+        "execution_class": reservation.ledger_class,
+        "reservation_id": reservation.id,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1784,6 +2127,14 @@ def release_fund_budget(db: Session, operation: FundOperation, *, settings, reas
 # Terminal outcomes a human may record. Deliberately no "resend" and no
 # "retry": once a submission is ambiguous, the only way forward is to state
 # what actually happened at IOL.
+# Only an operation that reached — or may have reached — IOL can be
+# reconciled. `submitting` is included because the claim succeeded: the POST
+# may have been in flight when the process died.
+RECONCILABLE_STATES = frozenset({
+    STATE_SUBMITTING, STATE_SUBMITTED, STATE_PENDING_CONFIRMATION,
+    STATE_SUBMISSION_UNKNOWN, STATE_RECONCILIATION_REQUIRED,
+})
+
 RECONCILIATION_TARGETS = {
     "confirmed": STATE_CONFIRMED,
     "rejected": STATE_REJECTED,
@@ -1961,6 +2312,17 @@ def reconcile_fund_operation(
     if previous in (STATE_CONFIRMED, STATE_REJECTED, STATE_CANCELLED):
         return _err(f"La operación ya está en un estado terminal ('{previous}').",
                     "not_reconcilable", 409)
+    if previous not in RECONCILABLE_STATES:
+        # Reconciling is DECLARING what IOL did. An operation that never left
+        # this process has nothing at IOL to declare, so marking it
+        # `confirmed` would invent a subscription that does not exist — and
+        # the fabricated record would then reserve capacity and read as real
+        # money in the portfolio.
+        return _err(
+            f"La operación está en '{previous}' y nunca llegó al broker. "
+            "No hay nada que conciliar.",
+            "fund_operation_never_submitted", 409,
+        )
 
     target = RECONCILIATION_TARGETS[outcome]
     claimed = (
