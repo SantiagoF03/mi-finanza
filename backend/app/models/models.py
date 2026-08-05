@@ -457,6 +457,13 @@ class FundInstrument(Base):
     source: Mapped[str] = mapped_column(String(50), default="")
     verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     stale_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Hash of symbol + currency + manager: what makes this fund THIS fund.
+    # An automatic refresh preserves an administrative verification only while
+    # this stays the same; a change freezes the fund instead of inheriting an
+    # approval that was given for something else.
+    identity_hash: Mapped[str] = mapped_column(String(64), default="")
+    previous_identity: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    pending_identity: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     raw_detail: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -505,6 +512,44 @@ class FundOperation(Base):
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class FundInstrumentVerification(Base):
+    """Append-only audit of every administrative decision about a fund.
+
+    A fund read from IOL's catalog is only ever a `candidate`: the operational
+    field names are observed, not documented, so reading a plausible cutoff is
+    not evidence enough to time real money. Promoting one to `verified` is a
+    human act, and this table is the record of who asserted what.
+
+    Rows are never updated or deleted. `data_hash` pins the exact parameter
+    set that was verified, so a later change is visible instead of silently
+    inheriting an old approval.
+    """
+
+    __tablename__ = "fund_instrument_verifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fund_symbol: Mapped[str] = mapped_column(String(30), index=True)
+    # verify | reject | demote | identity_changed | auto_refresh_preserved
+    action: Mapped[str] = mapped_column(String(30))
+    previous_status: Mapped[str] = mapped_column(String(20), default="")
+    new_status: Mapped[str] = mapped_column(String(20), default="")
+    # The parameters as asserted at this moment. Kept even for a demotion, so
+    # the record shows what was withdrawn.
+    currency: Mapped[str] = mapped_column(String(10), default="")
+    cutoff_local_time: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    minimum_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    settlement_delay_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    subscription_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    redemption_supported: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Where the assertion comes from (e.g. "official_docs", "fund_prospectus").
+    source: Mapped[str] = mapped_column(String(100), default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    # Hash of the verified parameter set + the fund's identity.
+    data_hash: Mapped[str] = mapped_column(String(64), default="", index=True)
+    identity_hash: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class FundOperationDecision(Base):

@@ -126,7 +126,33 @@ def _patch_schema(engine_ref):
                         f"ALTER TABLE fund_operations ADD COLUMN {column} {ddl}"
                     ))
 
-    # 4. execution_instruments / execution_daily_notional — new tables only.
+    # 3d-bis. FCI daily-ledger keys moved from "FCI:subscribe"/"FCI:redeem" to
+    #     the explicit FCI_SUBSCRIBE / FCI_REDEEM classes. Deliberately NO
+    #     rewrite: the old rows stay exactly as they are, readable as audit.
+    #     Renaming them would move already-spent budget into today's key, and
+    #     copying them would charge the same money twice. Queries filter on the
+    #     exact class, so the legacy rows are simply never counted again.
+
+    # 3e. fund_instruments identity columns. Empty identity_hash means "never
+    #     hashed"; the first refresh computes it and — because there is no
+    #     previous hash to differ from — does NOT report an identity change.
+    #     Reading a missing hash as a change would freeze every existing fund
+    #     at once for a schema migration nobody made.
+    if "fund_instruments" in existing_tables:
+        columns = {c["name"] for c in inspector.get_columns("fund_instruments")}
+        for column, ddl in (
+            ("identity_hash", "VARCHAR(64) DEFAULT ''"),
+            ("previous_identity", "JSON"),
+            ("pending_identity", "JSON"),
+        ):
+            if column not in columns:
+                with engine_ref.begin() as conn:
+                    conn.execute(text(
+                        f"ALTER TABLE fund_instruments ADD COLUMN {column} {ddl}"
+                    ))
+
+    # 4. execution_instruments / execution_daily_notional /
+    #    fund_instrument_verifications — new tables only.
     #    create_all() already made them; nothing here rewrites or drops data.
     #
     #    MIGRATION SAFETY: every step in this function is additive and
