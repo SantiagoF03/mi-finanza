@@ -151,14 +151,32 @@ def _quote_probe(broker, symbol: str, side: str, market: str, settlement: str) -
 # ---------------------------------------------------------------------------
 
 
+# Provenance fields that describe a CAPABILITY rather than identity. Readiness
+# splits these per side, so they are excluded from the shared identity verdict.
+CAPABILITY_PROVENANCE_FIELDS = frozenset({
+    "buy_supported", "sell_supported", "quote_supported",
+})
+
+
 def instrument_verification(entry) -> dict:
     """Identity, buy capability and sell capability — three separate verdicts.
 
     An instrument with a bid but no ask is perfectly sellable. Requiring
     buy_supported AND sell_supported AND quote_supported before anything works
     means one missing side blocks both, which is not what the data says.
+
+    WHICH fields count as verified is decided by the catalog's own
+    `unverified_fields()`, never re-derived here. This function used to walk
+    `field_provenance` itself, and when the catalog learned that a price tick
+    can be satisfied by a verified dynamic RULE instead of a fixed number,
+    this copy did not: an instrument the catalog called `verified` still read
+    as unverified in readiness, and the pilot creator stayed blocked on a
+    requirement that was already met.
+
+    A second implementation of "is this field verified" will drift again the
+    next time the first one changes, so there is now only one.
     """
-    from app.broker.instrument_catalog import VERIFYING_PROVENANCES
+    from app.broker.instrument_catalog import unverified_fields
 
     if entry is None:
         return {
@@ -168,24 +186,20 @@ def instrument_verification(entry) -> dict:
             "sell_missing": ["instrument_catalog_missing"],
         }
 
-    provenance = entry.field_provenance or {}
-
-    def verified(field: str) -> bool:
-        return provenance.get(field) in VERIFYING_PROVENANCES
-
-    # Shared identity and mechanics: what any order of any side needs.
-    identity_fields = ("broker_symbol", "asset_type", "instrument_type", "currency",
-                       "market", "price_tick", "quantity_step")
-    identity_missing = [f for f in identity_fields if not verified(f)]
+    # The catalog's verdict, which already knows that `price_tick` is
+    # satisfied by EITHER a verified fixed tick or a verified dynamic rule
+    # that actually covers this instrument.
+    catalog_missing = set(unverified_fields(entry))
+    identity_missing = sorted(catalog_missing - CAPABILITY_PROVENANCE_FIELDS)
 
     buy_missing = list(identity_missing)
-    if not verified("buy_supported"):
+    if "buy_supported" in catalog_missing:
         buy_missing.append("buy_supported")
     if not bool(entry.buy_supported):
         buy_missing.append("buy_unsupported")
 
     sell_missing = list(identity_missing)
-    if not verified("sell_supported"):
+    if "sell_supported" in catalog_missing:
         sell_missing.append("sell_supported")
     if not bool(entry.sell_supported):
         sell_missing.append("sell_unsupported")
