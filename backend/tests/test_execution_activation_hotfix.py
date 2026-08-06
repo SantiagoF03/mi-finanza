@@ -1746,6 +1746,30 @@ def test_the_headline_action_agrees_with_the_per_capability_map(db, client):
     assert body["next_safe_action"] in set(body["next_safe_actions"].values())
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_readiness_reports_the_pilot_creation_flag(db, client, enabled):
+    """Creating a pilot has its OWN gate, and the report has to show it.
+
+    Without this field an operator could not tell from the readiness response
+    whether pilot creation was open — the only way to find out was to inspect
+    the environment by hand, or to try and read the 423.
+    """
+    with exec_settings(**_prepared(execution_pilot_creation_enabled=enabled)):
+        body = client.get("/api/broker/execution-readiness").json()
+
+    assert body["execution_pilot_creation_enabled"] is enabled
+
+
+def test_the_pilot_creation_flag_is_reported_as_a_real_boolean(db, client):
+    """A truthy string would read as enabled in the UI while the backend
+    still refused, which is the worst of both."""
+    with exec_settings(**_prepared(execution_pilot_creation_enabled=False)):
+        body = client.get("/api/broker/execution-readiness").json()
+
+    assert body["execution_pilot_creation_enabled"] is False
+    assert isinstance(body["execution_pilot_creation_enabled"], bool)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # BLOQUEO 13 + regression — production history
 # ═══════════════════════════════════════════════════════════════════

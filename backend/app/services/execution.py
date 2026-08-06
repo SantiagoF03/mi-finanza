@@ -857,6 +857,12 @@ def get_execution_readiness(db: Session | None = None) -> dict:
         "securities_sell_enabled": sell_enabled,
         "securities_sell_flag_enabled": securities_sell_enabled(settings),
         "legacy_sell_only_bridge_active": legacy_sell_bridge_active(settings),
+        # Reported explicitly: creating a pilot is gated by its OWN flag, and
+        # an operator reading this report had no way to see whether that gate
+        # was open without inspecting the environment by hand.
+        "execution_pilot_creation_enabled": bool(
+            getattr(settings, "execution_pilot_creation_enabled", False)
+        ),
         "fci_subscription_enabled": bool(getattr(settings, "fci_subscription_enabled", False)),
         "fci_redemption_enabled": bool(getattr(settings, "fci_redemption_enabled", False)),
         # The FCI endpoints are official and implemented as a separate
