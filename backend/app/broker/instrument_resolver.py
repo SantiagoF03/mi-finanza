@@ -196,12 +196,27 @@ def resolve_instrument(
         return {**report, "error": "class_policy_not_configured",
                 "execution_class": execution_class}
 
-    if detail_market not in (policy.get("markets") or []):
-        # The symbol is not on the market this class trades on. Refusing here
-        # is the point: a same-named instrument on another venue is a
-        # different instrument.
+    # IOL spells the venue inconsistently — the title detail has returned
+    # "bcba" where the policy (and KNOWN_IOL_MARKETS) say "bCBA". Those are the
+    # same venue, so rejecting on the spelling refused real instruments.
+    #
+    # Canonicalised exactly ONCE, here at the boundary where IOL's text enters
+    # the system. Everything downstream — the catalog row, the quotes, the
+    # identity hash, execution_scope's policy check — keeps comparing
+    # EXACTLY, because by then the value is already the authorised variant.
+    # Loosening those comparisons instead would have been the wrong fix: it
+    # would let a genuinely different venue through somewhere further in.
+    canonical_market = _canonical_market(detail_market, policy.get("markets") or [])
+    if canonical_market is None:
+        # Not a spelling difference — a different venue, or one nobody
+        # authorised. A same-named instrument on another market is a
+        # different instrument, so this still refuses.
         return {**report, "error": "instrument_market_mismatch",
-                "market": detail_market}
+                "market": detail_market,
+                "observed_market": detail_market,
+                "allowed_markets": list(policy.get("markets") or [])}
+    detail_market = canonical_market
+
     if currency not in (policy.get("currencies") or []):
         return {**report, "error": "instrument_currency_mismatch",
                 "currency": currency}
@@ -303,6 +318,27 @@ def resolve_instrument(
         "unverified_fields": unverified_fields(entry),
         "field_provenance": dict(entry.field_provenance or {}),
     }
+
+
+def _canonical_market(raw_market: str, allowed_markets: list[str]) -> str | None:
+    """The AUTHORISED spelling of an observed market, or None if it is not one.
+
+    Matches case-insensitively but returns the value from the policy, never
+    the observed text: "bcba" and "BCBA" resolve to the configured "bCBA".
+
+    Deliberately NOT a normaliser. It only ever returns a string that is
+    already in `allowed_markets`, so there is no input that turns an
+    unrecognised venue into an authorised one — "NYSE" comes back None, not
+    coerced. That distinction is the whole point: tolerating a spelling is
+    safe, inventing a venue is not.
+    """
+    observed = str(raw_market or "").strip()
+    if not observed:
+        return None
+    for candidate in allowed_markets:
+        if str(candidate).strip().lower() == observed.lower():
+            return candidate
+    return None
 
 
 def _side_quotable(broker, symbol: str, side: str, market: str, settlement: str) -> bool:

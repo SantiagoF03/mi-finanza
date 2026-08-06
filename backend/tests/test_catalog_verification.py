@@ -583,6 +583,165 @@ def test_resolution_refuses_a_symbol_on_the_wrong_market(db):
     assert get_instrument(db, "GGAL") is None
 
 
+# ───────────────────────────────────────────────────────────────────
+# Market canonicalisation
+#
+# IOL spells the venue inconsistently: the title detail has returned "bcba"
+# where the policy says "bCBA". They are the same market, so a case-sensitive
+# comparison refused real instruments — BYMA and SPY both failed in production
+# with instrument_market_mismatch.
+#
+# Tolerating a spelling is safe. Inventing a venue is not, so an unrecognised
+# market must still be refused, never coerced.
+# ───────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("observed", ["bcba", "BCBA", "bCBA", "BcBa", " bcba "])
+def test_a_differently_spelled_market_resolves_to_the_canonical_one(db, observed):
+    from app.broker.instrument_resolver import SOURCE_UNIVERSE, resolve_instrument
+
+    broker = _resolver_broker(mercado=observed)
+    with exec_settings(**_scope_settings()):
+        report = resolve_instrument(
+            db, symbol="GGAL", broker=broker, settings=get_settings(),
+            source=SOURCE_UNIVERSE, class_policies={CLASS_ACCIONES: dict(CLASS_POLICY)},
+        )
+
+    assert report.get("error") is None, report
+    assert report["resolved"] is True
+    # The report carries the AUTHORISED spelling, not what IOL happened to say.
+    assert report["market"] == "bCBA"
+
+
+@pytest.mark.parametrize("observed", ["bcba", "BCBA", "bCBA"])
+def test_the_catalog_persists_the_canonical_market(db, observed):
+    """Persisting the canonical value is what keeps every downstream
+    comparison exact — execution_scope compares `entry.market` to the policy
+    with `!=`, and that check must stay strict."""
+    from app.broker.instrument_resolver import SOURCE_UNIVERSE, resolve_instrument
+
+    broker = _resolver_broker(mercado=observed)
+    with exec_settings(**_scope_settings()):
+        resolve_instrument(
+            db, symbol="GGAL", broker=broker, settings=get_settings(),
+            source=SOURCE_UNIVERSE, class_policies={CLASS_ACCIONES: dict(CLASS_POLICY)},
+        )
+
+    entry = get_instrument(db, "GGAL")
+    assert entry is not None
+    assert entry.market == "bCBA"
+    # And the identity hash is built from the canonical value, so the same
+    # instrument spelled two ways does not read as an identity change.
+    assert entry.raw_identity.get("market") in (None, "bCBA")
+
+
+def test_quotes_are_requested_with_the_canonical_market(db):
+    """Both sides, and the fetch that precedes them, use the authorised
+    spelling — a quote asked for on `bcba` is a quote for a venue the rest of
+    the system does not recognise."""
+    from app.broker.instrument_resolver import SOURCE_UNIVERSE, resolve_instrument
+
+    broker = _resolver_broker(mercado="bcba")
+    with exec_settings(**_scope_settings()):
+        resolve_instrument(
+            db, symbol="GGAL", broker=broker, settings=get_settings(),
+            source=SOURCE_UNIVERSE, class_policies={CLASS_ACCIONES: dict(CLASS_POLICY)},
+        )
+
+    markets_used = {call.args[2] for call in broker.get_execution_quote.call_args_list}
+    sides_probed = {call.args[1] for call in broker.get_execution_quote.call_args_list}
+    assert markets_used == {"bCBA"}
+    assert sides_probed == {"buy", "sell"}
+
+
+def test_an_unknown_market_is_still_refused_with_both_values(db):
+    """`NYSE` is not a spelling of `bCBA`. It must not be coerced into one."""
+    from app.broker.instrument_resolver import SOURCE_UNIVERSE, resolve_instrument
+
+    broker = _resolver_broker(mercado="NYSE")
+    with exec_settings(**_scope_settings()):
+        report = resolve_instrument(
+            db, symbol="GGAL", broker=broker, settings=get_settings(),
+            source=SOURCE_UNIVERSE, class_policies={CLASS_ACCIONES: dict(CLASS_POLICY)},
+        )
+
+    assert report["error"] == "instrument_market_mismatch"
+    assert report["observed_market"] == "NYSE"
+    assert report["allowed_markets"] == ["bCBA"]
+    assert get_instrument(db, "GGAL") is None
+
+
+@pytest.mark.parametrize("observed", ["", "   ", "NASDAQ", "bcba_extra", "cba"])
+def test_the_canonicaliser_only_ever_returns_an_authorised_value(observed):
+    """The helper cannot manufacture a venue: every non-None answer is a
+    member of the allowed list it was given."""
+    from app.broker.instrument_resolver import _canonical_market
+
+    allowed = ["bCBA"]
+    result = _canonical_market(observed, allowed)
+    assert result is None or result in allowed
+
+
+def test_the_canonicaliser_returns_the_policys_own_variant():
+    from app.broker.instrument_resolver import _canonical_market
+
+    # Whatever the policy declares is what comes back — the helper never
+    # imposes a spelling of its own.
+    assert _canonical_market("bcba", ["bCBA"]) == "bCBA"
+    assert _canonical_market("bCBA", ["BCBA"]) == "BCBA"
+    assert _canonical_market("BCBA", ["bcba"]) == "bcba"
+    assert _canonical_market("nyse", ["bCBA"]) is None
+    assert _canonical_market("bcba", []) is None
+
+
+def test_resolving_never_sends_an_order(db):
+    """The resolver is read-only. A canonicalised market must not open a path
+    to sending anything."""
+    from app.broker.instrument_resolver import SOURCE_UNIVERSE, resolve_instrument
+
+    broker = _resolver_broker(mercado="bcba")
+    with exec_settings(**_scope_settings()):
+        resolve_instrument(
+            db, symbol="GGAL", broker=broker, settings=get_settings(),
+            source=SOURCE_UNIVERSE, class_policies={CLASS_ACCIONES: dict(CLASS_POLICY)},
+        )
+
+    broker.place_order.assert_not_called()
+    broker.submit_order_request.assert_not_called()
+    broker.cancel_order.assert_not_called()
+    broker.submit_fund_request.assert_not_called()
+
+
+def test_the_legacy_byma_path_is_untouched_by_this_change():
+    """The BYMA pilot that already executed for real goes through
+    EXECUTION_INSTRUMENT_POLICIES, not the resolver — this fix must not reach
+    it."""
+    import pathlib
+
+    source = pathlib.Path("app/broker/instrument_scope.py").read_text()
+    # The legacy per-symbol path still compares exactly, deliberately: it is
+    # configured by a human, so there is no IOL spelling to tolerate.
+    assert '_canonical_market' not in source
+    assert 'policy["market"] != (settings.iol_order_market or "")' in source
+
+
+def test_a_canonicalised_instrument_passes_the_downstream_policy_check(db):
+    """End to end: the production symptom was that resolution failed. This
+    proves the resolved entry is then accepted by the check that compares
+    `entry.market` to the policy exactly."""
+    from app.broker.instrument_resolver import SOURCE_UNIVERSE, resolve_instrument
+
+    broker = _resolver_broker(mercado="bcba")
+    with exec_settings(**_scope_settings()):
+        resolve_instrument(
+            db, symbol="GGAL", broker=broker, settings=get_settings(),
+            source=SOURCE_UNIVERSE, class_policies={CLASS_ACCIONES: dict(CLASS_POLICY)},
+        )
+        entry = get_instrument(db, "GGAL")
+
+    assert entry.market in CLASS_POLICY["markets"]
+
+
 def test_resolution_refuses_a_currency_outside_the_class(db):
     from app.broker.instrument_resolver import SOURCE_UNIVERSE, resolve_instrument
 
