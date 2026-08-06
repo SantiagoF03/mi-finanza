@@ -203,6 +203,47 @@ def required_provenance_fields(entry: ExecutionInstrument) -> tuple[str, ...]:
     return REQUIRED_SECURITIES_PROVENANCE
 
 
+def has_usable_price_tick(entry: ExecutionInstrument) -> bool:
+    """Is there SOME trustworthy way to price this instrument's decimals?
+
+    Either a fixed tick, or a verified dynamic rule that actually covers this
+    instrument. A rule stored on the row is not enough on its own: it must
+    carry a verifying provenance AND apply to this family/class/market/
+    currency. A class default that merely mentioned a rule can never satisfy
+    this, which is the point — a default asserts nothing about the instrument.
+    """
+    if _as_positive_float(entry.price_tick) is not None:
+        return True
+    return verified_price_tick_rule(entry) is not None
+
+
+def verified_price_tick_rule(entry: ExecutionInstrument) -> str | None:
+    """The dynamic rule this instrument may be priced with, or None.
+
+    Three conditions, all required: the rule is named, its provenance
+    verifies, and its audited scope covers this instrument. Dropping any one
+    of them is how a rule checked for argentine equities ends up pricing a
+    bond.
+    """
+    from app.broker.price_rules import KNOWN_PRICE_TICK_RULES, price_tick_rule_applies
+
+    rule = (getattr(entry, "price_tick_rule", None) or "").strip()
+    if not rule or rule not in KNOWN_PRICE_TICK_RULES:
+        return None
+    provenance = entry.field_provenance or {}
+    if provenance.get("price_tick_rule") not in VERIFYING_PROVENANCES:
+        return None
+    if not price_tick_rule_applies(
+        rule,
+        execution_family=entry.execution_family,
+        execution_class=entry.execution_class,
+        market=entry.market,
+        currency=entry.currency,
+    ):
+        return None
+    return rule
+
+
 def unverified_fields(entry: ExecutionInstrument) -> list[str]:
     """Operative fields lacking a verifying provenance.
 
@@ -212,6 +253,16 @@ def unverified_fields(entry: ExecutionInstrument) -> list[str]:
     provenance = entry.field_provenance or {}
     missing = []
     for field in required_provenance_fields(entry):
+        if field == "price_tick":
+            # Satisfied by EITHER a verified fixed tick or a verified dynamic
+            # rule — the requirement is "we can price the decimals", not "a
+            # constant exists".
+            if provenance.get("price_tick") in VERIFYING_PROVENANCES:
+                continue
+            if verified_price_tick_rule(entry) is not None:
+                continue
+            missing.append(field)
+            continue
         source = provenance.get(field)
         if source not in VERIFYING_PROVENANCES:
             missing.append(field)
@@ -283,7 +334,12 @@ def catalog_entry_status(
         # or sized safely — IOL rejects incompatible decimals outright.
         if not (entry.settlement or "").strip():
             missing.append("settlement")
-        if _as_positive_float(entry.price_tick) is None:
+        # A tick may come from a fixed value OR from a verified dynamic rule.
+        # Requiring a single fixed number would block every bCBA equity, whose
+        # minimum alteration genuinely depends on the price — and would invite
+        # storing one band's tick as if it were constant, which is the unsafe
+        # answer this branch exists to avoid.
+        if not has_usable_price_tick(entry):
             missing.append("price_tick")
         if _as_positive_float(entry.quantity_step) is None:
             missing.append("quantity_step")
@@ -788,10 +844,33 @@ def verify_fields(
     recorded with `admin_verified_override` provenance plus an audit entry.
     A class default can never reach this state on its own.
     """
+    from app.broker.price_rules import KNOWN_PRICE_TICK_RULES, price_tick_rule_applies
+
     stamp = now or _utcnow_naive()
     applied = {}
     for field, value in (fields or {}).items():
-        if field in ("price_tick", "quantity_step", "minimum_quantity"):
+        if field == "price_tick_rule":
+            # Only rules this build actually implements. Arbitrary text would
+            # persist a rule nothing can evaluate, and the instrument would
+            # read as verified while no code could price it.
+            rule = str(value or "").strip()
+            if rule not in KNOWN_PRICE_TICK_RULES:
+                return {"changed": False, "reason": "unknown_price_tick_rule"}
+            # And it must cover THIS instrument. A rule audited for argentine
+            # equities in pesos on bCBA does not become correct for a bond
+            # because someone typed its name.
+            if not price_tick_rule_applies(
+                rule,
+                execution_family=entry.execution_family,
+                execution_class=entry.execution_class,
+                market=entry.market,
+                currency=entry.currency,
+            ):
+                return {"changed": False, "reason": "price_tick_rule_not_applicable"}
+            entry.price_tick_rule = rule
+            entry.price_tick_rule_verified_at = stamp
+            applied[field] = rule
+        elif field in ("price_tick", "quantity_step", "minimum_quantity"):
             parsed = _as_positive_float(value)
             if parsed is None:
                 return {"changed": False, "reason": f"invalid_{field}"}

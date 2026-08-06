@@ -514,6 +514,16 @@ def _canonical_preview_payload(
                 # Instrument identity + per-symbol scope are signed too.
                 "instrument_identity": o.get("instrument_identity") or {},
                 "execution_scope": o.get("execution_scope") or {},
+                # The tick decision, signed in full. Changing the rule, the
+                # band, the tick or the reference price changes the hash, so
+                # an approval can only carry the tick that was reviewed — and
+                # a client cannot supply one, because nothing read from the
+                # request feeds this.
+                "price_tick_mode": o.get("price_tick_mode"),
+                "price_tick_rule": o.get("price_tick_rule"),
+                "price_tick_band": o.get("price_tick_band"),
+                "effective_price_tick": o.get("effective_price_tick"),
+                "reference_price_used_for_tick": o.get("reference_price_used_for_tick"),
             }
             for o in orders
         ],
@@ -610,6 +620,122 @@ def _execution_locked(settings) -> bool:
     if env == "sandbox":
         return not settings.sandbox_execution_enabled
     return not settings.order_execution_enabled
+
+
+def resolve_effective_tick(policy: dict | None, price) -> tuple[dict | None, str | None]:
+    """The tick that applies to ONE price, plus how it was decided.
+
+    Returns (tick_info, error_code). `tick_info`:
+
+        price_tick_mode              "dynamic" | "fixed"
+        price_tick_rule              rule id, or None when fixed
+        price_tick_band              band label, or None when fixed
+        effective_price_tick         Decimal — the answer for THIS price
+        reference_price_used_for_tick  the price the answer was derived from
+
+    A dynamic rule wins when the instrument has a verified one, because for
+    those instruments a stored constant is only right inside one band. Without
+    a rule the fixed tick applies, and without either we fail closed: pricing
+    an order's decimals by guessing is how IOL rejects it — or worse, accepts
+    something other than what was reviewed.
+
+    Used by BOTH the preview and the preflight, so the two can never disagree
+    about the rule; the only thing that differs between them is the price they
+    feed in, which is exactly the difference the preflight exists to catch.
+    """
+    from app.broker.price_rules import PriceTickRuleError, resolve_price_band_for_rule
+
+    if policy is None:
+        return None, "instrument_policy_missing"
+
+    rule = policy.get("price_tick_rule")
+    if rule:
+        try:
+            band = resolve_price_band_for_rule(rule, price)
+        except PriceTickRuleError:
+            # The price we were given cannot be priced by the rule. Never
+            # silently fall back to the fixed tick: they are different
+            # answers and the caller must not receive the wrong one.
+            return None, "invalid_execution_price"
+        return {
+            "price_tick_mode": "dynamic",
+            "price_tick_rule": band["rule"],
+            "price_tick_band": band["band"],
+            "effective_price_tick": band["tick"],
+            "reference_price_used_for_tick": to_finite_decimal(price),
+        }, None
+
+    fixed = positive_decimal(policy.get("price_tick"))
+    if fixed is None:
+        return None, "price_tick_unverified"
+    return {
+        "price_tick_mode": "fixed",
+        "price_tick_rule": None,
+        "price_tick_band": None,
+        "effective_price_tick": fixed,
+        "reference_price_used_for_tick": to_finite_decimal(price),
+    }, None
+
+
+def _serialize_tick_info(tick_info: dict | None) -> dict:
+    """Tick info as JSON-safe strings, for the preview payload and the HMAC.
+
+    Decimal is serialized positionally: `str(float)` would make the signature
+    depend on binary representation, so the same tick could hash two ways.
+    """
+    if not tick_info:
+        return {
+            "price_tick_mode": None,
+            "price_tick_rule": None,
+            "price_tick_band": None,
+            "effective_price_tick": None,
+            "reference_price_used_for_tick": None,
+        }
+    tick = tick_info.get("effective_price_tick")
+    reference = tick_info.get("reference_price_used_for_tick")
+    return {
+        "price_tick_mode": tick_info.get("price_tick_mode"),
+        "price_tick_rule": tick_info.get("price_tick_rule"),
+        "price_tick_band": tick_info.get("price_tick_band"),
+        "effective_price_tick": format(tick, "f") if tick is not None else None,
+        "reference_price_used_for_tick": (
+            format(reference, "f") if reference is not None else None
+        ),
+    }
+
+
+def _attach_price_tick(orders: list[dict], settings, db: Session | None) -> None:
+    """Resolve each order's effective tick from its SIGNED reference price.
+
+    The preview is rebuilt server-side during approve to verify the HMAC, so
+    it must be a deterministic function of stored state. It therefore does NOT
+    fetch a quote: it derives the tick from `snapshot_price_ref`, the same
+    reference price it already signs, and records the band it lands in.
+
+    The fresh quote enters at preflight, where the band is recomputed and
+    compared against this one. That is what makes a band change between review
+    and send detectable — and it is why the tick here is a reviewed
+    expectation rather than a promise about the price at submission time.
+    """
+    from app.broker.execution_scope import effective_policy_for
+
+    for order in orders:
+        reference = positive_decimal(order.get("snapshot_price_ref"))
+        policy = None
+        if db is not None:
+            try:
+                policy = effective_policy_for(db, order.get("symbol"), settings)
+            except Exception:  # a report must never break on policy lookup
+                policy = None
+        if policy is None or reference is None:
+            order.update(_serialize_tick_info(None))
+            continue
+        tick_info, tick_error = resolve_effective_tick(policy, reference)
+        if tick_error:
+            order.update(_serialize_tick_info(None))
+            order["price_tick_error"] = tick_error
+            continue
+        order.update(_serialize_tick_info(tick_info))
 
 
 def _apply_execution_scope(orders: list[dict], snapshot, settings, db: Session | None = None) -> list[str]:
@@ -1176,6 +1302,10 @@ def build_execution_preview(
     # Execution scope: attaches instrument identity + per-symbol scope to
     # every order and invalidates any order outside the allowlist.
     scope_reasons = _apply_execution_scope(orders_preview, snapshot, settings, db)
+    # Then the tick decision, derived from the reference price this preview
+    # already signs. Read-only: no quote, no broker — the preview has to be
+    # reproducible byte-for-byte when approve rebuilds it to check the HMAC.
+    _attach_price_tick(orders_preview, settings, db)
 
     # --- Blocking reasons: stable codes the frontend can rely on ---
     blocking_reasons: list[str] = []
@@ -1828,12 +1958,18 @@ def _preflight_one_order(
     trade_date: str | None = None,
     daily_reserved: dict | None = None,
     cash_reserved: dict | None = None,
+    error_detail: dict | None = None,
 ) -> tuple[dict | None, str | None]:
     """Prepare ONE order completely, without sending anything.
 
     Returns (prepared, error_code). `prepared` carries the exact IOL request
     plus every audit fragment. NOTHING here touches the network except the
     executable quote query, and no order is ever submitted.
+
+    `error_detail`, when given, is populated with non-sensitive context for
+    blocks the caller needs to explain — currently a tick-band change, where
+    the operator has to know both bands to understand why re-previewing is
+    required rather than retrying.
     """
     from app.broker.environment import api_host_of, resolve_execution_environment
     from app.broker.order_request import build_iol_order_request, compute_order_validity
@@ -1920,16 +2056,55 @@ def _preflight_one_order(
     if validity_err:
         return None, validity_err
 
+    # 6-bis. RECOMPUTE the tick from the FRESH price, and compare it with the
+    # one the human approved.
+    #
+    # For a bCBA equity the minimum alteration depends on the price, so a
+    # preview signed at 49.95 (tick 0.05) is not a valid authorisation at
+    # 50.05 (tick 0.10): the limit price it described is no longer a legal
+    # order. Blocking here is the whole point of the feature — and it happens
+    # BEFORE anything irreversible, so the operation stays unsent, records no
+    # numeroOperacion, never marks request_started and never needs
+    # reconciliation.
+    #
+    # Deliberately separate from the deviation check above: a price that moved
+    # a lot inside the same band is `price_deviation_exceeded`, an existing
+    # and differently-meaning block. Conflating them would tell an operator to
+    # re-preview when the real problem is that the market ran away.
+    tick_info, tick_error = resolve_effective_tick(policy, fresh_price)
+    if tick_error:
+        return None, tick_error
+    signed_tick = _serialize_tick_info(tick_info)
+    previous_band = preview_order.get("price_tick_band")
+    previous_tick = preview_order.get("effective_price_tick")
+    if tick_info["price_tick_mode"] == "dynamic":
+        if (previous_band != signed_tick["price_tick_band"]
+                or previous_tick != signed_tick["effective_price_tick"]):
+            if error_detail is not None:
+                # Enough to regenerate the preview, and nothing more: no
+                # credentials, no balances, no positions.
+                error_detail.update({
+                    "code": "price_tick_changed_repreview_required",
+                    "symbol": symbol,
+                    "previous_band": previous_band,
+                    "current_band": signed_tick["price_tick_band"],
+                    "previous_tick": previous_tick,
+                    "current_tick": signed_tick["effective_price_tick"],
+                    "price_tick_rule": signed_tick["price_tick_rule"],
+                    "repreview_required": True,
+                })
+            return None, "price_tick_changed_repreview_required"
+
     # 7. Canonical form-urlencoded request (precioLimite only).
-    # The per-symbol price_tick is enforced here: IOL rejects an order whose
-    # decimals are not compatible with the minimum tick, so we fail closed
+    # The effective tick is enforced here: IOL rejects an order whose decimals
+    # are not compatible with the minimum alteration, so we fail closed
     # instead of sending it (the price is never rounded to fit).
     order_request, build_err = build_iol_order_request(
         side=side, symbol=symbol, quantity=quantity, price=fresh_price,
         market=market, settlement=settlement,
         order_type=_policy_number(policy, "order_type", settings.iol_order_type),
         validity=validity,
-        price_tick=policy["price_tick"],
+        price_tick=tick_info["effective_price_tick"],
     )
     if build_err:
         return None, build_err
@@ -2024,6 +2199,14 @@ def _preflight_one_order(
         "live_portfolio_value_used": decimal_str(live_portfolio_value),
         "execution_class": execution_class,
         "policy_source": policy.get("policy_source", "legacy_instrument_policy"),
+        # The tick actually used, recomputed from the fresh price, alongside
+        # what the preview had signed — so the audit shows both and a reader
+        # can see they agreed.
+        "price_tick": {
+            **signed_tick,
+            "preview_band": previous_band,
+            "preview_effective_price_tick": previous_tick,
+        },
         "iol_request": {
             "environment": env["environment"],
             "api_host": api_host_of(env),
@@ -2165,6 +2348,7 @@ def prepare_validated_execution_batch(
     orders_by_action: dict,
     broker,
     settings,
+    error_detail: dict | None = None,
 ) -> tuple[list[dict] | None, str | None]:
     """Full preflight for the WHOLE batch — no order is submitted here.
 
@@ -2264,6 +2448,7 @@ def prepare_validated_execution_batch(
     prepared: list[dict] = []
     for order_exec in intents:
         preview_order = orders_by_action.get(order_exec.recommendation_action_id) or {}
+        detail: dict = {}
         result, err = _preflight_one_order(
             order_exec, preview_order, broker, settings,
             live_positions, live_portfolio_value, policies,
@@ -2273,9 +2458,12 @@ def prepare_validated_execution_batch(
             trade_date=trade_date,
             daily_reserved=daily_reserved,
             cash_reserved=cash_reserved,
+            error_detail=detail,
         )
         if err:
             _cancel_batch(db, intents, order_exec, err, "preflight validation failed")
+            if detail and error_detail is not None:
+                error_detail.update(detail)
             return None, err
         prepared.append(result)
 
@@ -2553,8 +2741,10 @@ def _execute_validated_orders(
             # One live portfolio read, all positions/quotes/notionals/limits
             # validated, all requests built, all orders committed as
             # execution_ready. If anything fails, NO order is submitted.
+            preflight_detail: dict = {}
             prepared_batch, preflight_error = prepare_validated_execution_batch(
-                db, intents, orders_by_action, broker, settings
+                db, intents, orders_by_action, broker, settings,
+                error_detail=preflight_detail,
             )
             if preflight_error:
                 for order_exec in intents:
@@ -2562,14 +2752,21 @@ def _execute_validated_orders(
                     executions.append(_exec_summary(order_exec))
                 rec.status = "execution_failed"
                 db.commit()
-                return {
+                response = {
                     "recommendation_id": recommendation_id,
                     "status": rec.status,
+                    "code": preflight_error,
                     "executions": executions,
                     "message": (
                         f"Preflight falló ({preflight_error}): ninguna orden del lote fue enviada."
                     ),
                 }
+                if preflight_detail:
+                    # Non-sensitive context so the operator can regenerate the
+                    # preview instead of retrying an approval that can never
+                    # succeed with the tick it was signed for.
+                    response["price_tick_change"] = preflight_detail
+                return response
 
             # ---- SUBMISSION: only execution_ready orders, one POST each ----
             for prepared in prepared_batch:

@@ -392,6 +392,70 @@ def _live_sell_check(broker, *, entry, quantity, probe) -> dict:
     return result
 
 
+def _price_tick_report(entry, probe: dict) -> dict:
+    """Tick reporting, with the effective value ONLY when a price exists.
+
+    Without a live quote there is no price, and without a price a dynamic rule
+    has no answer. Reporting a made-up `effective_price_tick` in that case
+    would show an operator a number the order path never agreed to.
+    """
+    from app.broker.instrument_catalog import (
+        VERIFYING_PROVENANCES,
+        verified_price_tick_rule,
+    )
+    from app.broker.price_rules import PriceTickRuleError, resolve_price_band_for_rule
+
+    report = {
+        "fixed_price_tick": entry.price_tick if entry is not None else None,
+        "fixed_price_tick_verified": False,
+        "dynamic_price_tick_rule_verified": False,
+        "price_tick_rule": None,
+        "price_tick_band": None,
+        "effective_price_tick": None,
+        "reference_price_used_for_tick": None,
+        "price_tick_mode": None,
+        "effective_price_tick_requires_live_quote": False,
+    }
+    if entry is None:
+        return report
+
+    provenance = entry.field_provenance or {}
+    fixed_verified = (
+        entry.price_tick is not None
+        and provenance.get("price_tick") in VERIFYING_PROVENANCES
+    )
+    report["fixed_price_tick_verified"] = bool(fixed_verified)
+
+    rule = verified_price_tick_rule(entry)
+    if rule is None:
+        if fixed_verified:
+            report["price_tick_mode"] = "fixed"
+            report["effective_price_tick"] = str(entry.price_tick)
+        return report
+
+    report.update({
+        "dynamic_price_tick_rule_verified": True,
+        "price_tick_rule": rule,
+        "price_tick_mode": "dynamic",
+        "effective_price_tick_requires_live_quote": True,
+    })
+    price = probe.get("price") if probe.get("available") else None
+    if price is None:
+        return report
+    try:
+        band = resolve_price_band_for_rule(rule, price)
+    except PriceTickRuleError:
+        return report
+    report.update({
+        "price_tick_band": band["band"],
+        "effective_price_tick": format(band["tick"], "f"),
+        "reference_price_used_for_tick": format(
+            positive_decimal(price) or Decimal("0"), "f"
+        ),
+    })
+    return report
+
+
 def _quantity_blockers(*, entry, policy, quantity, exact_notional) -> list[str]:
     """Does this exact quantity fit the instrument and the class limits?"""
     reasons: list[str] = []
@@ -537,6 +601,7 @@ def evaluate_pilot_readiness(
                 "quote": probe,
                 "live_check": live_check,
                 "exact_notional": exact_notional,
+                **_price_tick_report(entry, probe),
             }
 
         reference_price = (

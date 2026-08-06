@@ -63,6 +63,43 @@ def _probe(db: Session, symbol: str, side: str, position, settings, context) -> 
     return [c for c in codes if c not in _SIZING_CODES]
 
 
+def _price_tick_report(entry) -> dict:
+    """How this instrument's price decimals are decided.
+
+    `effective_price_tick` is deliberately absent here: it depends on a price,
+    and this report has no live quote. Inventing one — say from the last
+    observed price — would put a number in front of an operator that the
+    order path would not necessarily agree with.
+    """
+    from app.broker.instrument_catalog import VERIFYING_PROVENANCES, verified_price_tick_rule
+    from app.broker.price_rules import describe_rule
+
+    if entry is None:
+        return {
+            "fixed_price_tick_verified": False,
+            "dynamic_price_tick_rule_verified": False,
+            "price_tick_rule": None,
+            "price_tick_mode": None,
+        }
+    provenance = entry.field_provenance or {}
+    fixed_verified = (
+        entry.price_tick is not None
+        and provenance.get("price_tick") in VERIFYING_PROVENANCES
+    )
+    rule = verified_price_tick_rule(entry)
+    return {
+        "fixed_price_tick": entry.price_tick,
+        "fixed_price_tick_verified": bool(fixed_verified),
+        "dynamic_price_tick_rule_verified": rule is not None,
+        "price_tick_rule": rule,
+        "price_tick_rule_detail": describe_rule(rule),
+        "price_tick_observed": getattr(entry, "price_tick_observed", None),
+        "price_tick_mode": "dynamic" if rule else ("fixed" if fixed_verified else None),
+        # Said explicitly so nobody reads its absence as zero.
+        "effective_price_tick_requires_live_quote": rule is not None,
+    }
+
+
 def build_instrument_capabilities(db: Session) -> dict:
     """Read-only capability matrix. Contains no secrets and no credentials."""
     settings = get_settings()
@@ -123,6 +160,11 @@ def build_instrument_capabilities(db: Session) -> dict:
             "identity": catalog_to_dict(entry) if entry else None,
             "catalog_status": catalog_code or "ok",
             "missing_fields": missing,
+            # How this instrument's decimals get priced. The two are mutually
+            # exclusive in practice and reported apart so an operator can see
+            # WHICH one is missing: a fixed tick and a verified rule are
+            # different pieces of work.
+            **_price_tick_report(entry),
             "buy_ready": not buy_codes,
             "sell_ready": not sell_codes,
             "buy_blocking_reasons": buy_codes,

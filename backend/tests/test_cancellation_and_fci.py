@@ -337,8 +337,13 @@ def test_broker_cancel_order_classifies_outcomes():
 # ───────────────────────────────────────────────────────────────────
 
 
-def _fund(db, symbol="FCIAR", cutoff="15:00", minimum=1000.0, status="verified"):
+def _fund(db, symbol="FCIAR", cutoff="23:59", minimum=1000.0, status="verified"):
     """A fund an operator has administratively verified.
+
+    Cutoff 23:59 so the tests do not depend on WHEN the suite runs. With the
+    previous 15:00 default these tests passed in the morning and failed in the
+    afternoon — a real flake, unrelated to what they assert. The cutoff logic
+    itself is covered deterministically by tests that pass an explicit `now`.
 
     The provenance map is not decoration: `verified` now means every
     operational field has a trustworthy source, so a status string alone no
