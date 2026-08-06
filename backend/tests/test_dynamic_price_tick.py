@@ -1008,3 +1008,313 @@ def test_every_execution_flag_still_defaults_to_false():
 def test_the_known_rule_set_is_explicit():
     """A rule identifier is a promise that code can evaluate it."""
     assert KNOWN_PRICE_TICK_RULES == frozenset({RULE_BYMA_EQUITY_V1})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# H — readiness must agree with the catalog about the tick
+#
+# The catalog learned that a price tick can be satisfied by a verified dynamic
+# RULE instead of a fixed number. `pilot_readiness.instrument_verification()`
+# had its own copy of "is this field verified" and did not learn it, so COME
+# came back `verified` from the catalog and `identity_verified: false` from
+# readiness — and the pilot creator stayed blocked on a requirement that was
+# already met.
+#
+# These tests pin the two together. The fix was to delete the second
+# implementation, not to special-case the tick in it.
+# ═══════════════════════════════════════════════════════════════════
+
+
+def test_readiness_blocks_come_before_the_rule_is_verified(db):
+    """Production's starting state: everything verified but the tick."""
+    from app.broker.instrument_catalog import catalog_entry_status
+    from app.services.pilot_readiness import instrument_verification
+
+    entry = _come(db)
+    code, _details = catalog_entry_status(entry)
+    verification = instrument_verification(entry)
+
+    assert code in ("instrument_catalog_incomplete", "instrument_not_verified")
+    assert verification["identity_verified"] is False
+    assert "price_tick" in verification["identity_missing"]
+    assert "price_tick" in verification["buy_missing"]
+    assert "price_tick" in verification["sell_missing"]
+
+
+def test_readiness_accepts_come_once_the_rule_is_verified(db):
+    """The bug: this used to stay False while the catalog said `verified`."""
+    from app.broker.instrument_catalog import (
+        PROV_ADMIN_OVERRIDE,
+        catalog_entry_status,
+        verify_fields,
+    )
+    from app.services.pilot_readiness import instrument_verification
+
+    entry = _come(db)
+    verify_fields(
+        entry, fields={"price_tick_rule": RULE_BYMA_EQUITY_V1},
+        provenance_source=PROV_ADMIN_OVERRIDE,
+        note="Regla de bandas de precio BYMA/IOL verificada administrativamente.",
+    )
+    db.commit()
+
+    assert catalog_entry_status(entry)[0] is None
+    assert entry.verification_status == "verified"
+
+    verification = instrument_verification(entry)
+    assert verification["identity_verified"] is True
+    assert verification["buy_verified"] is True
+    assert verification["sell_verified"] is True
+    # The tick requirement is met by the RULE; no fixed tick was invented.
+    assert entry.price_tick is None
+    for bucket in ("identity_missing", "buy_missing", "sell_missing"):
+        assert "price_tick" not in verification[bucket], bucket
+
+
+def test_readiness_and_the_catalog_never_disagree_about_the_tick(db):
+    """The invariant the bug violated, stated directly.
+
+    Whatever the catalog considers verified, readiness must too — that is why
+    readiness no longer derives it independently.
+    """
+    from app.broker.instrument_catalog import unverified_fields
+    from app.services.pilot_readiness import instrument_verification
+
+    cases = [
+        _come(db, symbol="FIXED", price_tick=0.01),
+        _come(db, symbol="RULED", rule=RULE_BYMA_EQUITY_V1),
+        _come(db, symbol="NEITHER"),
+        _come(db, symbol="UNVERIFIEDRULE", rule=RULE_BYMA_EQUITY_V1,
+              rule_verified=False),
+    ]
+    for entry in cases:
+        catalog_says_missing = "price_tick" in unverified_fields(entry)
+        readiness_says_missing = "price_tick" in \
+            instrument_verification(entry)["identity_missing"]
+        assert catalog_says_missing == readiness_says_missing, entry.broker_symbol
+
+
+@pytest.mark.parametrize("kwargs,label", [
+    ({"price_tick": 0.01}, "fixed tick verified"),
+    ({"rule": RULE_BYMA_EQUITY_V1}, "dynamic rule verified"),
+])
+def test_either_kind_of_verified_tick_satisfies_readiness(db, kwargs, label):
+    from app.services.pilot_readiness import instrument_verification
+
+    entry = _come(db, **kwargs)
+    verification = instrument_verification(entry)
+    assert verification["identity_verified"] is True, (label, verification)
+
+
+@pytest.mark.parametrize("kwargs,label", [
+    ({}, "no tick and no rule"),
+    ({"rule": RULE_BYMA_EQUITY_V1, "rule_verified": False},
+     "rule stored but not verified"),
+    ({"rule": "MADE_UP_RULE_V9"}, "unknown rule"),
+    ({"rule": RULE_BYMA_EQUITY_V1, "market": "NYSE"}, "rule wrong market"),
+    ({"rule": RULE_BYMA_EQUITY_V1, "currency": "USD"}, "rule wrong currency"),
+    ({"rule": RULE_BYMA_EQUITY_V1, "execution_class": "BONOS"}, "rule wrong class"),
+])
+def test_everything_short_of_a_verified_usable_tick_stays_blocked(db, kwargs, label):
+    """Fail-closed in every direction. A rule that is merely stored, unknown,
+    or audited for something else must not unblock an instrument."""
+    from app.services.pilot_readiness import instrument_verification
+
+    entry = _come(db, **kwargs)
+    verification = instrument_verification(entry)
+    assert verification["identity_verified"] is False, label
+    assert "price_tick" in verification["identity_missing"], label
+
+
+def test_a_fixed_tick_without_verifying_provenance_stays_blocked(db):
+    """Present is not verified — a tick from a class default proves nothing."""
+    from app.services.pilot_readiness import instrument_verification
+
+    entry = _come(db, price_tick=0.01)
+    provenance = dict(entry.field_provenance)
+    provenance["price_tick"] = "class_policy_default"
+    entry.field_provenance = provenance
+    db.commit()
+
+    verification = instrument_verification(entry)
+    assert verification["identity_verified"] is False
+    assert "price_tick" in verification["identity_missing"]
+
+
+def test_readiness_without_a_live_quote_does_not_blame_the_tick(db):
+    """live=false may legitimately say "I did not look" — but not "the
+    identity is unverified" when the tick requirement is met."""
+    from app.services.pilot_readiness import evaluate_pilot_readiness
+
+    _come(db, rule=RULE_BYMA_EQUITY_V1)
+    with exec_settings(**_settings()) as settings:
+        report = evaluate_pilot_readiness(
+            db, symbols=["COME"], live=False, broker=None, settings=settings,
+        )
+
+    entry = report["symbols"][0]
+    for side in ("buy", "sell"):
+        reasons = entry[side]["technical_blocking_reasons"]
+        assert "live_check_not_performed" in reasons
+        assert "instrument_identity_not_verified" not in reasons
+        assert "instrument_buy_not_verified" not in reasons
+        assert "instrument_sell_not_verified" not in reasons
+
+
+def _come_broker(*, ask=41.10, bid=41.05, cash=100000.0, held=10):
+    broker = mock.MagicMock()
+
+    def _quote_side(symbol, side, market, settlement):
+        price = bid if side == "sell" else ask
+        if price is None:
+            return {"available": False, "source": None, "price": None,
+                    "retrieved_at": datetime.now(timezone.utc).isoformat()}
+        return {"available": True, "source": "bid" if side == "sell" else "ask",
+                "price": price,
+                "retrieved_at": datetime.now(timezone.utc).isoformat()}
+
+    broker.get_execution_quote.side_effect = _quote_side
+    broker.get_live_cash.return_value = {
+        "available": True, "cash": cash, "currency": "ARS",
+        "committed": 0.0, "source": "estadocuenta",
+    }
+    broker.get_portfolio_snapshot.return_value = {
+        "total_value": 100000.0, "cash": cash,
+        "positions": [{"symbol": "COME", "asset_type": "ACCIONES",
+                       "instrument_type": "ACCIONES", "currency": "ARS",
+                       "quantity": held, "committed": 0,
+                       "market_value": held * (bid or 0)}],
+    }
+    return broker
+
+
+def test_come_is_technically_ready_to_buy_once_the_rule_is_verified(db):
+    """The end state this whole fix exists to reach: COME at ask 41.10,
+    quantity 1, technically ready — and still not allowed to send."""
+    from app.services.pilot_readiness import evaluate_pilot_readiness
+
+    _come(db, rule=RULE_BYMA_EQUITY_V1)
+    broker = _come_broker(ask=41.10)
+    with exec_settings(**_settings(execution_sell_only=True)) as settings:
+        report = evaluate_pilot_readiness(
+            db, symbols=["COME"], side="buy", quantity=1,
+            live=True, broker=broker, settings=settings,
+        )
+
+    entry = report["symbols"][0]
+    buy = entry["buy"]
+
+    assert buy["technically_ready"] is True, buy["technical_blocking_reasons"]
+    # Reported PER SIDE: the tick depends on the price, and buy is priced at
+    # the ask while sell is priced at the bid — so the two can legitimately
+    # land in different bands.
+    assert buy["price_tick_mode"] == "dynamic"
+    assert buy["price_tick_rule"] == RULE_BYMA_EQUITY_V1
+    assert buy["price_tick_band"] == ">10.00<=50.00"
+    assert buy["effective_price_tick"] == "0.05"
+    assert buy["reference_price_used_for_tick"] == "41.1"
+    assert entry["minimum_valid_quantity"] == 1.0
+    assert buy["exact_notional"] == pytest.approx(41.10)
+
+    # Technically ready is NOT permission. Every lock is still shut.
+    assert buy["activation_ready"] is False
+    assert buy["ready_for_real_execution"] is False
+    assert set(buy["activation_blocking_reasons"]) == {
+        "execution_locked", "execution_sell_only_blocks_buy", "buy_execution_disabled",
+    }
+
+
+def test_come_is_technically_ready_to_sell_once_the_rule_is_verified(db):
+    from app.services.pilot_readiness import evaluate_pilot_readiness
+
+    _come(db, rule=RULE_BYMA_EQUITY_V1)
+    broker = _come_broker(bid=41.05)
+    with exec_settings(**_settings()) as settings:
+        report = evaluate_pilot_readiness(
+            db, symbols=["COME"], side="sell", quantity=1,
+            live=True, broker=broker, settings=settings,
+        )
+
+    sell = report["symbols"][0]["sell"]
+    assert sell["technically_ready"] is True, sell["technical_blocking_reasons"]
+    assert sell["activation_ready"] is False
+    assert "execution_locked" in sell["activation_blocking_reasons"]
+
+
+def test_an_unverified_rule_keeps_come_technically_blocked(db):
+    """Fail-closed end to end, not just in the helper."""
+    from app.services.pilot_readiness import evaluate_pilot_readiness
+
+    _come(db, rule=RULE_BYMA_EQUITY_V1, rule_verified=False)
+    broker = _come_broker()
+    with exec_settings(**_settings()) as settings:
+        report = evaluate_pilot_readiness(
+            db, symbols=["COME"], side="buy", quantity=1,
+            live=True, broker=broker, settings=settings,
+        )
+
+    buy = report["symbols"][0]["buy"]
+    assert buy["technically_ready"] is False
+    assert "instrument_identity_not_verified" in buy["technical_blocking_reasons"]
+
+
+def test_the_pilot_creator_accepts_come_technically_but_the_flag_still_blocks(db):
+    """Technical readiness is a precondition, not an authorisation.
+
+    With EXECUTION_PILOT_CREATION_ENABLED=false nothing is created, no order is
+    sent, and no flag changes — the refusal happens before a broker is even
+    built.
+    """
+    from app.services.execution_pilot import (
+        create_securities_pilot_recommendation,
+        securities_pilot_phrase,
+    )
+
+    _come(db, rule=RULE_BYMA_EQUITY_V1)
+    broker = _come_broker()
+    calls = {"n": 0}
+
+    def _factory():
+        calls["n"] += 1
+        return broker
+
+    with exec_settings(**_settings(execution_pilot_creation_enabled=False)) as settings:
+        result = create_securities_pilot_recommendation(
+            db,
+            execution_key=TEST_ADMIN_KEY,
+            symbol="COME", side="buy", quantity=1,
+            confirmation_text=securities_pilot_phrase("COME", "buy", 1),
+            note="piloto",
+            broker_factory=_factory,
+        )
+        # And nothing about the flags moved.
+        assert settings.order_execution_enabled is False
+        assert settings.securities_buy_enabled is False
+        assert settings.execution_pilot_creation_enabled is False
+
+    assert result["code"] == "execution_pilot_creation_disabled"
+    assert db.query(Recommendation).count() == 0
+    # Refused before any broker was built, so nothing reached the network.
+    assert calls["n"] == 0
+    broker.place_order.assert_not_called()
+    broker.submit_order_request.assert_not_called()
+
+
+def test_the_two_sides_can_sit_in_different_bands(db):
+    """Buy is priced at the ask and sell at the bid, so a spread across a band
+    edge gives the two sides different ticks. Reporting one tick per symbol
+    would show at least one of them a number its own order would not use."""
+    from app.services.pilot_readiness import evaluate_pilot_readiness
+
+    _come(db, rule=RULE_BYMA_EQUITY_V1)
+    broker = _come_broker(bid=49.95, ask=50.05)
+    with exec_settings(**_settings()) as settings:
+        report = evaluate_pilot_readiness(
+            db, symbols=["COME"], side=None, quantity=1,
+            live=True, broker=broker, settings=settings,
+        )
+
+    entry = report["symbols"][0]
+    assert entry["sell"]["effective_price_tick"] == "0.05"
+    assert entry["buy"]["effective_price_tick"] == "0.10"
+    assert entry["sell"]["price_tick_band"] != entry["buy"]["price_tick_band"]
