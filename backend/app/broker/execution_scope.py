@@ -328,6 +328,11 @@ def effective_policy_for(db, symbol, settings, context: dict | None = None) -> d
             "execution_family": FAMILY_SECURITIES,
             "execution_class": None,
             "price_tick": legacy["price_tick"],
+            # The legacy per-symbol path keeps its FIXED tick. It is the path
+            # the already-executed BYMA pilot used, its tick is stated by a
+            # human in EXECUTION_INSTRUMENT_POLICIES, and there is no reason
+            # to re-price it with a rule it was never verified against.
+            "price_tick_rule": None,
             "quantity_step": legacy["quantity_step"],
             "max_quantity": legacy["max_quantity"],
             "max_order_notional": legacy["max_notional"],
@@ -356,9 +361,15 @@ def effective_policy_for(db, symbol, settings, context: dict | None = None) -> d
     )
     if policy is None:
         return None
+    from app.broker.instrument_catalog import verified_price_tick_rule
+
     return {
         **policy,
         "policy_source": SOURCE_CLASS,
         "price_tick": entry.price_tick,
         "quantity_step": entry.quantity_step,
+        # The dynamic rule, when this instrument has a VERIFIED one that
+        # covers it. The tick itself is deliberately absent: it depends on the
+        # price, so it is computed per price by whoever has one.
+        "price_tick_rule": verified_price_tick_rule(entry),
     }

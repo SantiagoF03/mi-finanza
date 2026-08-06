@@ -341,8 +341,29 @@ class ExecutionInstrument(Base):
     execution_class: Mapped[str] = mapped_column(String(20), default="", index=True)
     currency: Mapped[str] = mapped_column(String(10), default="")
     quantity_step: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # A FIXED tick, for instruments whose minimum alteration is a constant.
+    # Still the authority wherever no dynamic rule is verified.
     price_tick: Mapped[float | None] = mapped_column(Float, nullable=True)
     minimum_quantity: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # --- Dynamic price tick -----------------------------------------------
+    # For bCBA equities the minimum alteration depends on the ORDER'S PRICE,
+    # so a single stored number is only correct while the price stays inside
+    # one band. Three deliberately separate things:
+    #
+    #   price_tick_observed  what we happened to see once. Diagnostic only;
+    #                        it never authorises anything.
+    #   price_tick_rule      WHICH rule applies (e.g. BYMA_EQUITY_PRICE_BANDS_V1).
+    #                        The rule is the durable fact; the tick is not.
+    #   effective tick       computed per price, at preview and again at
+    #                        preflight. Never persisted as authority.
+    #
+    # A rule that merely appears here is not trusted: it must also carry a
+    # verifying provenance in field_provenance["price_tick_rule"], exactly
+    # like every other operative field.
+    price_tick_rule: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    price_tick_rule_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    price_tick_observed: Mapped[float | None] = mapped_column(Float, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     buy_supported: Mapped[bool] = mapped_column(Boolean, default=False)
     sell_supported: Mapped[bool] = mapped_column(Boolean, default=False)

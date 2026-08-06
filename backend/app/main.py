@@ -68,6 +68,13 @@ def _patch_schema(engine_ref):
             "previous_identity": "JSON",
             "identity_changed_at": "DATETIME",
             "verification_audit": "JSON",
+            # Dynamic price-tick rule. All NULL for existing rows, which means
+            # "no rule verified" — those instruments keep needing a fixed tick
+            # exactly as before, so nothing that was blocked becomes allowed
+            # by this migration.
+            "price_tick_rule": "VARCHAR(60)",
+            "price_tick_rule_verified_at": "DATETIME",
+            "price_tick_observed": "FLOAT",
         }
         for column, ddl in additions.items():
             if column not in columns:
