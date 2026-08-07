@@ -203,6 +203,48 @@ def required_provenance_fields(entry: ExecutionInstrument) -> tuple[str, ...]:
     return REQUIRED_SECURITIES_PROVENANCE
 
 
+# Numeric fields a human can verify administratively, and which an automatic
+# refresh can only ever supply from a class default. Their value and their
+# provenance are preserved together — see `_apply_refreshed_field`.
+ADMIN_PRESERVABLE_NUMERIC_FIELDS = ("quantity_step", "price_tick", "minimum_quantity")
+
+
+def _admin_value_wins(current_origin, incoming_origin) -> bool:
+    """Does the stored administrative value survive this incoming source?
+
+    Only against a class default. That is the deliberate narrow rule:
+
+    - `class_policy_default` never looked at the instrument, so it must not
+      overwrite a value a human checked against real documentation;
+    - a genuinely authoritative source (`iol_title_detail`, `iol_portfolio`,
+      `iol_quote`, `iol_fci_catalog`) DOES overwrite it. If IOL now states a
+      different minimum lot, the broker is telling us something the human's
+      earlier reading no longer matches, and silently keeping the old number
+      would be preferring a stale human note over the venue itself;
+    - a later `admin_verified_override` overwrites it too — that is how an
+      operator corrects their own earlier value.
+
+    So the preserved case is exactly one: admin verified, refresh could only
+    guess.
+    """
+    return current_origin == PROV_ADMIN_OVERRIDE and incoming_origin == PROV_CLASS_DEFAULT
+
+
+def _apply_refreshed_field(entry: ExecutionInstrument, field: str, incoming,
+                           provenance: dict) -> None:
+    """Write a numeric field, unless a stored admin value outranks the source.
+
+    Kept next to the provenance merge on purpose: these two decisions have to
+    agree, and they previously did not.
+    """
+    current_origin = (entry.field_provenance or {}).get(field)
+    incoming_origin = provenance.get(field)
+    if _admin_value_wins(current_origin, incoming_origin):
+        # Keep what the human verified — value AND label.
+        return
+    setattr(entry, field, _as_positive_float(incoming))
+
+
 def has_usable_price_tick(entry: ExecutionInstrument) -> bool:
     """Is there SOME trustworthy way to price this instrument's decimals?
 
@@ -257,14 +299,26 @@ def unverified_fields(entry: ExecutionInstrument) -> list[str]:
             # Satisfied by EITHER a verified fixed tick or a verified dynamic
             # rule — the requirement is "we can price the decimals", not "a
             # constant exists".
-            if provenance.get("price_tick") in VERIFYING_PROVENANCES:
+            if (provenance.get("price_tick") in VERIFYING_PROVENANCES
+                    and _as_positive_float(entry.price_tick) is not None):
                 continue
             if verified_price_tick_rule(entry) is not None:
                 continue
             missing.append(field)
             continue
+
         source = provenance.get(field)
         if source not in VERIFYING_PROVENANCES:
+            missing.append(field)
+            continue
+
+        # A provenance label certifies a VALUE. If the value is gone, the
+        # label certifies nothing — and a row reading
+        # `quantity_step=None, provenance=admin_verified_override, verified`
+        # is exactly the incoherent state that let an unusable instrument
+        # claim it was ready to trade.
+        if (field in ADMIN_PRESERVABLE_NUMERIC_FIELDS
+                and _as_positive_float(getattr(entry, field, None)) is None):
             missing.append(field)
     return sorted(missing)
 
@@ -515,9 +569,17 @@ def upsert_instrument(
     entry.currency = identity["currency"]
     entry.execution_class = execution_class or ""
     entry.execution_family = execution_family
-    entry.quantity_step = _as_positive_float(quantity_step)
-    entry.price_tick = _as_positive_float(price_tick)
-    entry.minimum_quantity = _as_positive_float(minimum_quantity)
+    # A value and its provenance are ONE unit. Writing the value here and
+    # merging provenance afterwards is what produced the bug this fixes: the
+    # refresh overwrote an admin-verified `quantity_step` with the class
+    # default's None, the later merge kept the `admin_verified_override`
+    # LABEL, and the row ended up claiming a verified value it no longer had.
+    for field, incoming in (
+        ("quantity_step", quantity_step),
+        ("price_tick", price_tick),
+        ("minimum_quantity", minimum_quantity),
+    ):
+        _apply_refreshed_field(entry, field, incoming, provenance or {})
     entry.active = bool(active)
     entry.buy_supported = bool(buy_supported)
     entry.sell_supported = bool(sell_supported)
@@ -535,9 +597,14 @@ def upsert_instrument(
 
     # Merge provenance: an ADMIN-verified field is never demoted by a later
     # automatic refresh that could only offer a class default for it.
+    #
+    # The VALUES for the numeric fields above were already merged under the
+    # same rule by `_apply_refreshed_field`, so the two can no longer diverge.
+    # Every other field's value is written unconditionally and its provenance
+    # follows the same rule here.
     merged = dict(entry.field_provenance or {})
     for field, origin in (provenance or {}).items():
-        if merged.get(field) == PROV_ADMIN_OVERRIDE and origin == PROV_CLASS_DEFAULT:
+        if _admin_value_wins(merged.get(field), origin):
             continue
         merged[field] = origin
     entry.field_provenance = merged
