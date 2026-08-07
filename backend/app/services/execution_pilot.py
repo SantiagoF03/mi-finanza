@@ -1,21 +1,36 @@
 """Execution pilot — administrative creation of ONE controlled recommendation.
 
-This module can ONLY create a Recommendation + RecommendationAction for a
-single-unit BYMA sell. It is deliberately incapable of sending anything:
+Two creators live here, and they are not the same thing:
 
-- it never instantiates a broker;
-- it never fetches a quote;
-- it never calls place_order or submit_order_request;
-- it never approves, and it never flips any execution lock.
+`create_execution_pilot_recommendation` — the LEGACY single-unit BYMA sell.
+    Touches nothing external: no broker, no quote. It is the path the already
+    executed real pilot used, and it is kept unchanged on purpose.
+
+`create_securities_pilot_recommendation` — the GENERIC one (ACCIONES/CEDEARS,
+    buy or sell). It DOES obtain a broker, but only after every credential,
+    flag, payload and catalog gate has passed, and only to run a read-only
+    live readiness probe: it must not create a pilot for a quantity we already
+    know cannot be paid for or is not held. What that probe observed is
+    persisted in `metadata_json.exact_notional_at_creation`, which later
+    becomes the preview's price reference — see
+    `execution.pilot_reference_price`.
+
+Neither creator can send anything:
+
+- neither calls place_order or submit_order_request;
+- neither approves, and neither flips any execution lock;
+- both produce a `pending` Recommendation and stop.
 
 After creation the operator keeps using the existing, unchanged path:
     GET  /api/recommendations/{id}/execution-preview
     POST /api/recommendations/{id}/approve   (still gated by
                                               ORDER_EXECUTION_ENABLED)
 
-Double lock: creation requires EXECUTION_PILOT_CREATION_ENABLED=true AND
-ORDER_EXECUTION_ENABLED=false — the pilot may only be *prepared* while real
-sending is blocked.
+The legacy creator carries a double lock: EXECUTION_PILOT_CREATION_ENABLED=true
+AND ORDER_EXECUTION_ENABLED=false. The generic one requires the creation flag
+but deliberately does NOT require the execution lock to be open — preparing a
+pilot with every lock shut is the intended workflow, and demanding otherwise
+would make the system unpreparable.
 """
 
 from __future__ import annotations
