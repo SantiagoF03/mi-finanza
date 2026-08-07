@@ -275,13 +275,22 @@ def _pilot_payload(symbol=PILOT_ACCION, side="sell", quantity=1.0, **extra):
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _pilot_rec(db, *, symbol, side, quantity, pilot=True):
+def _pilot_rec(db, *, symbol, side, quantity, pilot=True, reference_price=100.0):
+    """A generic securities pilot, as the creator actually writes one.
+
+    `exact_notional_at_creation` is part of that contract: the creator runs a
+    live readiness probe and persists what it saw, and the preview prices
+    itself from that instead of the discovery catalog. A generic pilot without
+    it now fails closed — covered directly in
+    tests/test_pilot_reference_price.py.
+    """
     rec = Recommendation(
         action="rebalancear", status="pending", suggested_pct=0.0, confidence=1.0,
         rationale="piloto", risks="", executive_summary="piloto",
         metadata_json=({
             "execution_pilot": True, "pilot_type": f"security_{side}",
             "symbol": symbol, "side": side, "quantity": quantity,
+            "exact_notional_at_creation": quantity * reference_price,
         } if pilot else {"execution_pilot": False}),
     )
     db.add(rec)
@@ -340,7 +349,12 @@ def test_a_buy_pilot_does_not_require_a_prior_position(db):
     orders = _build_order_previews([action], snapshot, rec, db)
 
     assert orders[0]["valid"] is True, orders[0]["blocked_reason"]
-    assert orders[0]["price_ref_source"] == "instrument_catalog"
+    # Priced from the pilot's OWN live observation, not the discovery
+    # catalog: the catalog's last price can be hours old and from another
+    # session, which is what made the deviation guard compare two unrelated
+    # prices. The claim this test makes — a buy needs no prior position —
+    # is unchanged.
+    assert orders[0]["price_ref_source"] == "pilot_live_quote_at_creation"
 
 
 def test_a_sell_pilot_without_a_position_is_blocked(db):
@@ -387,7 +401,14 @@ def test_a_pilot_whose_declared_side_contradicts_the_plan_is_blocked(db):
     orders = _build_order_previews([action], snapshot, rec, db)
 
     assert orders[0]["valid"] is False
-    assert "side" in orders[0]["blocked_reason"]
+    # The reference check catches this first now, and more precisely: the
+    # stored notional was observed on ONE side of the book, so a metadata side
+    # that contradicts the computed one makes the reference unusable. Either
+    # way the order is refused — that is what this test is about.
+    assert (
+        "side" in orders[0]["blocked_reason"]
+        or orders[0]["pilot_reference_error"] == "pilot_reference_identity_mismatch"
+    )
 
 
 def test_an_override_that_exceeds_the_snapshot_position_is_blocked(db):

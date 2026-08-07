@@ -140,10 +140,99 @@ def _catalog_reference_price(db: Session | None, symbol: str) -> float | None:
     return float(price) if price is not None else None
 
 
+# --- Generic securities pilots ---------------------------------------------
+# `pilot_type` exists ONLY on pilots created by
+# create_securities_pilot_recommendation(). The legacy BYMA pilot carries
+# pilot_symbol / pilot_side / pilot_quantity and no pilot_type at all, so this
+# is a robust discriminator: it cannot accidentally capture a legacy pilot
+# that never stored the live reference this path requires.
+GENERIC_SECURITIES_PILOT_TYPES = frozenset({"security_buy", "security_sell"})
+
+
+def is_generic_securities_pilot(rec: Recommendation | None) -> bool:
+    """True only for a pilot created by the generic securities creator."""
+    if not is_execution_pilot(rec):
+        return False
+    meta = rec.metadata_json or {}
+    return meta.get("pilot_type") in GENERIC_SECURITIES_PILOT_TYPES
+
+
+def _order_side(action: RecommendationAction) -> str:
+    """The side a plan will compute. Single definition, used by both the
+    planner and the pilot-reference check, so they cannot disagree."""
+    return "sell" if (action.target_change_pct or 0) < 0 else "buy"
+
+
+def pilot_reference_price(
+    rec: Recommendation, action: RecommendationAction
+) -> tuple[Decimal | None, str | None]:
+    """The live quote this pilot observed AT CREATION, per unit.
+
+    Returns (price, error_code). A generic securities pilot ran a live
+    readiness check moments before it was created, and that check's
+    `exact_notional` is a real observed quote for the exact quantity. Dividing
+    it back out gives a per-unit reference that is:
+
+      - deterministic — the same stored number every time the preview is
+        rebuilt, which is what lets `approve` reproduce the signed hash;
+      - honest about its age — it is labelled
+        `pilot_live_quote_at_creation`, never presented as fresh;
+      - never the price sent. The order is priced by the fresh best ask/bid
+        resolved at preflight; this only sizes the preview and anchors the
+        deviation guard.
+
+    Why it matters: `InstrumentCatalog.last_price` can be hours old and drawn
+    from a different session. Anchoring the 2% deviation guard to it made a
+    pilot fail preflight for a move that never happened — the "deviation" was
+    between two unrelated prices, not between review and execution.
+
+    FAIL CLOSED on any inconsistency. A generic pilot whose contract says it
+    stored a live reference, and did not, must NOT quietly fall back to the
+    catalog: that would restore exactly the behaviour this replaces, and do it
+    invisibly.
+    """
+    meta = (rec.metadata_json or {}) if rec is not None else {}
+
+    raw_notional = meta.get("exact_notional_at_creation")
+    if raw_notional is None:
+        return None, "pilot_reference_price_missing"
+
+    notional = positive_decimal(raw_notional)
+    if notional is None:
+        # Covers NaN, Infinity, zero, negatives and non-numeric values.
+        return None, "pilot_reference_price_invalid"
+
+    quantity = positive_decimal(meta.get("quantity"))
+    if quantity is None:
+        return None, "pilot_reference_price_invalid"
+
+    # Identity: the metadata must describe the action being planned. A pilot
+    # whose stored symbol or side disagrees with the action is not a pilot we
+    # can price from — one of the two is wrong and we cannot tell which.
+    if _normalized(meta.get("symbol")) != _normalized(action.symbol):
+        return None, "pilot_reference_identity_mismatch"
+    if str(meta.get("side") or "").strip().lower() != _order_side(action):
+        return None, "pilot_reference_identity_mismatch"
+
+    override = action.quantity_override
+    if override is not None:
+        override_dec = positive_decimal(override)
+        if override_dec is None or override_dec != quantity:
+            # The notional was observed for the pilot's quantity. If the
+            # action now says a different one, dividing by either number
+            # produces a per-unit price that was never quoted.
+            return None, "pilot_reference_identity_mismatch"
+
+    # Decimal throughout: this number anchors a percentage comparison that
+    # decides whether a real order is sent.
+    return notional / quantity, None
+
+
 def _plan_order(
     action: RecommendationAction,
     snapshot: PortfolioSnapshot,
     db: Session | None = None,
+    reference_price: Decimal | None = None,
 ) -> dict:
     """Plan a safe order from a recommendation action using real portfolio data.
 
@@ -204,8 +293,16 @@ def _plan_order(
                 "snapshot_price_ref": None,
             }
 
-        # Price per unit from position data
-        price_per_unit = position_value / position_qty
+        # Price per unit. A generic pilot's own live observation wins over the
+        # position's derived average: the pilot checked the actual bid moments
+        # before it was created, and that is a better anchor for the deviation
+        # guard than a valuation carried in the snapshot.
+        price_ref_source = "live_position"
+        if reference_price is not None:
+            price_per_unit = float(reference_price)
+            price_ref_source = "pilot_live_quote_at_creation"
+        else:
+            price_per_unit = position_value / position_qty
         if price_per_unit <= 0:
             return {
                 "valid": False,
@@ -232,6 +329,7 @@ def _plan_order(
                 "position_value_used": position_value,
                 "blocked_reason": f"Calculated sell quantity for {symbol} rounds to 0 (target_value={target_value:.2f}, price={price_per_unit:.2f}).",
                 "snapshot_price_ref": price_per_unit,
+                "price_ref_source": price_ref_source,
             }
 
         return {
@@ -242,6 +340,7 @@ def _plan_order(
             "position_value_used": position_value,
             "blocked_reason": "",
             "snapshot_price_ref": price_per_unit,
+            "price_ref_source": price_ref_source,
         }
 
     # --- Buy (increase position / new position) ---
@@ -269,7 +368,15 @@ def _plan_order(
     # the fresh best ask resolved at preflight.
     price_per_unit = None
     price_ref_source = None
-    if position and position.quantity and position.quantity > 0 and position.market_value:
+    if reference_price is not None:
+        # A generic pilot observed a real ask for this exact quantity moments
+        # before it was created. That beats every fallback below, and it is
+        # the only one of them that is guaranteed to be about THIS order.
+        price_per_unit = float(reference_price)
+        price_ref_source = "pilot_live_quote_at_creation"
+    if (price_per_unit is None
+            and position and position.quantity and position.quantity > 0
+            and position.market_value):
         price_per_unit = position.market_value / position.quantity
         price_ref_source = "live_position"
     if not price_per_unit or price_per_unit <= 0:
@@ -371,11 +478,22 @@ def _build_order_previews(
     recommendation bypass the percentage-derived quantity.
     """
     pilot = is_execution_pilot(rec)
+    generic_pilot = is_generic_securities_pilot(rec)
     orders = []
     for action in actions:
-        plan = _plan_order(action, snapshot, db)
+        # A generic securities pilot prices its preview from the live quote it
+        # observed at creation, not from the discovery catalog's last price —
+        # which can be hours old and from a different session, and which made
+        # the deviation guard compare two unrelated prices.
+        reference_price = None
+        reference_error = None
+        if generic_pilot:
+            reference_price, reference_error = pilot_reference_price(rec, action)
+
+        plan = _plan_order(action, snapshot, db, reference_price=reference_price)
         valid = plan["valid"]
         blocked_reason = plan["blocked_reason"]
+
         price = plan["snapshot_price_ref"]
         qty = plan["quantity_planned"]
         estimated_notional = 0.0
@@ -442,6 +560,20 @@ def _build_order_previews(
                         valid = True
                         blocked_reason = ""
 
+        if reference_error:
+            # FAIL CLOSED, and LAST: the override branch above re-validates a
+            # plan whose percentage rounded to zero, so applying this earlier
+            # would let that reset it.
+            #
+            # This pilot's contract says it stored a live reference; it did
+            # not, or the metadata contradicts the action. Falling back to the
+            # catalog here would silently restore the behaviour this replaces.
+            valid = False
+            blocked_reason = (
+                f"El piloto no tiene una referencia de precio utilizable: "
+                f"{reference_error}."
+            )
+
         if valid:
             if not price or price <= 0:
                 valid = False
@@ -465,7 +597,12 @@ def _build_order_previews(
             "quantity_planned": qty,
             "quantity_override": int(override) if override is not None else None,
             "snapshot_price_ref": price,
-            "price_ref_source": plan.get("price_ref_source"),
+            # A pilot that could not produce its own reference reports NO
+            # source. The planner may have found a catalog price on the way,
+            # but this order is refused and must not appear to have been
+            # priced from it.
+            "price_ref_source": None if reference_error else plan.get("price_ref_source"),
+            "pilot_reference_error": reference_error,
             "estimated_notional": estimated_notional,
             "portfolio_value_used": plan["portfolio_value_used"],
             "position_value_used": plan["position_value_used"],
@@ -507,6 +644,11 @@ def _canonical_preview_payload(
                 # Signed: changing the override invalidates the preview hash.
                 "quantity_override": o.get("quantity_override"),
                 "snapshot_price_ref": o["snapshot_price_ref"],
+                # WHERE the reference came from is signed too: the same number
+                # sourced from a stale catalog and from the pilot's own live
+                # quote describe different previews.
+                "price_ref_source": o.get("price_ref_source"),
+                "pilot_reference_error": o.get("pilot_reference_error"),
                 "estimated_notional": o["estimated_notional"],
                 "portfolio_value_used": o["portfolio_value_used"],
                 "position_value_used": o["position_value_used"],
